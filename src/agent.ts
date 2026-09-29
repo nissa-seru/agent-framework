@@ -1098,7 +1098,8 @@ export class Agent {
     }
 
     if (isAbortedResponse(response)) {
-      this.toolResultGuard.recovering = false;
+      // Interrupted before a clean response: settle, never leave pending.
+      this.toolResultGuard.abandon('aborted');
       const partialContent = response.partialContent ?? [];
       const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(partialContent);
       return {

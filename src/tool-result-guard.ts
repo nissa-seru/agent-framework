@@ -13,6 +13,8 @@ interface PendingBatch {
   content: ContentBlock[];
   wireResults: ToolResult[];
   submitted: boolean;
+  /** False when the audit sync failed: originals then never go on the wire. */
+  durable: boolean;
 }
 
 /**
@@ -111,28 +113,52 @@ export class ToolResultGuard {
       ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError }
       : block);
     const messageId = this.cm.addMessage('user', withheld);
-    this.pending = { id, messageId, content, wireResults, submitted: false };
+    this.pending = { id, messageId, content, wireResults, submitted: false, durable: false };
     this.append({ type: 'linked', batchId: id, messageId });
     // Durability barrier: the audit must reach Chronicle's chain heads before
-    // the originals can go to a provider. A failed sync is reported loudly;
-    // the batch still proceeds (failing here would strand a live stream),
-    // and the record carries on as best-effort like any unsynced write.
+    // the originals can go to a provider. On a failed sync the batch fails
+    // CLOSED: the placeholders go on the wire instead (the turn continues,
+    // nothing is stranded), and the batch later settles as unsubmitted.
     try {
       this.cm.getStore().sync();
+      this.pending.durable = true;
     } catch (error) {
-      console.error(`[tool-result-guard] agent=${this.agentName} audit sync failed before submission:`, error);
+      console.error(`[tool-result-guard] agent=${this.agentName} audit sync failed; ` +
+        'submitting placeholders instead of originals:', error);
     }
     return messageId;
   }
 
-  /** Live continuation submitted directly through provideToolResults. */
-  markSubmitted(): void { if (this.pending) this.pending.submitted = true; }
+  /** Results for a live continuation (provideToolResults). Marks the batch
+   * submitted and returns the originals only when the audit is durable;
+   * otherwise returns placeholder results and leaves it unsubmitted. */
+  submissionResults(results: ToolResult[]): ToolResult[] {
+    const pending = this.pending;
+    if (!pending) return results;
+    if (pending.durable) { pending.submitted = true; return results; }
+    const ids = new Set(pending.wireResults.map((result) => result.toolUseId));
+    return results.map((result) => ids.has(result.toolUseId)
+      ? { ...result, content: TOOL_RESULT_GUARD_NOTICE } : result);
+  }
+
+  /** The stream carrying this batch ended without a clean round (abort or
+   * exhausted errors). Settle conservatively — an interrupted submission
+   * does not establish acceptance — so a later turn neither resubmits the
+   * originals nor attributes its own refusal to this batch. */
+  abandon(reason: string): void {
+    const pending = this.pending;
+    this.recovering = false;
+    if (!pending) return;
+    this.pending = undefined;
+    this.append({ type: 'withheld', batchId: pending.id, messageId: pending.messageId,
+      reason, submitted: pending.submitted });
+  }
 
   /** A budget/error restart compiles placeholders; restore pending output
    * only in this provider request, never in the strategy's view. */
   prepareRequest(messages: NormalizedMessage[], recordSubmission = false): NormalizedMessage[] {
     const pending = this.pending;
-    if (!pending) return messages;
+    if (!pending || !pending.durable) return messages;
     const byId = new Map(pending.wireResults.map((result) => [result.toolUseId, result]));
     const present = new Set(messages.flatMap((message) => message.content
       .filter((block) => block.type === 'tool_result' && byId.has(block.toolUseId))

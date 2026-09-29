@@ -1304,6 +1304,8 @@ export class AgentFramework {
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
+  /** Explicit-send suppression carried into a tool-result-guard retry. */
+  private guardRetryTurnSilenced = new Map<string, boolean>();
   /** Presentation-only wall-clock zone; persistence remains UTC/epoch. */
   private readonly timeZone: string;
 
@@ -6651,9 +6653,8 @@ export class AgentFramework {
             // Mid-turn messages collected above ride along as injected user
             // messages (membrane ≥0.5.72) — appended after the tool_result
             // envelope so the next round of THIS turn hears them.
-            agent.toolResultGuard.markSubmitted();
             currentState.stream.provideToolResults(
-              membraneResults,
+              agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
             );
             agent.setStreaming(currentState.stream);
@@ -8589,7 +8590,9 @@ export class AgentFramework {
     // Sticky explicit-send suppression: prose after send_message stays quiet
     // to prevent a redundant "sent it" postscript. Fresh injected input
     // clears it, because the following prose is a reply to a new message.
-    let turnSilenced = false;
+    let turnSilenced = trigger?.reason === 'tool_result_guard_retry'
+      && this.guardRetryTurnSilenced.get(agent.name) === true;
+    this.guardRetryTurnSilenced.delete(agent.name);
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -9000,6 +9003,10 @@ export class AgentFramework {
                 agent.reset();
                 preserveEventGateForSuccessor = true;
                 lifecyclePhase = 'aborted';
+                // Carry same-turn explicit-send suppression into the retry:
+                // a text-only recovery after a successful send must not post
+                // a postscript to a message already delivered.
+                if (turnSilenced) this.guardRetryTurnSilenced.set(agent.name, true);
                 // Restart inference inside this logical turn. No tool is
                 // executed again and no settle/checkpoint/locus reset occurs.
                 await this.startAgentStream(agent, {
@@ -9351,6 +9358,12 @@ export class AgentFramework {
               if (speechText) {
                 if (agent.proseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
+                  this.recordProseSuppression(agent.name, 1);
+                } else if (turnSilenced && agent.proseRouting !== 'explicit') {
+                  // Only reachable on a guard recovery that carried the
+                  // same-turn send suppression (a fresh text-only turn starts
+                  // unsilenced). Explicit mode is exempt, as mid-turn.
+                  console.error(`[routing] ${agent.name}: text-only recovery prose NOT routed (turn silenced)`);
                   this.recordProseSuppression(agent.name, 1);
                 } else if (agent.proseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
@@ -9892,6 +9905,14 @@ export class AgentFramework {
       // (typing still stops, compression still runs — matching the observed
       // wedge). onInferenceEnded is idempotent, so a redundant call is safe.
       if (ownsPhysicalStream && !preserveEventGateForSuccessor) {
+        // A frame that ends without handing off to a successor (abort,
+        // exhausted errors) must not leave its batch pending: a later turn
+        // would resubmit the originals and claim its own refusal. Successor
+        // frames (error-policy retry, budget/guard restart) bump streamId or
+        // set preserveEventGateForSuccessor and keep the batch.
+        if (agent.streamId === myStreamId && agent.toolResultGuard.hasPending) {
+          agent.toolResultGuard.abandon('aborted');
+        }
         agent.toolResultGuard.recovering = false;
         this.eventGate?.onInferenceEnded(agent.name);
       }

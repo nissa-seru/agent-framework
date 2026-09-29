@@ -53,7 +53,12 @@ class ReadModule implements Module {
   constructor(readonly results: Record<string, ToolResult> = {}) {}
   async start(ctx: ModuleContext) { ctx.registerSpeechHandler('*'); }
   async stop() {}
-  getTools() { return [{ name: 'read', description: 'Read a result', inputSchema: { type: 'object' as const, properties: {} } }]; }
+  getTools() {
+    return [
+      { name: 'read', description: 'Read a result', inputSchema: { type: 'object' as const, properties: {} } },
+      { name: 'send_message', description: 'Explicit send', inputSchema: { type: 'object' as const, properties: {} } },
+    ];
+  }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     this.calls.push(call.id);
     return this.results[call.id] ?? { success: true, data: `payload-${call.id}` };
@@ -519,5 +524,77 @@ test('usage of an abandoned guarded round is counted in session totals', async (
     await h.run();
     const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
     assert.ok(totals.inputTokens >= 1_007, `refused round usage missing: ${JSON.stringify(totals)}`);
+  } finally { await h.framework.stop(); }
+});
+
+// ---------------------------------------------------------------------------
+// Greptile review regressions (PR #159, head 647f081).
+// ---------------------------------------------------------------------------
+
+function fakeRegistry(framework: AgentFramework) {
+  const routed: string[] = [];
+  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+    resolveLocus: () => 'world:test',
+    routeSpeech: async (_agent: string, speech: string) => {
+      routed.push(speech); return { delivered: true, channelId: 'world:test' };
+    },
+    sendOutgoingChunk: () => {},
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    getDescriptor: () => undefined, getChannelTools: () => [],
+  }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  return routed;
+}
+
+test('failed audit sync fails closed: originals are never submitted', async () => {
+  const h = await harness([[calls('one'), answer()]], { toolResultGuard: true });
+  const store = h.framework.getStore();
+  const sync = store.sync.bind(store);
+  (store as { sync: () => void }).sync = () => {
+    if (h.framework.getAgent('assistant')!.toolResultGuard.hasPending) throw new Error('disk full');
+    sync();
+  };
+  try {
+    await h.run();
+    const provided = JSON.stringify(h.membrane.streams[0].receivedToolResults);
+    assert.doesNotMatch(provided, /payload-one/, 'non-durable audit must not release originals');
+    assert.match(provided, /Tool result withheld by the guard/);
+    assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
+    const guard = h.framework.getAgent('assistant')!.toolResultGuard;
+    assert.equal(guard.hasPending, false);
+  } finally { (store as { sync: () => void }).sync = sync; await h.framework.stop(); }
+});
+
+test('an aborted stream settles its submitted batch; the next turn neither resubmits nor claims it', async () => {
+  const h = await harness([[calls('one')], [refused()], [answer()]], {
+    toolResultGuard: true, refusalHandling: { autoRewind: true },
+  });
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  try {
+    await h.run();
+    const guard = h.framework.getAgent('assistant')!.toolResultGuard;
+    assert.equal(guard.hasPending, false, 'aborted batch must not stay pending');
+    h.membrane.onSubmit = undefined;
+    await h.run();
+    assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/, 'old originals must not be resubmitted');
+    const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
+    assert.match(JSON.stringify(messages), /\[refusal-rewind\]/, 'ordinary autoRewind must run');
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    assert.ok(audit.some((r) => r.type === 'withheld' && r.reason === 'aborted'));
+  } finally { await h.framework.stop(); }
+});
+
+test('guard recovery keeps same-turn explicit-send suppression', async () => {
+  const h = await harness([[createMockResponse([
+    { type: 'tool_use', id: 'send', name: 'test--send_message', input: {} },
+    { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
+  ], 'tool_use'), refused()], [createMockResponse([{ type: 'text', text: 'postscript' }])]], { toolResultGuard: true });
+  const routed = fakeRegistry(h.framework);
+  try {
+    await h.run();
+    assert.equal(h.membrane.requests.length, 2);
+    assert.ok(!routed.some((text) => text.includes('postscript')), `postscript routed: ${JSON.stringify(routed)}`);
   } finally { await h.framework.stop(); }
 });

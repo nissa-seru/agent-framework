@@ -90,9 +90,16 @@ On a refusal, the placeholders remain. The audit slot is not a context or
 compression source.
 
 The host calls `store.sync()` after the `staged`/`linked` records and before
-the originals can be submitted. A failed sync is logged loudly
-(`[tool-result-guard] ... audit sync failed`) but does not stop submission,
-so in that case the records are only as durable as any other unsynced write.
+the originals can be submitted. A failed sync fails closed: it is logged
+(`[tool-result-guard] ... audit sync failed`), the provider receives the
+placeholders instead of the originals, and the batch settles as `withheld`
+(`reason: "unsubmitted"`). Output whose audit is not durable never reaches a
+provider.
+
+A stream that ends without a clean round and without a successor (abort,
+exhausted error retries; also an aborted direct `Agent.runInference`)
+settles its batch as `withheld` with `reason: "aborted"`, so a later turn
+neither resubmits the originals nor treats its own refusal as the guard's.
 
 If the process stops before acceptance, placeholders remain after restart;
 the full pending originals are still available in the audit. This is
@@ -118,11 +125,10 @@ retroactive and does not rewrite results already accepted into memory.
 
 - **Compression before acceptance** — see above; needs a context-manager
   change.
-- **Explicit-send suppression across a recovery.** The recovery restart
-  re-enters the stream without the previous round's `hadToolCalls` /
-  same-turn send-silencing state, so a text-only recovery after a successful
-  explicit `send` can publish a postscript the policy would have silenced.
-  Context-budget restarts share this inherited limitation.
+- **Explicit-send suppression across a budget restart.** A guard recovery
+  carries the same-turn send suppression, so a text-only recovery after a
+  successful explicit send is not routed (locus/hybrid). Context-budget
+  restarts still re-enter without it (inherited, unchanged here).
 - **Audit growth.** Every guarded batch, accepted ones included, archives
   `originals`, `content`, and `wireResults` indefinitely. There is no
   retention policy and no restore tool; large payloads are blobs, but a full
