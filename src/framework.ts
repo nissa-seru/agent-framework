@@ -3602,7 +3602,21 @@ export class AgentFramework {
 
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
-    const pass = this.runQueuedMaintenance().catch((error) => {
+    // The pass is registered before its body runs, and the body still starts
+    // in this call. Its synchronous steps reach callers' code, an ops:alert
+    // listener while it prepares or a strategy's tick before that tick's
+    // first await, and a stop(), surgery or maintain begun there must find
+    // it: stop() and the surgery wait for it, and the maintain joins it
+    // rather than starting a second pass beside it. A tick that awaits such a
+    // call waits on its own pass, as a tick already did for a call it made
+    // after its first await.
+    let begin!: (body: Promise<void>) => void;
+    const pass = new Promise<void>((resolve) => { begin = resolve; });
+    this.maintenancePass = pass;
+    void pass.finally(() => {
+      if (this.maintenancePass === pass) this.maintenancePass = null;
+    });
+    begin(this.runQueuedMaintenance().catch((error) => {
       // The alert cuts its own copies from the whole message, so the
       // webhook's states the whole length.
       const wholeReason = error instanceof Error ? String(error.message) : failureDescription(error);
@@ -3617,11 +3631,7 @@ export class AgentFramework {
         wholeReason,
         { data: { scope: 'pass' } },
       );
-    });
-    this.maintenancePass = pass;
-    void pass.finally(() => {
-      if (this.maintenancePass === pass) this.maintenancePass = null;
-    });
+    }));
   }
 
   /** resume()'s refusal while a surgery holds the store. */
@@ -3738,12 +3748,15 @@ export class AgentFramework {
         // A tick whose provider call a surgery or stop() withdrew ends this
         // agent's work for the pass, as the hold or the stop would have before
         // its next tick: it is no failure, and what the failure reports
-        // remember stays as it is.
+        // remember stays as it is. An agent disposed while the pass runs, such
+        // as a conversation fork closed after it went idle, takes no further
+        // tick, since the framework runs no further turn for it.
         let withdrawn = false;
         try {
           for (
             let i = 0;
-            i < MAINTENANCE_TICKS_PER_PASS && this.running && !this.surgeryHold && !cm.isReady();
+            i < MAINTENANCE_TICKS_PER_PASS && this.running && !this.surgeryHold
+              && this.agents.get(agent.name) === agent && !cm.isReady();
             i++
           ) {
             await cm.tick();
@@ -16351,22 +16364,25 @@ export class AgentFramework {
     if (agent && drainState === 'kicking') {
       this.overBudgetDrainInFlight.add(agentName);
       // Like a maintenance pass: none starts once stop() has begun, it starts
-      // no tick while a surgery holds the store, and a surgery, a
-      // switchBranch or stop() waits for the tick in flight. It joins the
-      // drains they wait for before the alert is raised and before its body
-      // runs, so the alert's listeners find it: one that begins stop() or a
-      // surgery waits for it, and its body then ticks none and says why. So
-      // does a stop() made from inside its first tick, before that tick's
-      // first await.
+      // no tick while a surgery holds the store or once its agent has been
+      // disposed, and a surgery, a switchBranch or stop() waits for the tick
+      // in flight. It joins the drains they wait for before the alert is
+      // raised and before its body runs, so the alert's listeners find it:
+      // one that begins stop() or a surgery waits for it, and its body then
+      // ticks none and says why. So does a stop() made from inside its first
+      // tick, before that tick's first await.
       const drain = Promise.resolve().then(async () => {
         let ticks = 0;
         try {
           const cm = agent.getContextManager();
-          while (ticks < 8 && !this.providerAdmissionClosed && !this.surgeryHold) {
+          while (ticks < 8 && !this.providerAdmissionClosed && !this.surgeryHold && this.agents.get(agentName) === agent) {
             await cm.tick();
             ticks++;
           }
-          const stopped = ticks >= 8 ? '' : this.providerAdmissionClosed ? ', stopped as the framework stops' : ', stopped while a surgery holds the store';
+          const stopped = ticks >= 8 ? ''
+            : this.agents.get(agentName) !== agent ? ', stopped as the agent was disposed'
+            : this.providerAdmissionClosed ? ', stopped as the framework stops'
+            : ', stopped while a surgery holds the store';
           console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks${stopped})`);
         } catch (err) {
           if (err instanceof MaintenanceWithdrawnError) {
