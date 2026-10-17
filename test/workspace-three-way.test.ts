@@ -13,7 +13,7 @@ import { describe, test, type TestContext } from 'node:test';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../src/module-registry.js';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, constants as fsConstants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { open, statfs } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -29,6 +29,7 @@ import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspac
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent } from '../src/types/events.js';
+import { changedAfterFstat, withFileHandle } from './helpers/file-handle.js';
 
 const FAULT_FIXTURE = join(import.meta.dirname, 'fixtures/workspace-fault.mjs');
 const TREE = 'workspace/work/tree';
@@ -190,22 +191,30 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** The hash evidence and disk facts carry for this text. */
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
-/** Run `fn` with FileHandle.readFile switching branches as `onRead` says. */
+/**
+ * Run `fn` with each file a pass reads switching branches as `onRead` says,
+ * once per file, just before its read starts: at a FileHandle readFile, or at
+ * a handle's first FileHandle read at position 0 (a file that grew past the
+ * size limit is read from its start again, on the same handle, to hash it).
+ * Any other such read in the window counts too, such as a write's
+ * verification or a listing's head read.
+ */
 async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promise<T>): Promise<T> {
-  const probe = await open(join(tmpdir(), `read-hook-${process.pid}`), 'w');
-  const proto = Object.getPrototypeOf(probe) as { readFile: (...args: unknown[]) => Promise<Buffer> };
-  await probe.close();
-  const readFile = proto.readFile;
   let calls = 0;
-  proto.readFile = async function (this: unknown, ...args: unknown[]) {
-    onRead(++calls);
-    return readFile.apply(this, args);
-  };
-  try {
-    return await fn();
-  } finally {
-    proto.readFile = readFile;
-  }
+  const started = new WeakSet<object>();
+  return withFileHandle({
+    readFile: (readFile) => async function (this: unknown, ...args: unknown[]) {
+      onRead(++calls);
+      return readFile.apply(this, args);
+    },
+    read: (read) => async function (this: object, ...args: unknown[]) {
+      if (args[3] === 0 && !started.has(this)) {
+        started.add(this);
+        onRead(++calls);
+      }
+      return read.apply(this, args);
+    },
+  }, fn);
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
@@ -1898,6 +1907,40 @@ describe('trust and identity at the point of use', () => {
       if (how === 'read') assert.deepEqual(outcome, { kind: 'unobserved', reason: 'not a regular file' });
       else assert.ok(outcome instanceof EffectFailed && /not a regular file/.test(outcome.message), `write refused: ${outcome}`);
     }
+  });
+
+  // A fractional limit, too, which allows the whole bytes in it.
+  for (const limit of [1024, 1024.5]) {
+    test(`a file within the size limit (${limit}) at its fstat that grows past it before the read is hashed as oversize, not loaded whole`, async (t) => {
+      const env = new Env(t);
+      const rootReal = realpathSync(env.dir);
+      env.writeDisk('grow.txt', 'a'.repeat(100));
+      const path = env.disk('grow.txt');
+      const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(4000)),
+        () => readPath(viewOf(env.dir), rootReal, 'grow.txt', limit));
+      assert.equal(read.kind, 'read');
+      if (read.kind !== 'read') return;
+      assert.equal(read.bytes, null, 'over the limit as read, so not kept, and so not ingested');
+      assert.equal(read.size, 4100, 'hashed to its end');
+      assert.equal(read.hash, createHash('sha256').update('a'.repeat(100) + 'b'.repeat(4000)).digest('hex'));
+      assert.equal(read.head.toString(), 'a'.repeat(100) + 'b'.repeat(4000), 'its head, as for any oversize file');
+    });
+  }
+
+  test('a file that grows within the size limit after its fstat is read whole, as the read found it', async (t) => {
+    const env = new Env(t);
+    const rootReal = realpathSync(env.dir);
+    env.writeDisk('grow.txt', 'a'.repeat(10));
+    const path = env.disk('grow.txt');
+    const grown = 'a'.repeat(10) + 'b'.repeat(200 * 1024);
+    const read = await changedAfterFstat(path, () => appendFileSync(path, 'b'.repeat(200 * 1024)),
+      () => readPath(viewOf(env.dir), rootReal, 'grow.txt', 1024 * 1024));
+    assert.equal(read.kind, 'read');
+    if (read.kind !== 'read') return;
+    assert.equal(read.bytes?.toString(), grown, 'read on, in larger buffers, past the 10 bytes its fstat gave');
+    assert.equal(read.size, grown.length);
+    assert.equal(read.fp.size, grown.length, 'the fingerprint gives the size of the bytes hashed');
+    assert.equal(read.hash, createHash('sha256').update(grown).digest('hex'));
   });
 
   /** A root identified as it is now, and a way to replace it: renamed away, with an empty `sub` in its place. */

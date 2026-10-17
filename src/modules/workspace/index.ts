@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { coveredByIgnore, filesystemTrustsCtime, locateRoot } from './observe.js';
+import { coveredByIgnore, filesystemTrustsCtime, locateRoot, readPrefix } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -156,13 +156,23 @@ export class WorkspaceReadError extends Error {
 
 /** Successful `readFileFromDisk()` result. */
 export interface WorkspaceDiskReadResult {
-  /** File bytes — the whole file, or its first `maxBytes` when `truncated`. */
+  /**
+   * File bytes: the whole file, or its first `maxBytes` when `truncated`.
+   * Without `maxBytes` the file is read with `readFile`, with no limit. In
+   * Node, that reads up to the size its own fstat finds, or to the file's end
+   * if that size is 0.
+   */
   bytes: Buffer;
-  /** Full on-disk size in bytes, regardless of truncation. */
+  /**
+   * The file's size, agreeing with `bytes` and `truncated`: `bytes.length`,
+   * unless `truncated`. Then it's the file's size by an fstat after the read,
+   * or `maxBytes + 1` if that's less, since the read found at least that many
+   * bytes.
+   */
   size: number;
-  /** True when `maxBytes` was set and the file was larger; `bytes` is a prefix. */
+  /** True when `maxBytes` was set and the read found the file going on past it; `bytes` is a prefix. */
   truncated: boolean;
-  /** mtime of the file actually read (for change-detection caches). */
+  /** mtime of the file actually read, from its fstat at the open (for change-detection caches). */
   mtimeMs: number;
   /** Canonical (realpath) location of the file read — inside the canonical mount root by construction. */
   realPath: string;
@@ -171,7 +181,12 @@ export interface WorkspaceDiskReadResult {
 }
 
 export interface ReadFileFromDiskOptions {
-  /** Read at most this many bytes (a bounded prefix read — the rest of the file is never loaded). */
+  /**
+   * Keep at most this many bytes (a bounded prefix read): the read loads them
+   * and one byte past them, which isn't kept and tells whether the file goes
+   * on, and never the rest of the file. It bounds the read itself, so it
+   * holds for a file that grows while it's read.
+   */
   maxBytes?: number;
 }
 
@@ -179,6 +194,11 @@ function errnoOf(err: unknown): string | undefined {
   return typeof err === 'object' && err !== null && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
     ? (err as { code: string }).code
     : undefined;
+}
+
+/** read_image's refusal of a file over the mount's size limit, wherever it's found to be. */
+function imageTooLarge(maxSize: number, mountPrefixedPath: string): WorkspaceImageReadError {
+  return new WorkspaceImageReadError('too_large', `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`);
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -1627,12 +1647,7 @@ export class WorkspaceModule implements Module {
     if (bytes.byteLength === 0) {
       throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
     }
-    if (bytes.byteLength > maxSize) {
-      throw new WorkspaceImageReadError(
-        'too_large',
-        `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
-      );
-    }
+    if (bytes.byteLength > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath);
     return {
       bytes,
       mimeType: detectImageMimeType(bytes, mountPrefixedPath),
@@ -1809,7 +1824,10 @@ export class WorkspaceModule implements Module {
    * - With symlinks allowed, the canonical target must stay beneath the
    *   canonical mount root; a sibling-prefix root (`/mount-other`) does not count.
    * - `maxBytes` performs a bounded prefix read: at most `maxBytes` bytes are
-   *   ever loaded, and `truncated` reports that the file was larger.
+   *   kept, and one byte past them is read to tell whether the file goes on
+   *   (`truncated`). The reads decide where the file ends, not the size fstat
+   *   gave at the open, so the bound holds for a file that grows while it's
+   *   read.
    *
    * Throws {@link WorkspaceReadError} with a `code` distinguishing unknown
    * mount, lexical traversal, unavailable mount, missing file, directory,
@@ -1837,23 +1855,17 @@ export class WorkspaceModule implements Module {
 
     const { handle, fileStat, realFilePath } = await this.openContainedFile(mount, relativePath, mountPrefixedPath);
     try {
-      const size = fileStat.size;
       const cap = options.maxBytes;
       let bytes: Buffer;
       let truncated = false;
-      if (cap !== undefined && size > cap) {
-        truncated = true;
-        bytes = Buffer.alloc(cap);
-        let offset = 0;
-        while (offset < cap) {
-          const { bytesRead } = await handle.read(bytes, offset, cap - offset, offset);
-          if (bytesRead === 0) break;
-          offset += bytesRead;
-        }
-        if (offset < cap) bytes = bytes.subarray(0, offset);
-      } else {
+      if (cap === undefined) {
         bytes = await handle.readFile();
+      } else {
+        ({ bytes, more: truncated } = await readPrefix(handle, cap, fileStat.size));
       }
+      // What the read found, not what the fstat before it said, so `size`,
+      // `bytes` and `truncated` agree even for a file that changed in between.
+      const size = truncated ? Math.max((await handle.stat()).size, bytes.length + 1) : bytes.length;
       return { bytes, size, truncated, mtimeMs: fileStat.mtimeMs, realPath: realFilePath, mount: mount.config.name };
     } catch (err) {
       if (err instanceof WorkspaceReadError) throw err;
@@ -1904,12 +1916,7 @@ export class WorkspaceModule implements Module {
         if (fileStat.size === 0) {
           throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
         }
-        if (fileStat.size > maxSize) {
-          throw new WorkspaceImageReadError(
-            'too_large',
-            `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
-          );
-        }
+        if (fileStat.size > maxSize) throw imageTooLarge(maxSize, mountPrefixedPath);
       });
     } catch (err) {
       if (err instanceof WorkspaceImageReadError) throw err;
@@ -1919,9 +1926,12 @@ export class WorkspaceModule implements Module {
       }
       throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
     }
-    const { handle } = opened;
+    const { handle, fileStat } = opened;
     try {
-      const bytes = await handle.readFile();
+      // No more than maxSize is loaded: a file grown past it since the fstat
+      // above is refused here, as one already over it was there.
+      const { bytes, more } = await readPrefix(handle, maxSize, fileStat.size);
+      if (more) throw imageTooLarge(maxSize, mountPrefixedPath);
       return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
     } catch (err) {
       if (err instanceof WorkspaceImageReadError) throw err;
