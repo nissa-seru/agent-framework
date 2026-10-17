@@ -1191,20 +1191,34 @@ export class ChannelRegistry {
         (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
         label && existing.descriptor.label === channelId
       ) {
-        existing.descriptor.label = label;
-        if (extraMetadata) {
-          existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
-        }
+        const metadata = extraMetadata
+          ? { ...existing.descriptor.metadata, ...extraMetadata }
+          : existing.descriptor.metadata;
         // The channel now has a real label, not just the bare id — durable.
-        this.appendLabelSighting(
-          existing.descriptor.id,
-          existing.descriptor.label,
-          extractDmMeta(existing.descriptor.metadata),
-        );
+        // Recorded before the live descriptor takes it, since this branch's
+        // guard reads the descriptor: an append that throws leaves the
+        // placeholder, so the next push tries again.
+        this.appendLabelSighting(existing.descriptor.id, label, extractDmMeta(metadata));
+        existing.descriptor.label = label;
+        existing.descriptor.metadata = metadata;
       }
       return;
     }
 
+    // Only persist a REAL label durably. Falling back to the bare
+    // channelId as a placeholder (no server-supplied label at all — e.g. a
+    // Discord DM push missing both channelName and an author name,
+    // framework.ts's derivePushEventChannel) must never overwrite a real
+    // label already on file from a previous boot: after a restart the live
+    // `channels` map starts empty, so THIS is the very branch a
+    // label-less post-restart event takes — recording the placeholder here
+    // would clobber the good label initializeLabelHistoryStore() just
+    // replayed, defeating the entire point of the durable log. The live
+    // descriptor below still carries the placeholder for in-process
+    // routing; only the durable write is skipped when there's no real
+    // label to record. A real label is recorded before the entry exists:
+    // an append that throws registers nothing, so the next push tries again.
+    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     const key = `${serverId}:${channelId}`;
     this.channels.set(key, {
       serverId,
@@ -1217,19 +1231,6 @@ export class ChannelRegistry {
       },
       open: false,
     });
-    // Only persist a REAL label durably. Falling back to the bare
-    // channelId as a placeholder (no server-supplied label at all — e.g. a
-    // Discord DM push missing both channelName and an author name,
-    // framework.ts's derivePushEventChannel) must never overwrite a real
-    // label already on file from a previous boot: after a restart the live
-    // `channels` map starts empty, so THIS is the very branch a
-    // label-less post-restart event takes — recording the placeholder here
-    // would clobber the good label initializeLabelHistoryStore() just
-    // replayed, defeating the entire point of the durable log. The live
-    // descriptor above still carries the placeholder for in-process
-    // routing; only the durable write is skipped when there's no real
-    // label to record.
-    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -1618,6 +1619,15 @@ export class ChannelRegistry {
     }
   }
 
+  /**
+   * Each writer appends its record here before it changes memory for it, so
+   * an append that throws, as on a full disk, fails the operation with that
+   * change unmade, and memory and the log still agree. A retry then records
+   * the change rather than finding it in memory already, where
+   * setDesiredState's same-state return would record nothing, and a restart
+   * replays what memory held. appendLabelSighting keeps the same order for
+   * the label history.
+   */
   private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
     this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);
   }
@@ -1723,6 +1733,16 @@ export class ChannelRegistry {
     const recipientNameUnchanged = recipientName === undefined || recipientName === this.dmRecipientNames.get(channelId);
     const isDmUnchanged = isDm === undefined || this.dmClassified.get(channelId) === true;
     if (labelUnchanged && recipientIdUnchanged && recipientNameUnchanged && isDmUnchanged) return;
+    // The log first, as for lifecycle events: an append that throws leaves
+    // the history in memory as it was, so the next sighting records it.
+    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
+      channelId,
+      label,
+      ts: Date.now(),
+      ...(recipientId ? { recipientId } : {}),
+      ...(recipientName ? { recipientName } : {}),
+      ...(isDm ? { isDm } : {}),
+    } satisfies ChannelLabelSightingEvent);
     this.labelHistory.set(channelId, label);
     let seen = this.allLabelsSeen.get(channelId);
     if (!seen) {
@@ -1733,14 +1753,6 @@ export class ChannelRegistry {
     if (recipientId) this.dmRecipientIds.set(channelId, recipientId);
     if (recipientName) this.dmRecipientNames.set(channelId, recipientName);
     if (isDm) this.dmClassified.set(channelId, true);
-    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
-      channelId,
-      label,
-      ts: Date.now(),
-      ...(recipientId ? { recipientId } : {}),
-      ...(recipientName ? { recipientName } : {}),
-      ...(isDm ? { isDm } : {}),
-    } satisfies ChannelLabelSightingEvent);
   }
 
   /**
@@ -1965,7 +1977,6 @@ export class ChannelRegistry {
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
     if (this.desiredStates.get(key)?.state === desired) return;
-    this.desiredStates.set(key, { state: desired, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1974,6 +1985,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: desired, source });
   }
 
   // ==========================================================================
@@ -1993,12 +2005,6 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    this.desiredStates.set(key, {
-      state: 'tuned-out',
-      source,
-      tuneOut: params,
-      wakeCount: 0,
-    });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -2007,6 +2013,12 @@ export class ChannelRegistry {
       tuneOut: params,
       source,
       timestamp: new Date().toISOString(),
+    });
+    this.desiredStates.set(key, {
+      state: 'tuned-out',
+      source,
+      tuneOut: params,
+      wakeCount: 0,
     });
   }
 
@@ -2026,7 +2038,6 @@ export class ChannelRegistry {
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
     const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
-    this.desiredStates.set(key, { state: nextState, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -2035,6 +2046,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: nextState, source });
     return ended;
   }
 
@@ -2052,16 +2064,17 @@ export class ChannelRegistry {
     const key = this.lifecycleKey(serverId, channelId);
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
-    current.wakeCount = (current.wakeCount ?? 0) + 1;
+    const wakeCount = (current.wakeCount ?? 0) + 1;
     this.appendLifecycleEvent({
       kind: 'tune-out-wake',
       serverId,
       channelId,
       epochId: current.tuneOut.epochId,
-      wakeCount: current.wakeCount,
+      wakeCount,
       timestamp: new Date().toISOString(),
     });
-    return { params: current.tuneOut, wakeCount: current.wakeCount };
+    current.wakeCount = wakeCount;
+    return { params: current.tuneOut, wakeCount };
   }
 
   /** Active tune-out params + wake count for a channel, or null. */
@@ -2136,13 +2149,13 @@ export class ChannelRegistry {
       this.setDesiredState(serverId, channel.id, desired, 'legacy-recipe-migration');
     }
 
-    this.migratedLegacyPolicies.add(serverId);
     this.appendLifecycleEvent({
       kind: 'legacy-policy-migrated',
       serverId,
       source: Array.isArray(policy) ? 'allow-list' : policy,
       timestamp: new Date().toISOString(),
     });
+    this.migratedLegacyPolicies.add(serverId);
   }
 
   /**
