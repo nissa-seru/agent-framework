@@ -116,11 +116,12 @@ export class DiscordModule implements Module {
   private replyContexts: Map<string, ConversationContext> = new Map();
 
   // Where a turn's thoughts go (onAgentSpeech edits them in as a spoiler): the
-  // message the latest attempt to post produced, by `send`, `reply` or the
-  // module's own speech. Each of those, and `dm`, forgets it before trying, so
-  // after an attempt that posts nothing (refused, or the client threw) or a DM,
-  // whose channel isn't known here, it's null, and the thoughts aren't edited
-  // into a message posted before that attempt. Taking thoughts forgets it too.
+  // last message posted since the latest attempt to post started. `send`,
+  // `reply` and `dm` forget it as they start, and the module's own speech
+  // before it posts; a send, reply or speech that posts sets it when it
+  // completes. So a message posted before an attempt that is refused or
+  // throws, or before a DM, whose channel isn't known here, never takes the
+  // thoughts. Taking thoughts forgets it too.
   private lastSentMessage: { channelId: string; messageId: string } | null = null;
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on

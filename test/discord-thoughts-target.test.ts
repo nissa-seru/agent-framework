@@ -5,10 +5,10 @@ import type { ConversationContext, DiscordClientInterface } from '../src/modules
 import type { SpeechContext } from '../src/types/index.js';
 
 // On a turn with tool calls, the framework hands the Discord module the turn's
-// text as `thoughts`, and the module edits them, as a spoiler, into the message
-// the latest attempt to post produced. An attempt that posted nothing, or a DM,
-// leaves no message for them: the message posted before it, which people may
-// already have read, isn't edited.
+// text as `thoughts`, and the module edits them, as a spoiler, into the last
+// message posted since the latest attempt to post started. An attempt that is
+// refused or throws, or a DM, leaves no message for them: the message posted
+// before it, which people may already have read, isn't edited.
 
 const agentName = 'assistant';
 const trigger = { reason: 'test', source: 'test', timestamp: 0 };
@@ -23,7 +23,7 @@ function setup(rateLimitPerMinute?: number) {
   let n = 0;
   const posted = new Map<string, string>();
   const edits: string[] = [];
-  const failures = { send: false };
+  const failures = { send: false, dm: false };
   const client = {
     sendMessage: async (_channelId: string, content: string) => {
       if (failures.send) {
@@ -35,6 +35,10 @@ function setup(rateLimitPerMinute?: number) {
       return { messageId };
     },
     sendDM: async (_userId: string, content: string) => {
+      if (failures.dm) {
+        failures.dm = false;
+        throw new Error('Cannot send messages to this user');
+      }
       const messageId = `D${++n}`;
       posted.set(messageId, content);
       return { messageId };
@@ -78,6 +82,13 @@ const attempts: Array<{
     },
   },
   {
+    name: 'a reply refused by the rate limit',
+    rateLimitPerMinute: 1,
+    attempt: async ({ tool }) => {
+      assert.equal((await tool('reply', { content: 'second' })).error, 'Rate limited');
+    },
+  },
+  {
     name: 'a reply refused for want of a reply context',
     attempt: async ({ tool, replyContexts }) => {
       replyContexts.delete('default');
@@ -88,6 +99,13 @@ const attempts: Array<{
     name: 'a DM that posts',
     attempt: async ({ tool }) => {
       assert.equal((await tool('dm', { userId: 'u1', content: 'second' })).success, true);
+    },
+  },
+  {
+    name: 'a DM that throws',
+    attempt: async ({ tool, failures }) => {
+      failures.dm = true;
+      assert.equal((await tool('dm', { userId: 'u1', content: 'second' })).success, false);
     },
   },
   {
@@ -104,6 +122,13 @@ const attempts: Array<{
       await module.onAgentSpeech(agentName, [{ type: 'text', text: 'second' }], textTurn);
     },
   },
+  {
+    name: "the module's own speech with no reply context",
+    attempt: async ({ module, replyContexts }) => {
+      replyContexts.delete('default');
+      await module.onAgentSpeech(agentName, [{ type: 'text', text: 'second' }], textTurn);
+    },
+  },
 ];
 
 for (const { name, rateLimitPerMinute, attempt } of attempts) {
@@ -116,10 +141,20 @@ for (const { name, rateLimitPerMinute, attempt } of attempts) {
   });
 }
 
-test("a send that posts takes the turn's thoughts", async () => {
+for (const name of ['send', 'reply']) {
+  test(`a ${name} that posts takes the turn's thoughts`, async () => {
+    const s = setup();
+    await s.tool('send', { channelId: 'c1', content: 'first' });
+    assert.equal((await s.tool(name, { channelId: 'c1', content: 'second' })).success, true);
+    await s.module.onAgentSpeech(agentName, [], toolTurnEnd);
+    assert.deepEqual(s.edits, ['M2: ||why||\nsecond']);
+  });
+}
+
+test("thoughts edited into a message aren't edited into it again by a later turn's thoughts", async () => {
   const s = setup();
   await s.tool('send', { channelId: 'c1', content: 'first' });
-  await s.tool('send', { channelId: 'c1', content: 'second' });
   await s.module.onAgentSpeech(agentName, [], toolTurnEnd);
-  assert.deepEqual(s.edits, ['M2: ||why||\nsecond']);
+  await s.module.onAgentSpeech(agentName, [], toolTurnEnd);
+  assert.deepEqual(s.edits, ['M1: ||why||\nfirst']);
 });
