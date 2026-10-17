@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
+import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel, unfetchableReason } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -19158,9 +19158,10 @@ export class AgentFramework {
             // Point at fetch_reference only where it can deliver: not for a
             // reference this process holds no record of (fetch_reference
             // looks the id up in the same registry), nor, as the stub does,
-            // for an unfetched one the fetcher would refuse as expired.
+            // for one whose record shows the fetcher would refuse it as
+            // unbound or expired. A saved copy it serves.
             const record = referenceRegistry.get(candidate.refId);
-            const expiry = record && !record.fetchedPath ? referenceExpiry(record.testimony) : null;
+            const unfetchable = record ? unfetchableReason(record) : null;
             throw new Error(
               `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
@@ -19168,8 +19169,8 @@ export class AgentFramework {
                 ? 'This process holds no record of it (a restart or an eviction drops records, and a stub quoted ' +
                   "from elsewhere never had one), so fetch_reference can't fetch it either. If its tool can produce " +
                   'it again, re-run that tool for a fresh reference.'
-                : expiry
-                  ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
+                : unfetchable
+                  ? `It can't be fetched either — ${unfetchable}.`
                   : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }
