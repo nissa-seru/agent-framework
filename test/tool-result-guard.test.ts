@@ -1684,7 +1684,13 @@ test('storage recovery: shutdown retries edits queued by its terminating stream'
     edit(id, content);
   };
   let stopping: Promise<void> | undefined;
-  h.membrane.onSubmit = () => { stopping = h.framework.stop(); };
+  // stop() begins once the turn's stream has completed, on its
+  // inference:completed: the guard has accepted the batch, and its edit has
+  // failed once and is queued. (Begun while the round's results were
+  // submitted, at `ready`, stop() would now cancel the turn there.)
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:completed' && !stopping) stopping = h.framework.stop();
+  });
   try {
     await h.run();
     assert.ok(stopping);

@@ -1464,14 +1464,12 @@ export class Agent {
   }
 
   /**
-   * Cancel any active stream and reset to idle.
+   * Cancel the stream this agent's state holds (streaming, waiting on its
+   * tools, or ready at a tool boundary with every result in), and reset to
+   * idle.
    */
   cancelStream(): void {
-    if (this._state.status === 'streaming') {
-      this._state.stream.cancel();
-    } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
-      this._state.stream.cancel();
-    }
+    if ('stream' in this._state) this._state.stream?.cancel();
     this._state = { status: 'idle' };
   }
 
@@ -1532,8 +1530,7 @@ export class Agent {
       return { aborted: true, durationMs };
     }
 
-    if (this._state.status === 'streaming' ||
-        (this._state.status === 'waiting_for_tools' && this._state.stream)) {
+    if ('stream' in this._state && this._state.stream) {
       const durationMs = Date.now() - this._inferenceStartedAt;
       this.cancelStream();
       return { aborted: true, durationMs };
