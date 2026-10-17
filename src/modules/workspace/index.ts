@@ -3182,7 +3182,9 @@ function stateView(report: PathReport): Record<string, unknown> {
 // ==========================================================================
 
 /**
- * Convert a glob pattern to a RegExp.
+ * Convert a glob pattern to a RegExp. Throws, naming the pattern, for a brace
+ * group it can't read: a "{" that never closes, a group inside another, or a
+ * group with no ",".
  */
 function globToRegex(pattern: string): RegExp {
   // Split pattern into segments, handling {a,b,c} alternation
@@ -3190,13 +3192,33 @@ function globToRegex(pattern: string): RegExp {
   let i = 0;
   while (i < pattern.length) {
     if (pattern[i] === '{') {
-      const closeIdx = pattern.indexOf('}', i);
-      if (closeIdx > i) {
-        const alternatives = pattern.slice(i + 1, closeIdx).split(',');
-        regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
-        i = closeIdx + 1;
-        continue;
+      // A brace form this can't read is refused. A `{` that never closes, read
+      // as a literal, would almost always answer with no matches, and with it
+      // refused, each pass of this loop moves past at least one character. A
+      // group closes at the `}` that brings the braces open since its `{` back
+      // to none, so a `{` that never closes is named as that, even with a
+      // closed group after it. A group inside another would be split at the
+      // inner `}`, so `{a,{b,c}}` would match `a}` but not `a`, and a group
+      // with no `,` would lose its braces, so `{name}` would match `name` and
+      // never a file named `{name}`, and `{1..3}` would match only `1..3`.
+      let depth = 0;
+      let closeIdx = -1;
+      for (let j = i; j < pattern.length && closeIdx < 0; j++) {
+        if (pattern[j] === '{') depth++;
+        else if (pattern[j] === '}' && --depth === 0) closeIdx = j;
       }
+      if (closeIdx < 0) throw new Error(braceRefusal(pattern, 'has a "{" with no closing "}"'));
+      const group = pattern.slice(i + 1, closeIdx);
+      if (group.includes('{')) {
+        throw new Error(braceRefusal(pattern, 'has a "{" group inside another; put all its alternatives in one group'));
+      }
+      if (!group.includes(',')) {
+        throw new Error(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
+      }
+      const alternatives = group.split(',');
+      regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
+      i = closeIdx + 1;
+      continue;
     }
     // Accumulate non-brace characters, convert as a chunk
     let chunk = '';
@@ -3209,6 +3231,11 @@ function globToRegex(pattern: string): RegExp {
     }
   }
   return new RegExp(`^${regex}$`);
+}
+
+/** A glob's refusal of a brace form it can't read, with the way to match a literal "{". */
+function braceRefusal(pattern: string, problem: string): string {
+  return `glob pattern ${JSON.stringify(pattern)} ${problem}. To match a "{" in a name, put "?" in its place.`;
 }
 
 function globPartToRegex(part: string): string {
