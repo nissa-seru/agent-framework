@@ -115,7 +115,12 @@ export class DiscordModule implements Module {
   // Track current reply context per agent
   private replyContexts: Map<string, ConversationContext> = new Map();
 
-  // Last message sent by a tool (for thought-editing)
+  // Where a turn's thoughts go (onAgentSpeech edits them in as a spoiler): the
+  // message the latest attempt to post produced, by `send`, `reply` or the
+  // module's own speech. Each of those, and `dm`, forgets it before trying, so
+  // after an attempt that posts nothing (refused, or the client threw) or a DM,
+  // whose channel isn't known here, it's null, and the thoughts aren't edited
+  // into a message posted before that attempt. Taking thoughts forgets it too.
   private lastSentMessage: { channelId: string; messageId: string } | null = null;
 
   // Typing keepalive: agentName -> { interval, deadline }. Started on
@@ -588,8 +593,9 @@ export class DiscordModule implements Module {
           console.warn('Discord: Failed to edit thoughts into message:', err);
         }
       }
-      this.lastSentMessage = null;
     }
+    // Taken by these thoughts, or forgotten before this speech tries to post.
+    this.lastSentMessage = null;
 
     // Get reply context for this agent
     const replyCtx = this.replyContexts.get(agentName) ?? this.replyContexts.get('default');
@@ -1038,6 +1044,7 @@ export class DiscordModule implements Module {
   // ==========================================================================
 
   private async handleSend(input: SendInput): Promise<ToolResult> {
+    this.lastSentMessage = null;
     if (!this.checkRateLimit(input.channelId)) {
       return { success: false, error: 'Rate limited', isError: true };
     }
@@ -1054,11 +1061,13 @@ export class DiscordModule implements Module {
   }
 
   private async handleDM(input: SendDMInput): Promise<ToolResult> {
+    this.lastSentMessage = null;
     const result = await this.client.sendDM(input.userId, input.content);
     return { success: true, data: { messageId: result.messageId } };
   }
 
   private async handleReply(input: ReplyInput): Promise<ToolResult> {
+    this.lastSentMessage = null;
     const replyCtx = this.replyContexts.get('default');
     if (!replyCtx) {
       return { success: false, error: 'No conversation context', isError: true };
