@@ -1945,6 +1945,11 @@ export class AgentFramework {
 
   /** Liveness watchdog (fail hard on a wedged main thread). Null unless enabled. */
   private livenessWatchdog: import('./runtime/liveness-watchdog.js').LivenessWatchdog | null = null;
+  /** The frameworks a SIGUSR2 dumps (joinDiagnostics): each joins in create()
+   *  where the liveness watchdog starts, or would if it isn't enabled, and
+   *  leaves in stop() where the watchdog stops. */
+  private static readonly diagnosed = new Set<AgentFramework>();
+  private static diagnosticsListenerInstalled = false;
 
   // MCPL subsystems (null when no mcplServers configured)
   private mcplServerRegistry: McplServerRegistry | null = null;
@@ -2500,6 +2505,7 @@ export class AgentFramework {
       });
       framework.livenessWatchdog.start();
     }
+    AgentFramework.joinDiagnostics(framework);
 
     // Stored for lazy MCPL initialization (connectMcplServer on a framework
     // that started with zero configured servers).
@@ -2642,31 +2648,6 @@ export class AgentFramework {
       framework.tuneOutCoordinator.resumeActiveEpochs();
     }
 
-    // Diagnostics: `kill -USR2 <pid>` dumps live wake/inference state to stderr
-    // (journal) without a restart — for catching the wake-wedge on the running
-    // process. Shows the gate's `inferring` set + buffered-event count (the
-    // wedge signature), active streams, and pending inference requests.
-    try {
-      process.on('SIGUSR2', () => {
-        try {
-          const gate = framework.eventGate?.inferenceDiagnostics() ?? null;
-          console.error(
-            '[diagnostics] ' + JSON.stringify({
-              at: new Date().toISOString(),
-              gate,
-              activeStreams: [...framework.activeStreams.keys()],
-              pendingRequests: framework.pendingRequests.length,
-              agents: [...framework.agents.keys()],
-            }),
-          );
-        } catch (err) {
-          console.error('[diagnostics] dump failed:', err instanceof Error ? err.message : err);
-        }
-      });
-    } catch {
-      // SIGUSR2 not available on this platform — non-fatal.
-    }
-
     // Modules, agents, MCPL servers and the tune-out tool are all in place:
     // the first point at which "matches no tool" can be judged. Later tool
     // refreshes re-check patterns still undecided.
@@ -2674,6 +2655,62 @@ export class AgentFramework {
     framework.checkToolPatterns();
 
     return framework;
+  }
+
+  /**
+   * Diagnostics: `kill -USR2 <pid>` dumps live wake/inference state to stderr
+   * (journal) without a restart — for catching the wake-wedge on the running
+   * process. Each framework prints its own line: the gate's `inferring` set
+   * and buffered-event count (the wedge signature), active streams, and
+   * pending inference requests. A framework joins partway through create(),
+   * once its agents, modules and event gate are built, where the liveness
+   * watchdog starts (or would, when it isn't enabled). It leaves in stop()
+   * where the watchdog stops: after stop() has waited on its streams,
+   * maintenance, event loop and operator operations, so a dump shows what
+   * those waits are on, and before its modules and MCPL servers stop, so a
+   * stop() whose teardown hangs, fails or times out doesn't keep it listed.
+   * With none in the set, one line says no framework is running. A framework
+   * started again after a completed stop() doesn't rejoin; whether that
+   * lifecycle is supported is #315.
+   *
+   * One listener serves the process, installed by the first create() to
+   * reach the join and kept: once a process's last SIGUSR2 listener is
+   * removed, the signal's default action ends the process, and a dump can
+   * arrive between one framework's stop() and the next one's create(), as on
+   * a host's session switch. Until a create() first reaches the join, the
+   * process has no listener, and the default action applies.
+   */
+  private static joinDiagnostics(framework: AgentFramework): void {
+    AgentFramework.diagnosed.add(framework);
+    if (AgentFramework.diagnosticsListenerInstalled) return;
+    try {
+      process.on('SIGUSR2', () => {
+        if (AgentFramework.diagnosed.size === 0) {
+          console.error('[diagnostics] no framework is running in this process');
+        }
+        for (const running of AgentFramework.diagnosed) running.printDiagnostics();
+      });
+      AgentFramework.diagnosticsListenerInstalled = true;
+    } catch {
+      // SIGUSR2 not available on this platform — non-fatal.
+    }
+  }
+
+  private printDiagnostics(): void {
+    try {
+      const gate = this.eventGate?.inferenceDiagnostics() ?? null;
+      console.error(
+        '[diagnostics] ' + JSON.stringify({
+          at: new Date().toISOString(),
+          gate,
+          activeStreams: [...this.activeStreams.keys()],
+          pendingRequests: this.pendingRequests.length,
+          agents: [...this.agents.keys()],
+        }),
+      );
+    } catch (err) {
+      console.error('[diagnostics] dump failed:', err instanceof Error ? err.message : err);
+    }
   }
 
   /**
@@ -2905,6 +2942,7 @@ export class AgentFramework {
     // Dispose EventGate (clear debounce timers)
     this.eventGate?.dispose();
     this.livenessWatchdog?.stop();
+    AgentFramework.diagnosed.delete(this);
 
     // A stopping stream's batch settles as withheld, and its stub names where
     // the original went: let those writes finish while the workspace is up.
