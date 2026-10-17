@@ -862,20 +862,42 @@ export class Agent {
 
   /**
    * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, per branch. Everything above it has never been in a
+   * of a model request, or at the last tool boundary that injected messages
+   * into a live one, per branch. Everything above it has never been in a
    * request and may still be replaced or withdrawn in place by its sender.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
+  /** Counts marks: a compile writes its watermark back only if no mark was
+   *  made while it ran (a tool boundary's, or another compile's). */
+  private watermarkMarks = 0;
 
   getConsumedWatermark(): { branch: string; sequence: number } | null {
     return this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as consumed (boot, branch switch). */
+  /** Mark everything currently stored as consumed (the agent's creation, at
+   *  boot or later, and a tool boundary that injected messages into the live
+   *  stream). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.
     this.consumedWatermark = this.pendingWatermark();
+    this.watermarkMarks++;
+  }
+
+  /**
+   * A finished compile's watermark, taken before it awaited. Within a branch
+   * the watermark only advances: if a mark was made while the compile ran,
+   * the compile's (older) one is applied only where it is later on that
+   * mark's branch, so a boundary's mark is never rolled back by a compile
+   * that started before it (a preview during a live turn).
+   */
+  private applyCompileWatermark(watermark: { branch: string; sequence: number }, marksBefore: number): void {
+    const current = this.consumedWatermark;
+    if (this.watermarkMarks !== marksBefore && current
+      && (current.branch !== watermark.branch || current.sequence >= watermark.sequence)) return;
+    this.consumedWatermark = watermark;
+    this.watermarkMarks++;
   }
 
   /** The watermark a successful compile will establish (taken before, applied after). */
@@ -907,9 +929,10 @@ export class Agent {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
+    const marksBefore = this.watermarkMarks;
     const compile = () => this.contextManager.compile(this.compileBudget(budget));
     const result = budget ? await compile() : await this.compileAtLiveBudget(compile);
-    if (watermark) this.consumedWatermark = watermark;
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
@@ -948,9 +971,10 @@ export class Agent {
     // compression hold whose deadline has passed, which `compile` does for
     // any compile before it selects.
     const watermark = opts?.dryRun ? null : this.pendingWatermark();
+    const marksBefore = this.watermarkMarks;
     const compile = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
     const result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
-    if (watermark) this.consumedWatermark = watermark;
+    if (watermark) this.applyCompileWatermark(watermark, marksBefore);
     return result;
   }
 
@@ -1114,7 +1138,12 @@ export class Agent {
 
     // If all tools done, transition to ready
     if (this._state.pending.size === 0) {
-      this._state = { status: 'ready', toolResults: this._state.completed, stream: this._state.stream };
+      this._state = {
+        status: 'ready',
+        toolResults: this._state.completed,
+        stream: this._state.stream,
+        supportsInjectedMessages: this._state.supportsInjectedMessages,
+      };
     }
   }
 
@@ -1408,9 +1437,10 @@ export class Agent {
 
   /**
    * Transition to waiting_for_tools when stream yields tool calls.
-   * Called by framework's driveStream.
+   * Called by framework's driveStream, with what the stream declared about
+   * carrying injected messages with this round's results (see AgentState).
    */
-  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream): void {
+  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream, supportsInjectedMessages?: boolean): void {
     const pending = new Map<ToolCallId, PendingToolCall>();
     for (const call of calls) {
       pending.set(call.id, {
@@ -1420,7 +1450,7 @@ export class Agent {
         startedAt: Date.now(),
       });
     }
-    this._state = { status: 'waiting_for_tools', pending, completed: [], stream };
+    this._state = { status: 'waiting_for_tools', pending, completed: [], stream, supportsInjectedMessages };
   }
 
   /**

@@ -504,11 +504,60 @@ interface DeferredWrite {
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
+/** A drained entry as writeDrainedInOrder wrote it: the id its store gave it
+ *  (empty when addMessage deferred it again; a sharded body's first shard)
+ *  and what the store holds of it. For an entry whose write threw after
+ *  storing it, found in the store and counted as written, the content is
+ *  what landed, as later compiles render it, which for a sharded body can be
+ *  its first shards alone. */
+interface DrainedWrite {
+  id: MessageId;
+  content: ContentBlock[];
+}
+
+/** What later compiles render from the store for the copies of one write
+ *  that landed: one copy as it is, and two or more, the shards of a sharded
+ *  body, as context-manager's autobiographical strategy (the one that
+ *  shards on ingest) joins a body's consecutive shards: their non-text
+ *  blocks, then one text block of their joined text. The join is that
+ *  strategy's `mergeAdjacentBodyGroupRaw`, which context-manager doesn't
+ *  export, so the rule is copied here, and a test compares the two. */
+function asCompiled(landed: ReadonlyArray<{ content: ContentBlock[] }>): ContentBlock[] {
+  if (landed.length === 1) return landed[0]!.content;
+  const blocks = landed.flatMap((m) => m.content);
+  const text = blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
+  return [...blocks.filter((b) => b.type !== 'text'), { type: 'text', text } as ContentBlock];
+}
+
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+}
+
+/** A deferred entry as a log line names it: its id, participant and block
+ *  types. A block that isn't an object is named by its JavaScript type, and
+ *  an object whose type isn't a string as untyped, so the line names whatever
+ *  a queued entry holds. */
+function describeDeferredWrite(msg: { id: string; participant: string; content: ContentBlock[] }): string {
+  const kind = (b: unknown): string => {
+    if (b === null) return 'null';
+    if (typeof b !== 'object') return typeof b;
+    const type = (b as { type?: unknown }).type;
+    return typeof type === 'string' ? type : 'untyped';
+  };
+  return `${msg.id} (${msg.participant}: ${[...new Set(msg.content.map(kind))].join('+') || 'empty'})`;
+}
+
+/** Whether a deferred message can join a live stream at a tool boundary:
+ *  no tool blocks (the membrane's tool cycle) and not named as the agent
+ *  itself (it would render as an assistant turn, a prefill). */
+function isInjectableMidTurn(msg: { participant: string; content: ContentBlock[] }, agentName: string): boolean {
+  // Exact, as membrane's role test is: only a participant equal to the
+  // request's assistantParticipant (Agent's name) renders as the assistant.
+  return msg.participant !== agentName
+    && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result');
 }
 
 /**
@@ -3000,6 +3049,42 @@ export class AgentFramework {
       }
     }
 
+    // No stream is left: from the start of stop() none registers and no
+    // agent turn starts (providerAdmissionClosed, checked for every agent),
+    // and every stream registered before was cancelled and awaited above.
+    // (A start() made before this stop finishes reopens admission, so a turn
+    // it begins can be alive here and take one of these entries mid-stream;
+    // #315 asks how start() after stop() should behave.)
+    // What is still deferred (a message held for a turn's end whose flush
+    // found the target busy again, or one deferred behind its target's own
+    // state) would wait for a flush that may never come. Land each at its
+    // registered target now, while the store is open; a memory-only queue
+    // would otherwise lose it at exit. Every registered agent's entries go in
+    // queue order (residents share one message slot), each target cut at its
+    // own first entry that can't be stored (writeDrainedInOrder). They go
+    // past the deferral: a frame stop() doesn't wait for (a turn started
+    // outside the event loop) can still hold its target's turn token, but no
+    // reply can follow an entry in any stream.
+    //
+    // A puppet call in flight is one of the operator operations stop() waited
+    // for above, so its pair and the flush after it have landed by now. If
+    // that wait timed out, the call may still be running and holding its
+    // target's turn: its pair lands after these entries, on the store a
+    // timed-out wait leaves open.
+    //
+    // A quiesced host defers each entry again instead, into the persisted
+    // queue, for boot recovery. Past the deferral, a write that throws stays
+    // queued with what follows it for its target, and a memory-only queue
+    // still loses it at exit. An entry for a target no longer registered (a
+    // disposed fork) is left: dropped with a memory-only queue at exit, and
+    // logged and dropped from a persisted one by the boot or resume flush
+    // that meets it.
+    if (this.deferredMessages.length > 0) {
+      const entries = [...this.agents.keys()].flatMap((name) => this.drainDeferredFor(name));
+      this.readdDrained(entries, 'stop', { bypassDeferral: !this.quiesced });
+      this.ackDeferredWrites();
+    }
+
     // Final sync before closing
     try {
       this.store.sync();
@@ -5070,12 +5155,18 @@ export class AgentFramework {
   }
 
   /**
-   * Land every deferred write whose target has no turn alive, one at a time,
-   * acknowledging each durably as it lands (the persisted queue is rewritten
-   * after every message). A crash mid-flush therefore replays exactly the
-   * un-acked remainder at the next boot — no loss, no duplicates. A write
-   * the store REJECTS is logged and acked too: replaying a poison message
-   * forever would wedge every later boot on it.
+   * Land every deferred write whose target has no turn alive, as one batch
+   * acknowledged once: the chronicle is synced, then the persisted queue is
+   * rewritten without the batch (ackDeferredWrites). Until then the batch
+   * stays in the durable queue, so a crash mid-flush replays it at the next
+   * boot, which skips each entry that already landed, by its deferredWriteId
+   * — no loss, no duplicates. The batch is stored in queue order, whatever
+   * its targets (writeDrainedInOrder). A write the store rejects stays
+   * queued, logged, with what is queued behind it for its target, so the
+   * flush never stores that target's later entries ahead of it, and other
+   * targets' entries go on. (A write that isn't deferred can still land
+   * ahead of it, such as one for an idle agent once the host has resumed.)
+   * A boot that meets it again logs it and goes on.
    *
    * Per-target: an agent whose turn is still alive keeps ITS messages
    * deferred for its own turn boundary; everyone else's flush now.
@@ -5098,22 +5189,7 @@ export class AgentFramework {
     flush.sort(bySeq);
     this.deferredMessages = keep;
     this.handOffDeferredWrites(flush);
-    let stored = 0;
-    for (const msg of flush) {
-      try {
-        this.addMessage(msg.participant, msg.content, msg.metadata, {
-          deferredWriteId: msg.id,
-          ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
-        });
-        stored++;
-      } catch (err) {
-        console.error(
-          `[host-mode] ${label}: failed to store a deferred context write ` +
-          `(participant=${msg.participant}, forAgent=${msg.forAgent ?? 'primary'}):`,
-          err,
-        );
-      }
-    }
+    const stored = this.readdDrained(flush, `host-mode ${label}`).length;
     // Ack = sync the chronicle FIRST, then rewrite the durable queue without
     // the batch. Never the other way round.
     this.ackDeferredWrites();
@@ -5253,7 +5329,12 @@ export class AgentFramework {
    * window is operator-length, not turn-length. Lives in the
    * branch-independent recovery file so a rollback cannot orphan it.
    * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
-   * still memory-only: they flush within the turn, as before.
+   * mirrored only while such a queue is still persisted; otherwise they are
+   * memory-only: they land within the turn, at a tool boundary or at its
+   * end, and a crash before then loses them. That window runs to the turn's
+   * end for a message held there and what is queued behind it, and, on a
+   * stream that can't carry injected messages, for every message deferred
+   * during the turn.
    */
   private persistDeferredWrites(): void {
     try {
@@ -5316,18 +5397,93 @@ export class AgentFramework {
           if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
         }
       }
-      const candidates = data
-        .filter((m): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
-          !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
-            && Array.isArray((m as { content?: unknown }).content))
-        .map((m, i) => ({
-          ...m,
-          id: typeof m.id === 'string' ? m.id : randomUUID(),
-          // Files that predate `seq` are in write order already.
-          seq: typeof m.seq === 'number' ? m.seq : i + 1,
-        }))
+      // An entry the queue's readers can't handle has no place in it: one whose
+      // participant isn't text, whose content isn't an array, that holds a
+      // block that isn't an object, or whose `forAgent` is present but not a
+      // name, is dropped here with a line naming it, rather than held. Reading
+      // a null block's type throws, at the tool boundary and in the store. The
+      // store keeps a string or number block as given, but the context
+      // manager's token estimate keys a WeakMap on each block, which such a
+      // value can't be: once one is stored, every compile for that agent
+      // throws, and a restart doesn't clear it. What a block holds, such as a
+      // tool result's content, isn't checked here, as it isn't for a fresh
+      // write. The framework writes `forAgent` only as a non-empty name, so
+      // another value comes from damage or a hand edit, and the agent it
+      // meant can't be known: sent to the primary, as a falsy one would be, it
+      // could put another agent's message in the primary's window.
+      const wellFormed = (m: unknown): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: unknown; seq?: unknown } => {
+        if (!m || typeof m !== 'object') return false;
+        const { participant, content, forAgent } = m as { participant?: unknown; content?: unknown; forAgent?: unknown };
+        return typeof participant === 'string'
+          && Array.isArray(content) && content.every((b) => !!b && typeof b === 'object')
+          && (forAgent === undefined || (typeof forAgent === 'string' && forAgent !== ''));
+      };
+      const malformed = data.filter((m) => !wellFormed(m));
+      for (const m of malformed) {
+        // What the entry holds there: a value that isn't text by its type.
+        const field = (key: string): string => {
+          const value = m && typeof m === 'object' ? (m as Record<string, unknown>)[key] : undefined;
+          if (typeof value === 'string') return value;
+          if (value === undefined) return `no ${key}`;
+          return `${key} ${value === null ? 'null' : `of type ${typeof value}`}`;
+        };
+        console.error(
+          `[host-mode] a recovered deferred context write is malformed and was dropped: ` +
+          `${field('id')} (${field('participant')})`,
+        );
+      }
+      // One entry per id: the boot dedup and the ack each take an id as one
+      // write, so an id that comes again is dropped with a line, and the first
+      // entry with it is kept. An entry with no id is given a fresh one, with
+      // a line: a copy of it that already landed carries the id it lost, so
+      // the boot dedup can't find it, and it may be stored again.
+      const seen = new Set<string>();
+      const kept: Array<Omit<DeferredWrite, 'id' | 'seq'> & { id: string; seq?: unknown }> = [];
+      let duplicates = 0;
+      for (const m of data.filter(wellFormed)) {
+        const hasId = typeof m.id === 'string' && m.id !== '';
+        const id = hasId ? (m.id as string) : randomUUID();
+        if (!hasId) {
+          console.error(`[host-mode] a recovered deferred context write (${m.participant}) has no id; it is given ${id}`);
+        }
+        if (seen.has(id)) {
+          duplicates++;
+          console.error(
+            `[host-mode] a recovered deferred context write repeats id ${id} (${m.participant}) and was dropped; ` +
+            `the first entry with that id is kept`,
+          );
+          continue;
+        }
+        seen.add(id);
+        kept.push({ ...m, id });
+      }
+      // A seq is a positive whole number no larger than
+      // Number.MAX_SAFE_INTEGER, the entry's place in arrival order.
+      // An entry without one (a file that predates seq, which is in write
+      // order already) or with any other value (damage or a hand edit:
+      // JSON's 1e400 reads as Infinity) is numbered after every valid seq, in
+      // file order, so the counter stays finite and the rest keep their order.
+      const validSeq = (seq: unknown): seq is number => Number.isSafeInteger(seq) && (seq as number) > 0;
+      let lastSeq = 0;
+      for (const m of kept) if (validSeq(m.seq)) lastSeq = Math.max(lastSeq, m.seq);
+      let renumbered = 0;
+      const candidates: DeferredWrite[] = kept
+        .map((m) => {
+          if (validSeq(m.seq)) return { ...m, seq: m.seq };
+          renumbered++;
+          if (m.seq !== undefined) {
+            // A value that isn't a number is named by its type: it could be
+            // any size.
+            const seq = typeof m.seq === 'number' ? String(m.seq) : m.seq === null ? 'null' : `of type ${typeof m.seq}`;
+            console.error(
+              `[host-mode] a recovered deferred context write (${m.id}) has seq ${seq}, not a positive ` +
+              `whole number up to Number.MAX_SAFE_INTEGER; it is queued after the others`,
+            );
+          }
+          return { ...m, seq: ++lastSeq };
+        })
         .sort(bySeq);
-      this.deferredSeq = Math.max(this.deferredSeq, ...candidates.map((m) => m.seq));
+      this.deferredSeq = Math.max(this.deferredSeq, lastSeq);
       // Exactly-once: a message that landed before its ack was written is
       // already in the store under its deferredWriteId — do not replay it.
       // The scan covers every slot the interrupted batch could occupy (from
@@ -5344,8 +5500,9 @@ export class AgentFramework {
       this.deferredMessages.push(...restored);
       this.deferredWritesPersisted = true;
       // Rewrite the durable queue without the already-landed entries so a
-      // second interrupted boot does not re-scan them.
-      if (landed.size > 0) this.persistDeferredWrites();
+      // second interrupted boot does not re-scan them, without the malformed
+      // and repeated ones, and with the seqs given here.
+      if (landed.size > 0 || malformed.length > 0 || duplicates > 0 || renumbered > 0) this.persistDeferredWrites();
       return restored.length;
     } catch (err) {
       console.error('[host-mode] failed to restore persisted deferred context writes:', err);
@@ -6129,6 +6286,15 @@ export class AgentFramework {
     }
   }
 
+  /** A turn refused because stop() has begun: an ephemeral run waiting on it
+   *  ends now, rather than when its startup watchdog fires. */
+  private endEphemeralRunRefused(agent: Agent): void {
+    const run = this.ephemeralRuns.get(agent.name);
+    if (run && this.agents.get(agent.name) === agent) {
+      run.settle.reject(new Error(`Ephemeral agent "${agent.name}" refused: the framework is stopping`));
+    }
+  }
+
   private createDeferred<T>(): Deferred<T> {
     let resolve!: (value: T) => void;
     let reject!: (reason?: unknown) => void;
@@ -6252,6 +6418,11 @@ export class AgentFramework {
         `refusing new ephemeral run for ${agent.name} — resume() first`,
       );
     }
+    // Once stop() has begun no turn starts (startAgentStream), so a run
+    // admitted now could only wait out its startup watchdog.
+    if (this.providerAdmissionClosed) {
+      throw new Error(`framework is stopping: refusing new ephemeral run for ${agent.name}`);
+    }
     // Only a fresh object returned by createEphemeralAgent may enter this path.
     // Never overwrite a resident/conversation owner or a concurrent run: their
     // cleanup is name-keyed and could cancel/deregister the legitimate owner.
@@ -6347,6 +6518,18 @@ export class AgentFramework {
       agent.cancelStream();
       if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
       if (this.agents.get(agent.name) === agent) {
+        // What is still queued for the run, such as a message held for its
+        // turn's end, goes to its store now, past its deferral: once the run
+        // is deregistered, a flush finds no agent to take it and drops it.
+        // The run's namespace stays in the store for investigation, so the
+        // messages stay with it. A quiesced host defers them again instead,
+        // as stop() does, and with the run gone, the flush that meets them
+        // later drops them.
+        const queued = this.drainDeferredFor(agent.name);
+        if (queued.length > 0) {
+          this.readdDrained(queued, `end of ephemeral run ${agent.name}`, { bypassDeferral: !this.quiesced });
+          this.ackDeferredWrites();
+        }
         // Exact-generation disposal owns these name-keyed entries. Remove them
         // before deregistration; the late driveStream finally will see the
         // generation mismatch and leave any future owner untouched.
@@ -8122,19 +8305,13 @@ export class AgentFramework {
       }
       // Writers that deferred behind the reservation land now, on the branch
       // the operator chose (or the restored source) — the same end-of-turn
-      // flush driveStream/puppet perform, under the same guard.
-      if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        for (const name of reserved.keys()) {
-          if (this.activeTurnTokens.has(name)) continue;
-          for (const msg of this.drainDeferredFor(name)) {
-            try {
-              this.addMessage(msg.participant, msg.content, msg.metadata,
-                msg.forAgent ? { forAgent: msg.forAgent } : undefined);
-            } catch (error) {
-              console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
-            }
-          }
-        }
+      // flush driveStream/puppet perform, under the same guard — for every
+      // agent free to take them, in queue order (writeDrainedInOrder).
+      if (this.deferredMessages.length > 0) {
+        const free = [...reserved.keys()]
+          .filter((name) => !this.activeTurnTokens.has(name) && !this.pendingAssistantBlocks.has(name));
+        this.readdDrained(free.flatMap((name) => this.drainDeferredFor(name)), 'post-surgery flush');
+        this.ackDeferredWrites();
       }
     };
   }
@@ -9162,36 +9339,51 @@ export class AgentFramework {
           // target's live stream (deaf agent + window/live divergence). Left
           // queued, they flush at the target's own next boundary — with
           // injection — or in driveStream's finally when its turn ends.
+          //
+          // Only what can be injected is drained here. Tool blocks would
+          // corrupt the tool-cycle structure the membrane enforces, and a
+          // message named as the agent itself would render as an ASSISTANT
+          // turn on the wire (an unintended prefill the model would
+          // continue). Stored here without being injected, such a message
+          // would sit in the window before the turn's later replies although
+          // their requests never held it: the divergence above, and a reply
+          // whose signed thinking the provider then refuses, since it binds
+          // thinking to the prefix it was minted under (context-manager
+          // #155). So the drain stops at the first such message, which waits
+          // with everything queued behind it — the queue keeps its order —
+          // for the turn-end flush, where no reply follows it in this stream.
+          //
+          // A stream that declares it can't carry injected messages
+          // (supportsInjectedMessages false: membrane's XML prefill path)
+          // gets none, so nothing is drained here. Everything queued for
+          // the agent waits for the turn-end flush, as a held message does,
+          // rather than sitting in the window between rounds the stream
+          // never showed it.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
           // The injected messages' ids, for a boundary that leaves them to the
           // turn's next start as arrivals.
           const injectedIds = new Map<object, MessageId>();
-          {
-            const deferred = this.drainDeferredFor(agent.name);
-            if (deferred.length > 0) {
-              for (const msg of deferred) {
-                const id = agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
-                // Every other resident reads what this boundary stores; for its
-                // own agent, the boundary weighs what it injects below.
-                this.noteForOtherResidents(agent, msg.metadata, id);
-                // Injection guards: tool blocks would corrupt the tool-cycle
-                // structure the membrane enforces, and a message named as the
-                // agent itself would render as an ASSISTANT turn on the wire
-                // (an unintended prefill the model would continue). Such
-                // messages stay window-only — visible next turn.
-                const hasToolBlocks = msg.content.some(
-                  (b) => b.type === 'tool_use' || b.type === 'tool_result'
-                );
-                if (!hasToolBlocks && msg.participant !== agent.name) {
-                  const injection = {
-                    participant: msg.participant,
-                    content: msg.content,
-                    ...(msg.metadata ? { metadata: msg.metadata } : {}),
-                  };
-                  midTurnInjections.push(injection);
-                  injectedIds.set(injection, id);
-                }
-              }
+          if (currentState.supportsInjectedMessages !== false) {
+            const deferred = this.drainDeferredFor(agent.name, (msg) => !isInjectableMidTurn(msg, agent.name));
+            // Stored in queue order, cut at the first that can't be stored: it
+            // and what follows wait for the turn's end, and only what was
+            // stored is injected (the round's results go on either way). A
+            // write that threw after storing counts as stored, and what landed
+            // of it is what's injected, so the request carries what the store
+            // holds (writeDrainedInOrder).
+            const stored = this.writeDrainedInOrder(deferred, `tool boundary for ${agent.name}`, (msg) =>
+              agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
+            for (const [msg, { id, content }] of stored) {
+              // Every other resident reads what this boundary stores; for its
+              // own agent, the boundary weighs what it injects below.
+              this.noteForOtherResidents(agent, msg.metadata, id);
+              const injection = {
+                participant: msg.participant,
+                content,
+                ...(msg.metadata ? { metadata: msg.metadata } : {}),
+              };
+              midTurnInjections.push(injection);
+              injectedIds.set(injection, id);
             }
           }
 
@@ -9315,7 +9507,7 @@ export class AgentFramework {
           }
 
           if (shouldEndTurn) {
-            // endTurn: messages already stored above, cancel stream, reset to idle.
+            // endTurn: what this boundary stored stays; cancel stream, reset to idle.
             // The batch is never submitted, so nothing can refuse it: admit
             // it now instead of leaving it pending across the idle gap.
             agent.toolResultGuard.settleTurnEnded();
@@ -9377,6 +9569,29 @@ export class AgentFramework {
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
             );
+            // RFC-006 §3.3: consumption is determined at assembly, and this
+            // is assembly too when the stream carries the injected messages
+            // into its next request. Without the mark they would sit above
+            // the watermark of the turn's compile and read as unread, so a
+            // coalesced replacement could remove a message the agent heard
+            // and answered (and that its later replies were minted after).
+            // Only a stream that declares it carries them is marked
+            // (supportsInjectedMessages true: membrane's native path). One
+            // that doesn't say may be membrane 0.5.87's XML path, which
+            // drops them with a warning, and a message marked read there
+            // could no longer be replaced though the agent never saw it. So
+            // without the declaration they stay unread, as before this mark.
+            // The mark is the store's head, a scalar, as a compile's is: it
+            // also covers what was stored since the compile without being
+            // carried, such as another slot's messages, and a write that
+            // bypassed deferral into this slot (a fresh tool_result, a
+            // routed channel message). That over-cover can't be left out.
+            // Under context-manager#160 such a write already gives the
+            // replies stored after it stamps their requests didn't carry,
+            // whatever the mark says; deferring those writers is the fix.
+            if (midTurnInjections.length > 0 && currentState.supportsInjectedMessages === true) {
+              agent.markContextConsumed();
+            }
             agent.setStreaming(currentState.stream);
             this.emitTrace({
               type: 'inference:stream_resumed',
@@ -11737,9 +11952,12 @@ export class AgentFramework {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
     // A stopping framework starts no turn, whoever owns provider admission
-    // (conversation agents and ephemeral runs do not take the gate).
+    // (conversation agents and ephemeral runs do not take the gate). An
+    // ephemeral run waiting on the turn ends now, as at every refusal of
+    // stop()'s.
     if (this.providerAdmissionClosed) {
       if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
+      this.endEphemeralRunRefused(agent);
       return;
     }
     if (ownsProviderGate && !providerGateAlreadyHeld) {
@@ -11872,24 +12090,13 @@ export class AgentFramework {
       // A start that ends before its stream exists lands what was deferred
       // during it, as a stream's teardown does. Left queued, those messages
       // would land only at the agent's next start, after any stored meanwhile.
-      // Per message, as the turn-start flush does: one store failure must
-      // neither drop the messages behind it nor replace the start's own error.
+      // In queue order and cut at the first that can't be stored, as every
+      // flush is (readdDrained), so a store failure neither lands the
+      // messages behind it out of order nor replaces the start's own error.
+      // Gated on this agent's own tool cycle, as the turn-end flush is.
       if (!tokenHandedOff && !this.activeTurnTokens.has(agent.name)
-        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        for (const msg of this.drainDeferredFor(agent.name)) {
-          try {
-            this.addMessage(msg.participant, msg.content, msg.metadata, {
-              deferredWriteId: msg.id,
-              ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
-            });
-          } catch (err) {
-            console.error(
-              `[deferred-flush] failed-start flush failed to store a message for ${agent.name} ` +
-              `(participant=${msg.participant}, id=${msg.id}):`,
-              err,
-            );
-          }
-        }
+        && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+        this.readdDrained(this.drainDeferredFor(agent.name), 'failed-start flush');
         this.ackDeferredWrites();
       }
     }
@@ -11952,25 +12159,17 @@ export class AgentFramework {
       this.deferredMessages.length > 0
     ) {
       {
-        const deferred = this.drainDeferredFor(agent.name);
-        for (const msg of deferred) {
-          // Per-message try/catch (mirrors announceLocusIfChanged): one
-          // poison message — or a transient store-write failure — must not
-          // abort the turn or drop the messages behind it in the queue.
-          try {
-            const id = agent.getContextManager().addMessage(
-              msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
-            );
-            this.noteArrival(agent.name, msg.metadata, id);
-            this.noteForOtherResidents(agent, msg.metadata, id);
-            this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
-          } catch (err) {
-            console.error(
-              `[deferred-flush] turn-start flush failed to store a message for ${agent.name} ` +
-              `(participant=${msg.participant}):`,
-              err,
-            );
-          }
+        // One poison message, or a transient store-write failure, must not
+        // abort the turn or drop the messages behind it in the queue: the
+        // drain cuts there, and it and what follows stay queued, in order
+        // (writeDrainedInOrder). What was stored is weighed for the turn now
+        // starting and for every other resident's open turn.
+        const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `turn-start flush for ${agent.name}`, (msg) =>
+          agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
+        for (const [msg, { id }] of stored) {
+          this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
+          this.noteArrival(agent.name, msg.metadata, id);
+          this.noteForOtherResidents(agent, msg.metadata, id);
         }
         this.ackDeferredWrites();
       }
@@ -12010,13 +12209,8 @@ export class AgentFramework {
         this.activeTurnTriggers.delete(agent.name);
       }
       if (!this.activeTurnTokens.has(agent.name)
-        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        for (const msg of this.drainDeferredFor(agent.name)) {
-          this.addMessage(msg.participant, msg.content, msg.metadata, {
-            deferredWriteId: msg.id,
-            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
-          });
-        }
+        && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+        this.readdDrained(this.drainDeferredFor(agent.name), 'withdrawn-turn flush');
         this.ackDeferredWrites();
       }
       return false;
@@ -12226,6 +12420,7 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+        if (this.providerAdmissionClosed) this.endEphemeralRunRefused(agent);
         return false;
       }
 
@@ -12253,9 +12448,13 @@ export class AgentFramework {
       // A stop followed by start must not revive this earlier turn.
       // Membrane's yielding stream starts its request when it is first
       // iterated, so cancelling it here, before driveStream, sends nothing.
-      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+      // A turn that was mid-compile when stop() cancelled every stream would
+      // otherwise register after that pass and outlive stop(). The caller's
+      // finally releases the turn token.
+      const stopping = this.providerAdmissionClosed;
+      if (this.agents.get(agent.name) !== agent || stopping || lifecycle !== this.lifecycleGeneration) {
         const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
-          : this.providerAdmissionClosed ? 'the framework was stopping'
+          : stopping ? 'the framework was stopping'
             : 'the framework was stopped and started again';
         const reason = `a turn compiled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
@@ -12272,6 +12471,7 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+        if (stopping) this.endEphemeralRunRefused(agent);
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression
@@ -12348,11 +12548,13 @@ export class AgentFramework {
         if (this.providerAdmissionClosed) {
           // stop() ended the wait: that cancels the retry, it does not hasten
           // it. Nothing is written (the store is closing); this frame still
-          // owns its token, since no retry frame replaced it.
+          // owns its token, since no retry frame replaced it. An ephemeral
+          // run waiting on the turn ends now, as at every refusal of stop()'s.
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
           }
+          this.endEphemeralRunRefused(agent);
           return false;
         }
         // The retry re-enters startAgentStream, which replaces this frame's
@@ -12807,7 +13009,15 @@ export class AgentFramework {
             // Truncated responses yield 'complete' with stop_reason 'max_tokens' directly.
             // So all calls here have valid input — {} is legitimate for parameterless tools.
 
-            agent.enterWaitingForTools(event.calls, stream);
+            // Whether this stream can carry messages injected with the round's
+            // results: true on membrane's native path, false on its XML
+            // prefill path, absent before membrane declared it. The tool
+            // boundary reads it from the agent's state.
+            agent.enterWaitingForTools(
+              event.calls,
+              stream,
+              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages,
+            );
 
             // A refused call doesn't silence: the silence before it, and its
             // round's other silencing calls, come back at the next round.
@@ -13606,7 +13816,9 @@ export class AgentFramework {
               await this.waitForRetry(action.delayMs);
               // stop() ending the wait cancels the retry (this frame's finally
               // clears the token); it is never permission to retry at once.
+              // An ephemeral run waiting on the turn ends now.
               if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
+              else this.endEphemeralRunRefused(agent);
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
@@ -14013,12 +14225,6 @@ export class AgentFramework {
         this.pendingAssistantBlocks.delete(agent.name);
       }
 
-      // A conversation fork whose TTL closure turn just finished is done for
-      // good — dispose it so the agent map doesn't grow monotonically.
-      if (ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
-        this.disposeConversationAgent(agent.name);
-      }
-
       // The turn is torn down — release the turn-alive marker BEFORE the
       // deferred flush below, so the flush appends at the settled tail.
       // Token-matched: if a successor turn already owns the agent (endTurn
@@ -14034,16 +14240,25 @@ export class AgentFramework {
       // Flush any deferred messages (e.g. if stream failed while tools were
       // pending). Only THIS agent's messages: other targets' entries wait
       // for their own boundaries (re-adding via addMessage re-defers if the
-      // target has meanwhile started a turn).
-      if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        const deferred = this.drainDeferredFor(agent.name);
-        for (const msg of deferred) {
-          this.addMessage(msg.participant, msg.content, msg.metadata, {
-            deferredWriteId: msg.id,
-            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
-          });
-        }
+      // target has meanwhile started a turn). Gated on this agent's own tool
+      // cycle, not every agent's: messages held for this turn's end depend on
+      // this flush, and another agent's pending tools say nothing about this
+      // window. addMessage judges each entry by the same rule, so the drained
+      // prefix is stored in order, or goes back into the queue whole under
+      // its ids when a successor turn has already taken the agent.
+      if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+        this.readdDrained(this.drainDeferredFor(agent.name), 'turn-end flush');
         this.ackDeferredWrites();
+      }
+
+      // A conversation fork whose TTL closure turn just finished is done for
+      // good — dispose it so the agent map doesn't grow monotonically. The
+      // frame that ends the turn disposes it, after the flush above, so what
+      // was held for the turn's end lands in the fork's store instead of
+      // being dropped as addressed to no agent. A frame that hands the turn
+      // to a successor (a guard or budget restart) leaves the fork to it.
+      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
+        this.disposeConversationAgent(agent.name);
       }
     }
   }
@@ -14209,6 +14424,9 @@ export class AgentFramework {
           { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, forAgent: agentName },
           { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, forAgent: agentName },
         );
+        // As addMessage's own deferral does: a crash before the next persist
+        // must not lose the pair from a persisted queue.
+        if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       }
 
       this.emitTrace({
@@ -14229,19 +14447,14 @@ export class AgentFramework {
       if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
       // Messages deferred while we held the token land now, after the pair
       // — the same end-of-turn flush driveStream performs, under the same
-      // tool-cycle guard. (No wake is requested: the agent sees the pair,
-      // and anything that arrived meanwhile, on its next turn.) Keyed on
-      // "no turn alive", not on token ownership: if a turn did replace us
-      // and has already ended, its flush ran before our pair was queued —
-      // nobody else will flush it, so we do.
+      // guard: this agent's own tool cycle. (No wake is requested: the agent
+      // sees the pair, and anything that arrived meanwhile, on its next
+      // turn.) Keyed on "no turn alive", not on token ownership: if a turn
+      // did replace us and has already ended, its flush ran before our pair
+      // was queued — nobody else will flush it, so we do.
       if (!this.activeTurnTokens.has(agentName)
-        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        for (const msg of this.drainDeferredFor(agentName)) {
-          this.addMessage(msg.participant, msg.content, msg.metadata, {
-            deferredWriteId: msg.id,
-            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
-          });
-        }
+        && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agentName)) {
+        this.readdDrained(this.drainDeferredFor(agentName), 'puppet flush');
         this.ackDeferredWrites();
       }
     }
@@ -15741,13 +15954,14 @@ export class AgentFramework {
        */
       forAgent?: string;
       /**
-       * Set when the message is being flushed FROM the durable deferred
-       * queue: it is the entry's one durable identity. A write stamps it
-       * into `metadata.deferredWriteId` (boot dedup); a re-deferral moves
-       * the same logical entry back to pending under the same id instead of
-       * minting a second, independently replayable one.
+       * Set when the message comes back from the deferred queue: the entry's
+       * one durable identity and its place in arrival order. A write stamps
+       * the id into `metadata.deferredWriteId` (boot dedup). A re-deferral
+       * moves the same logical entry back to pending under the same id and
+       * seq, instead of minting a second, independently replayable one, or
+       * moving it behind entries that arrived after it.
        */
-      deferredWriteId?: string;
+      fromQueue?: { id: string; seq: number };
       /** Out-param: where the message landed (RFC-006 needs to find it again). */
       placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
       /**
@@ -15758,12 +15972,7 @@ export class AgentFramework {
       bypassDeferralFor?: string;
     }
   ): MessageId {
-    // Route to the named agent, else the primary (not ephemeral subagents).
-    const agent = opts?.forAgent
-      ? this.agents.get(opts.forAgent)
-      : this.primaryAgentName
-        ? this.agents.get(this.primaryAgentName)
-        : this.agents.values().next().value;
+    const agent = this.deliveryAgent(opts?.forAgent);
     if (!agent) {
       if (opts?.forAgent) {
         console.error(
@@ -15795,32 +16004,40 @@ export class AgentFramework {
     // against a FROZEN context — module events and api message.send must not
     // append mid-surgery. Deferred here, flushed by resume(). tool_result
     // still lands (a draining turn's continuation depends on it).
-    const hasToolResult = content.some(b => b.type === 'tool_result');
-    // Explicitly-targeted deliveries scope the tool-cycle check to the
-    // target (pendingAssistantBlocks is keyed by agent); the default path
-    // keeps the historical GLOBAL check byte-for-byte (conservative: any
-    // agent's pending cycle defers primary-bound messages).
-    const midToolCycle = opts?.forAgent
-      ? this.pendingAssistantBlocks.has(agent.name)
-      : this.pendingAssistantBlocks.size > 0;
+    //
+    // A write coming back from the deferred queue (fromQueue) is
+    // re-deferred whatever its content: its tool_use went back into the
+    // queue just before it, in the same drain, and a tool_result stored
+    // without it would split the pair. (A turn-end flush can run after a
+    // successor turn has taken the agent: the 2026-07-31 interleave.)
+    const freshToolResult = opts?.fromQueue === undefined && content.some(b => b.type === 'tool_result');
+    // One rule for every write, primary-bound or targeted: it waits while ITS
+    // TARGET's own tool cycle is pending (pendingAssistantBlocks is keyed by
+    // agent). Another agent's cycle says nothing about this window. The
+    // default path used to check every agent's cycle (efc7e7af, from when
+    // all agents shared one message store), which held the primary's writes
+    // behind a fork's, subagent's or the subconscious's tools, and judged a
+    // drained queue by two rules, so a later targeted entry could land ahead
+    // of an earlier primary-bound one. Residents that share the un-namespaced
+    // slot with overlapping turns put each other's writes inside the other's
+    // live turn whatever this check does: the limit #286 states.
+    const midToolCycle = this.pendingAssistantBlocks.has(agent.name);
     if (
-      !hasToolResult &&
+      !freshToolResult &&
       opts?.bypassDeferralFor !== agent.name &&
       (this.quiesced ||
         midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {
-      // A re-deferral of a drained entry keeps its id and leaves the un-acked
-      // set: one logical message, one durable identity — never two entries.
-      const id = opts?.deferredWriteId ?? randomUUID();
-      let seq: number | undefined;
-      if (opts?.deferredWriteId) {
-        const prior = this.unackedDeferredWrites.find((m) => m.id === id);
-        seq = prior?.seq;
+      // A re-deferral of a drained entry keeps its id and seq, and leaves the
+      // un-acked set: one logical message, one durable identity, one place
+      // in arrival order, whether or not the queue is persisted.
+      const id = opts?.fromQueue?.id ?? randomUUID();
+      if (opts?.fromQueue) {
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
-      this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
+      this.deferredMessages.push({ id, seq: opts?.fromQueue?.seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
@@ -15829,32 +16046,43 @@ export class AgentFramework {
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
-      opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
+      opts?.fromQueue ? withDeferredWriteId(metadata, opts.fromQueue.id) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
-    // Stored while none of the agent's turns is alive, or assembled for the
-    // start now beginning: no tool boundary will weigh it.
-    if (!this.activeTurnTokens.has(agent.name) || opts?.bypassDeferralFor === agent.name) {
+    this.noteStored(agent, metadata, stored, opts?.bypassDeferralFor);
+    return stored;
+  }
+
+  /** Where addMessage delivers: the named agent, else the primary, else the
+   *  first registered agent. Undefined when there is no such agent. */
+  private deliveryAgent(forAgent?: string): Agent | undefined {
+    return forAgent
+      ? this.agents.get(forAgent)
+      : this.primaryAgentName
+        ? this.agents.get(this.primaryAgentName)
+        : this.agents.values().next().value;
+  }
+
+  /** The notes addMessage takes for a message it stored: an arrival for the
+   *  agent when none of its turns is alive or the message was assembled for
+   *  the start now beginning (no tool boundary will weigh it), and one for
+   *  every other resident's open turn. */
+  private noteStored(agent: Agent, metadata: MessageMetadata | undefined, stored: MessageId, bypassDeferralFor?: string): void {
+    if (!this.activeTurnTokens.has(agent.name) || bypassDeferralFor === agent.name) {
       this.noteArrival(agent.name, metadata, stored);
     }
     this.noteForOtherResidents(agent, metadata, stored);
-    return stored;
   }
 
   /**
    * Splice out the deferred messages addressed to `agentName` (explicitly
    * via forAgent, or implicitly when it is the primary), leaving other
-   * targets' messages queued for their own boundaries.
+   * targets' messages queued for their own boundaries. With `stopAt`, the
+   * drain ends at the first of them (in queue order) that it matches: that
+   * message and every later one stay queued, so what is drained is always a
+   * prefix of the agent's queue.
    */
-  private drainDeferredFor(agentName: string): Array<{
-    /** Durable identity — every write of this entry must carry it
-     *  (`withDeferredWriteId` / `opts.deferredWriteId`). */
-    id: string;
-    participant: string;
-    content: ContentBlock[];
-    metadata?: MessageMetadata;
-    forAgent?: string;
-  }> {
+  private drainDeferredFor(agentName: string, stopAt?: (msg: DeferredWrite) => boolean): DeferredWrite[] {
     if (this.deferredMessages.length === 0) return [];
     const mine: typeof this.deferredMessages = [];
     const rest: typeof this.deferredMessages = [];
@@ -15862,14 +16090,187 @@ export class AgentFramework {
       const target = msg.forAgent ?? this.primaryAgentName;
       (target === agentName ? mine : rest).push(msg);
     }
-    this.deferredMessages = rest;
     mine.sort(bySeq);
+    const stop = stopAt ? mine.findIndex(stopAt) : -1;
+    const drained = stop === -1 ? mine : mine.slice(0, stop);
+    this.deferredMessages = stop === -1 ? rest : [...rest, ...mine.slice(stop)];
     // The drained messages are about to be written by the caller; they stay
     // in the DURABLE queue (as un-acked) until the caller's
     // ackDeferredWrites() has synced the chronicle. Removing them here would
     // acknowledge before the write is durable.
-    this.handOffDeferredWrites(mine);
-    return mine;
+    this.handOffDeferredWrites(drained);
+    return drained;
+  }
+
+  /**
+   * Put drained entries back into the queue under their ids and seq: out of
+   * the un-acked set, and persisted when the queue is. A memory-only queue
+   * keeps them while the framework runs.
+   */
+  private requeueDrained(entries: DeferredWrite[]): void {
+    if (entries.length === 0) return;
+    const ids = new Set(entries.map((m) => m.id));
+    this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => !ids.has(m.id));
+    for (const msg of entries) {
+      if (!this.deferredMessages.some((m) => m.id === msg.id)) this.deferredMessages.push(msg);
+    }
+    if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+  }
+
+  /**
+   * Write drained entries in queue (seq) order, whatever their targets:
+   * residents share one message slot, so the order entries arrived in is the
+   * order they're stored. Each target is cut at its own first entry that
+   * can't be stored: that entry and every later one for the same target go
+   * back into the queue under their ids and seq (requeueDrained) before
+   * anything is logged, and other targets' entries go on. Left in the
+   * un-acked set, the next ack would drop them from the durable queue.
+   *
+   * So none of a target's entries lands ahead of an earlier one, and a queued
+   * tool_use that can't be stored keeps the tool_result queued behind it from
+   * being stored alone. (A tool_use that is stored, followed by a tool_result
+   * that can't be, stays stored without it until the tool_result lands at a
+   * later flush. The only queued pair is puppetToolCall's defensive one,
+   * which no path reaches today.) An entry that keeps failing is logged by
+   * id at each flush, and holds its target's later queued writes rather than
+   * letting them land out of order.
+   *
+   * The hold is the queue's alone. A write that isn't deferred is stored at
+   * once and can land ahead of a held entry: a fresh tool_result, whatever
+   * its agent's state, and any write while its agent's turn, stream and tool
+   * cycle are all idle and the host isn't quiesced. So an entry that keeps
+   * failing holds only what is deferred behind it.
+   *
+   * A write can throw after its message is stored: a store listener, the
+   * strategy's handling of the add, or a later shard of a sharded body can
+   * throw once a record is written. Before an entry that threw is put back,
+   * its target's store is read from where it stood before the write, for
+   * messages carrying the entry's `deferredWriteId`. What it finds counts as
+   * written, at most once: the entry isn't requeued and stored a second
+   * time, and what landed, as later compiles render it (asCompiled), is what
+   * it returns as the entry's content. For a sharded body, that can be its
+   * first shards alone, since the append loop stops at the throw; the rest
+   * of the body isn't stored. (Requeued, the
+   * landed shards would be stored twice, and only the rest could not be
+   * appended later without splitting the body.) Boot's scan for landed
+   * writes counts a landed shard the same way.
+   *
+   * Returns what was written (stored, or deferred again by addMessage, whose
+   * id is then empty), in queue order: for one target, a prefix of its
+   * entries. `onLanded` hears an entry whose write threw after storing it,
+   * with the id it landed under, as soon as it's found: before the writes
+   * after it, so whatever it records keeps their order.
+   */
+  private writeDrainedInOrder(
+    entries: DeferredWrite[],
+    where: string,
+    write: (msg: DeferredWrite) => MessageId,
+    onLanded?: (msg: DeferredWrite, id: MessageId) => void,
+  ): Map<DeferredWrite, DrainedWrite> {
+    const ordered = [...entries].sort(bySeq);
+    // An entry's target as addMessage resolves it, keyed by name for the cut.
+    const targetOf = (msg: DeferredWrite): string | null => msg.forAgent ?? this.deliveryAgent()?.name ?? null;
+    const cut = new Set<string | null>();
+    const written = new Map<DeferredWrite, DrainedWrite>();
+    for (let i = 0; i < ordered.length; i++) {
+      const msg = ordered[i]!;
+      const target = targetOf(msg);
+      if (cut.has(target)) continue;
+      const agent = this.deliveryAgent(msg.forAgent);
+      const before = agent ? this.storedCountOf(agent) : undefined;
+      try {
+        written.set(msg, { id: write(msg), content: msg.content });
+      } catch (error) {
+        const landed = agent && before !== undefined ? this.storedCopiesOf(agent, before, msg.id) : [];
+        if (landed.length > 0) {
+          written.set(msg, { id: landed[0]!.id, content: asCompiled(landed) });
+          this.logDeferredWriteError(msg, where, error, { count: landed.length, sharded: landed[0]!.bodyGroupId !== undefined });
+          onLanded?.(msg, landed[0]!.id);
+          continue;
+        }
+        cut.add(target);
+        this.requeueDrained(ordered.slice(i).filter((m) => targetOf(m) === target));
+        this.logDeferredWriteError(msg, where, error);
+      }
+    }
+    return written;
+  }
+
+  /** How many messages the agent's store holds: undefined when its store
+   *  can't say. */
+  private storedCountOf(agent: Agent): number | undefined {
+    try {
+      return agent.getContextManager().getMessageCount();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The messages carrying `deferredWriteId` among those the agent's store
+   *  gained from position `from` on, in store order, with their blobs
+   *  resolved, as a request carries them. A sharded body's carry its
+   *  `bodyGroupId`. */
+  private storedCopiesOf(agent: Agent, from: number, deferredWriteId: string): Array<{ id: MessageId; content: ContentBlock[]; bodyGroupId?: string }> {
+    try {
+      const cm = agent.getContextManager();
+      return cm.getMessageWindow(from, Math.max(0, cm.getMessageCount() - from)).messages
+        .filter((m) => m.metadata?.deferredWriteId === deferredWriteId)
+        .map((m) => ({ id: m.id, content: m.content, ...(m.bodyGroupId !== undefined ? { bodyGroupId: m.bodyGroupId } : {}) }));
+    } catch (error) {
+      console.error(`[deferral] could not read ${agent.name}'s store for a deferred write that threw:`, error);
+      return [];
+    }
+  }
+
+  /** The line naming a drained write that threw: one that couldn't be stored,
+   *  which is already back in the queue, or, with `landed`, one stored before
+   *  the throw (for a sharded body, how many of its shards). Logging mustn't
+   *  fail the flush that met it, so a thrown value that has no text is named
+   *  as such. */
+  private logDeferredWriteError(
+    msg: DeferredWrite,
+    where: string,
+    error: unknown,
+    landed?: { count: number; sharded: boolean },
+  ): void {
+    let reason: string;
+    try {
+      reason = error instanceof Error ? error.message : String(error);
+    } catch {
+      reason = 'a thrown value that has no text';
+    }
+    console.error(
+      `[deferral] ${where}: deferred write ${describeDeferredWrite(msg)} for ` +
+      `${msg.forAgent ?? this.primaryAgentName ?? 'the primary'} ` +
+      (landed
+        ? `threw after ${landed.sharded
+          ? `${landed.count} shard${landed.count === 1 ? '' : 's'} of its body ${landed.count === 1 ? 'was' : 'were'} stored`
+          : 'it was stored'}; what was stored counts as written and isn't stored again: `
+        : `could not be stored; it stays queued, holding what is queued behind it for that agent: `) +
+      reason,
+    );
+  }
+
+  /** Re-add drained entries through addMessage, which stores each or defers
+   *  it again, in queue order and cut per target (writeDrainedInOrder). With
+   *  `bypassDeferral`, each is stored past its target's deferral (stop()). A
+   *  write that threw after storing missed the notes addMessage takes after a
+   *  store, so they're taken for what landed as soon as it's found, before
+   *  the writes after it: an open turn's arrivals keep the order the writes
+   *  landed in, and its newest stays the newest (remainingArrival). */
+  private readdDrained(entries: DeferredWrite[], where: string, opts?: { bypassDeferral?: boolean }): DeferredWrite[] {
+    const bypassFor = (msg: DeferredWrite): string | undefined =>
+      opts?.bypassDeferral ? this.deliveryAgent(msg.forAgent)?.name : undefined;
+    const written = this.writeDrainedInOrder(entries, where, (msg) =>
+      this.addMessage(msg.participant, msg.content, msg.metadata, {
+        fromQueue: { id: msg.id, seq: msg.seq },
+        ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+        ...(bypassFor(msg) ? { bypassDeferralFor: bypassFor(msg) } : {}),
+      }), (msg, id) => {
+      const agent = this.deliveryAgent(msg.forAgent);
+      if (agent) this.noteStored(agent, msg.metadata, id, bypassFor(msg));
+    });
+    return [...written.keys()];
   }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {
