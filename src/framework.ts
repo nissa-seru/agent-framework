@@ -545,6 +545,15 @@ interface AdmittedEnvelope {
   resolved?: { channelId: string } | { error: string; candidates?: string[] };
 }
 
+/** The domains an mcpl/manifestChanged announcement names, for its receipt:
+ *  its `domains` strings, or none when its params are missing or malformed. */
+function announcedDomainsOf(announce: unknown): string[] {
+  const domains = typeof announce === 'object' && announce !== null
+    ? (announce as { domains?: unknown }).domains
+    : undefined;
+  return Array.isArray(domains) ? domains.filter((domain): domain is string => typeof domain === 'string') : [];
+}
+
 /**
  * Whether a stream resumes its turn's request rather than starting one: a
  * budget restart, or a tool-result-guard retry. Such a start takes in no new
@@ -17266,8 +17275,12 @@ export class AgentFramework {
    */
   private async handleManifestChanged(
     connection: McplServerConnection,
-    announce: { revision?: string; domains?: string[] },
+    announce: unknown,
   ): Promise<void> {
+    // The announcement's params are the server's hints, which a notification
+    // may leave out: read the one the receipt reports here, before anything
+    // is applied, so no later step can throw on them.
+    const announcedDomains = announcedDomainsOf(announce);
     const st = this.manifestRefreshState.get(connection.id)
       ?? { inFlight: false, queued: false, lastCompletedAt: 0 };
     this.manifestRefreshState.set(connection.id, st);
@@ -17422,7 +17435,7 @@ export class AgentFramework {
         type: 'mcpl:manifest-change-receipt',
         serverId: connection.id,
         revision: connection.manifestState.lastValidatedRevision,
-        announcedDomains: announce.domains ?? [],
+        announcedDomains,
         impacts,
       });
       this.handleToolsListChanged(connection.id);
@@ -17969,7 +17982,7 @@ export class AgentFramework {
     // §17.3: a manifest-change announcement. Rate-limited re-fetch → diff
     // → §6.7 consequences → one receipt. The announcement itself carries no
     // payload and no authority; everything below acts on FETCHED content.
-    connection.on('manifest-changed', (params: { revision?: string; domains?: string[] }) => {
+    connection.on('manifest-changed', (params: unknown) => {
       void this.handleManifestChanged(connection, params).catch((err) => {
         console.error(`[mcpl] ${connection.id} manifest refresh failed:`, err instanceof Error ? err.message : err);
       });
