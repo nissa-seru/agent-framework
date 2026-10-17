@@ -1070,9 +1070,16 @@ export class WorkspaceModule implements Module {
     // the pins and watermarks as the last work left them.
     this.stopped = true;
 
-    // Persist state
-    if (this.ctx) {
-      const activeBranchId = this.store ? this.store.currentBranch().id : undefined;
+    // Persist state, once initStore() has run and the state start() was
+    // handed has been applied (savedState is cleared then). Before that this
+    // session has made no pass or write, so it has nothing to save, and the
+    // stored state stays as it was: saving would put empty or default mounts
+    // over the saved pins. A create() that fails after starting this module
+    // stops it before the host can call initStore() (#389), and an
+    // initStore() that throws after taking the store leaves the state
+    // unapplied.
+    if (this.ctx && this.store && this.savedState === null) {
+      const activeBranchId = this.store.currentBranch().id;
       const state: WorkspaceModuleState = { mounts: {}, activeBranchId };
       for (const [name, mount] of this.mounts) {
         state.mounts[name] = {

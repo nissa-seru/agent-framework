@@ -1064,6 +1064,15 @@ const WITHHELD_SPILL_DEADLINE_MS = 30_000;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
 const MAINTENANCE_TICKS_PER_PASS = 8;
+/** The teardownTimeoutMs a failed create() gives stop(): how long each of its
+ *  cleanup waits, on operator operations and then on modules and MCPL servers
+ *  together, may take. stop() leaves its deadline to its caller, who owns the
+ *  framework, but the caller of a failed create() never got one: unbounded, a
+ *  module whose stop() never settles would turn a failed boot that exits into
+ *  one that hangs. stop()'s other waits are on streams, the event loop,
+ *  maintenance and guard annotations, which a framework create() never
+ *  started has none of. */
+const FAILED_CREATE_TEARDOWN_TIMEOUT_MS = 30_000;
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
 interface LocalProviderGate {
@@ -1639,6 +1648,11 @@ export class AgentFramework {
   private stopPromise: Promise<void> | null = null;
   private stopCompleted = false;
   private ownedStoreClosed = false;
+  /** Whether the latest stop() stopped in time everything it waits on with
+   * its deadline (an operator's operations, modules and MCPL servers),
+   * whatever failed after that. create()'s release reads it to say whether
+   * part of what a failed create() started may still be running. */
+  private stopFinishedTeardown = false;
   /** An operator's operations in flight, and the config materializations they
    * start. stop() waits until this set is empty before it tears down, unless
    * its wait budget runs out. */
@@ -2148,7 +2162,13 @@ export class AgentFramework {
   }
 
   /**
-   * Create and start the framework.
+   * Create and start the framework. A create() that fails releases what it
+   * had acquired before its error reaches the caller, so that the caller can
+   * try again in the same process: the framework it had begun is stopped, as
+   * stop() stops one, but giving up after 30 s on each of stop()'s two cleanup
+   * waits, for an operator's operations already running and then for its
+   * modules and MCPL servers, and a store it opened is closed. A store the
+   * caller passed in is left open.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
     // Before anything opens or starts: a refused config must leave nothing behind.
@@ -2168,6 +2188,70 @@ export class AgentFramework {
       throw new Error('Either storePath or store must be provided');
     }
 
+    const building: { framework?: AgentFramework } = {};
+    try {
+      return await AgentFramework.createOn(store, ownsStore, config, building);
+    } catch (error) {
+      throw await AgentFramework.releaseFailedCreate(error, building.framework, store, ownsStore);
+    }
+  }
+
+  /**
+   * The error a failed create() rejects with, once what it acquired is
+   * released: the framework it had begun is stopped, with
+   * FAILED_CREATE_TEARDOWN_TIMEOUT_MS as stop()'s teardownTimeoutMs, and a
+   * store create() opened is closed even when that stop failed or timed out.
+   * stop() keeps an owned store open when its waits on operator operations,
+   * modules or MCPL servers fail or time out, so that it can be called again,
+   * but no one can call it on a framework that create() never returned. When
+   * the release doesn't finish cleanly, the rejection carries create()'s error
+   * and then the release's, and its message says what didn't finish.
+   */
+  private static async releaseFailedCreate(
+    error: unknown,
+    framework: AgentFramework | undefined,
+    store: JsStore,
+    ownsStore: boolean,
+  ): Promise<unknown> {
+    const failures: unknown[] = [];
+    const unfinished: string[] = [];
+    if (framework) {
+      try {
+        await framework.stop(FAILED_CREATE_TEARDOWN_TIMEOUT_MS);
+      } catch (stopError) {
+        failures.push(stopError);
+        // A stop can fail after everything it waits on has stopped, as stop()
+        // counts it (an MCPL server once its transport has sent the kill):
+        // finishing a guard's storage work, in its final sync, or closing the
+        // store. The message then doesn't say part of it may still be running.
+        unfinished.push(framework.stopFinishedTeardown
+          ? 'What it had started stopped, but finishing the stop failed: ' + shutdownErrorMessage(stopError)
+          : 'Stopping what it had started didn\'t finish, so part of it may still be running: ' +
+            shutdownErrorMessage(stopError));
+      }
+    }
+    if (ownsStore && !store.isClosed()) {
+      try {
+        store.close();
+      } catch (closeError) {
+        failures.push(closeError);
+        unfinished.push('Closing its store failed, so the store may still be locked: ' + shutdownErrorMessage(closeError));
+      }
+    }
+    if (failures.length === 0) return error;
+    return new AggregateError([error, ...failures],
+      `AgentFramework.create() failed: ${shutdownErrorMessage(error)}. ${unfinished.join('. ')}`);
+  }
+
+  /** create()'s work once it holds its store. The framework is named in
+   *  `building` as soon as it exists, so that create() can stop it if a later
+   *  step fails. */
+  private static async createOn(
+    store: JsStore,
+    ownsStore: boolean,
+    config: FrameworkConfig,
+    building: { framework?: AgentFramework },
+  ): Promise<AgentFramework> {
     // Register framework states
     try {
       store.registerState({ id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
@@ -2242,7 +2326,7 @@ export class AgentFramework {
       );
     }
 
-    const framework = new AgentFramework(
+    const framework = building.framework = new AgentFramework(
       store,
       ownsStore,
       config.membrane,
@@ -2726,6 +2810,7 @@ export class AgentFramework {
   }
 
   private async stopOwned(teardownTimeoutMs: number | undefined): Promise<void> {
+    this.stopFinishedTeardown = false;
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -2846,6 +2931,7 @@ export class AgentFramework {
     }
 
     const teardownSucceeded = shutdownErrors.length === 0;
+    this.stopFinishedTeardown = teardownSucceeded;
 
     // Those later annotations write nothing, so they finish at once; let them
     // record and edit their stubs before the store closes.
@@ -16555,10 +16641,9 @@ export class AgentFramework {
         // awareness generation.
         await this.connectMcplServerInternal(config, true);
       } catch (error) {
-        if (error instanceof DiscordAwarenessAccountingError) {
-          await this.mcplServerRegistry.closeAll();
-          throw error;
-        }
+        // An accounting failure ends startup. create()'s release closes every
+        // server connected so far, within its deadline.
+        if (error instanceof DiscordAwarenessAccountingError) throw error;
         // Fail-open: log and continue with remaining servers
         const err = error instanceof Error ? error : new Error(String(error));
         console.error(`Failed to connect MCPL server "${config.id}": ${err.message}${withStderr(err)}`);
@@ -16581,15 +16666,13 @@ export class AgentFramework {
     // Start the durable drain only after all startup connections are staged.
     // The awareness tools/call is written before control-plane registration is
     // flushed, preserving the server-side queue -> registration -> call order.
+    // A barrier that fails ends startup the same way, and create()'s release
+    // closes the servers. (A lazy initialization from connectMcplServer has
+    // connected none yet.)
     const startupBarrier = this.installMcplDataPlaneGate();
     this.releaseMcplDataPlaneGate(startupBarrier);
-    try {
-      await startupBarrier.promise;
-      this.completeMcplDataPlaneGate(startupBarrier);
-    } catch (error) {
-      await this.mcplServerRegistry.closeAll();
-      throw error;
-    }
+    await startupBarrier.promise;
+    this.completeMcplDataPlaneGate(startupBarrier);
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
@@ -17072,13 +17155,15 @@ export class AgentFramework {
     try {
       await awarenessBarrier.promise;
     } catch (error) {
-      // Startup cannot fail open on a broken awareness ledger. Disable the
+      // A connect cannot fail open on a broken awareness ledger. Disable the
       // reconnecting stub/connection before propagating the distinct error to
-      // initializeMcpl, which tears down any other servers and aborts create().
+      // the runtime connect or restart that asked for it. (A startup connect
+      // defers awareness and returns before this gate; a startup that fails
+      // ends in create()'s release, which closes its servers.)
       // Ordering matters: awareness accounting settles BEFORE the §5.3
       // policy round-trip below, so an accounting failure aborts with the
       // grant still empty and every buffered event still behind the gate —
-      // a failed startup never reports a released data plane. (The reverse
+      // a failed connect never reports a released data plane. (The reverse
       // order let a push arrive during the policy await and get flushed by
       // teardown.)
       await connection.close().catch(() => {});
