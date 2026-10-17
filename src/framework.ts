@@ -418,7 +418,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import { stderrTailOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
-import { isWebSocketTransport } from './mcpl/transport.js';
+import { assertServerConfigBooleans, isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -2601,10 +2601,13 @@ export class AgentFramework {
 
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
-      // Validate tool prefixes: no collisions with module names or between servers
+      // Check every server's config before any is brought up: its boolean
+      // settings, and its tool prefix, which mustn't collide with a module
+      // name or another server's prefix.
       const moduleNames = new Set(config.modules.map(m => m.name));
       const prefixesSeen = new Map<string, string>(); // prefix → serverId
       for (const serverConfig of config.mcplServers) {
+        assertServerConfigBooleans(serverConfig);
         const prefix = serverConfig.toolPrefix ?? `mcpl--${serverConfig.id}`;
         if (moduleNames.has(prefix)) {
           throw new Error(
@@ -17648,7 +17651,9 @@ export class AgentFramework {
     };
     const declared = valueIn(config.env);
     if (declared !== undefined) return { value: declared, source: 'env' };
-    const inherited = config.inheritEnv ? valueIn(process.env) : undefined;
+    // Only true inherits, as in buildChildEnv: a value that reached here
+    // unchecked keeps the protective default.
+    const inherited = config.inheritEnv === true ? valueIn(process.env) : undefined;
     return inherited !== undefined ? { value: inherited, source: 'inherited' } : undefined;
   }
 
@@ -17656,7 +17661,9 @@ export class AgentFramework {
    * Connect a new MCPL server at runtime. Refreshes the tool list and
    * notifies the agent of newly available tools. Throws if the MCPL
    * subsystem is not initialized, the id is already connected, or the
-   * connection/handshake fails.
+   * connection/handshake fails. A config whose `inheritEnv` (on a stdio
+   * server), `reconnect` or `allowHostCommands` holds anything but true,
+   * false or null is refused, as `create()` refuses one.
    */
   async connectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
@@ -17668,6 +17675,7 @@ export class AgentFramework {
   private async runConnectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    assertServerConfigBooleans(config);
     // Lazily bring up the MCPL subsystem — a framework that started with zero
     // configured servers can still deploy its first one at runtime.
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
@@ -17737,6 +17745,8 @@ export class AgentFramework {
    * same (or an updated) config. This actually respawns a stdio child —
    * unlike `reconnect: true`, which only retries after transport-level
    * failures. Throws if the server has no stored config and none is given.
+   * A config `connectMcplServer` would refuse for its boolean settings is
+   * refused before the running server is disconnected, so it stays up.
    */
   async restartMcplServer(
     id: string,
@@ -17754,6 +17764,10 @@ export class AgentFramework {
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
+    // Checked before the running server is disconnected, so a config this
+    // refuses leaves it up. (A colliding toolPrefix is refused only by the
+    // connect below, once the server is down.)
+    assertServerConfigBooleans(config);
     // Every connect reads the awareness ledger: its awareness barrier
     // reconciles it, and a stdio child taking the protective default derives
     // that from it. Read it before disconnecting, so an unreadable ledger

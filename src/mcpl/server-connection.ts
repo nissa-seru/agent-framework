@@ -551,8 +551,9 @@ export class McplServerConnection extends EventEmitter {
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-    // Store config for reconnection
-    if (config.reconnect) {
+    // Store config for reconnection. Only `true` turns reconnect on, as at
+    // every other reader of it.
+    if (config.reconnect === true) {
       connection.config = config;
       connection.hostCapabilities = hostCapabilities;
       connection.reconnectEnabled = true;
@@ -702,7 +703,7 @@ export class McplServerConnection extends EventEmitter {
     try {
       return await McplServerConnection.connect(config, hostCapabilities);
     } catch (error) {
-      if (!config.reconnect) {
+      if (config.reconnect !== true) {
         throw error;
       }
 
