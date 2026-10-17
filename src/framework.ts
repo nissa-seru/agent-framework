@@ -123,7 +123,7 @@ import {
   scriptTimeLimits,
   validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
-import { splitProseSegments } from './prose-segments.js';
+import { splitProseSegments, withoutRoundsProse } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
@@ -165,7 +165,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  * another external message is injected. The suppression prevents a
  * `send_message` followed by "sent it" from double-posting, but a new message
  * starts a new conversational round and must be answerable with plain prose.
- * `skip_reply` ends the turn at the tool-result boundary.
+ * `skip_reply` ends the turn at the tool-result boundary, unless it's refused
+ * (wake_in_seconds without an EventGate): then the turn goes on, and only its
+ * own round stays silent.
  */
 const SILENCING_TOOLS = new Set([
   'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
@@ -188,6 +190,18 @@ const WORLD_PUBLICATION_TOOLS = new Set(['say', 'whisper']);
 const isSilencingTool = (name: string): boolean => {
   const bare = bareToolName(name);
   return SILENCING_TOOLS.has(bare) || WORLD_PUBLICATION_TOOLS.has(bare);
+};
+
+/**
+ * The seconds a skip_reply call asks to be woken after: its wake_in_seconds
+ * read as a number, when that's finite and above 0, and undefined when it asks
+ * for no timed wake. Without an EventGate such a call is refused, so the
+ * dispatch that refuses it and the round that keeps its prose private both
+ * read the request here.
+ */
+const requestedSelfWakeSeconds = (input: unknown): number | undefined => {
+  const secs = Number((input as Record<string, unknown> | null | undefined)?.wake_in_seconds);
+  return Number.isFinite(secs) && secs > 0 ? secs : undefined;
 };
 
 /**
@@ -12328,6 +12342,18 @@ export class AgentFramework {
     // historical whole-turn routing so fallback-mode prose is still
     // delivered exactly once, at turn end.
     let liveProseRouting = false;
+    // XML/legacy tool mode has no roundContent, so its final response contains
+    // prose from every round. A refused skip_reply's round stays private while
+    // later rounds remain deliverable: the turn-end delivery drops that round's
+    // text by its place, the round's index among this stream's tool rounds.
+    const refusedWakeRounds = new Set<number>();
+    let toolRounds = 0;
+    // A refused skip_reply silences only its own round: the silence before it,
+    // saved as its round is dispatched, comes back at the next round or at
+    // 'complete'. It's this stream's: a budget restart starts from its
+    // trigger, and a tool-result-guard retry takes the turn's silence as
+    // 'complete' restored it, through guardRetryTurnSilenced.
+    let silenceBeforeRefusal: boolean | undefined;
 
     // Typing indicator: show "<agent> is typing…" for the whole duration of
     // this turn. Started here (paired with the finally below, so it can never
@@ -12431,6 +12457,10 @@ export class AgentFramework {
     const discardGuardHeld = (): void => { guardHeld = []; };
 
     const adoptInjectedRound = (): void => {
+      if (silenceBeforeRefusal !== undefined) {
+        turnSilenced = silenceBeforeRefusal;
+        silenceBeforeRefusal = undefined;
+      }
       if (!this.midTurnInputSignals.has(agent.name)) return;
       this.midTurnInputSignals.delete(agent.name);
 
@@ -12547,6 +12577,7 @@ export class AgentFramework {
             lastTextBlock = undefined;
             adoptInjectedRound();
             hadToolCalls = true;
+            const toolRound = toolRounds++;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
             this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
@@ -12615,6 +12646,14 @@ export class AgentFramework {
 
             agent.enterWaitingForTools(event.calls, stream);
 
+            // A refused call doesn't silence: the silence before it, and its
+            // round's other silencing calls, come back at the next round.
+            if (event.calls.some((call) => this.refusesSelfWake(call))) {
+              silenceBeforeRefusal = turnSilenced
+                || event.calls.some((call) => isSilencingTool(call.name) && !this.refusesSelfWake(call));
+              refusedWakeRounds.add(toolRound);
+            }
+
             for (const call of event.calls) {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
@@ -12673,7 +12712,8 @@ export class AgentFramework {
                     // does: its round's envelopes all stay in the context
                     // (deliverProseEnvelope's keepPrivate), as the tool
                     // promises, and skip_reply then ends the turn at this
-                    // round's tool results.
+                    // round's tool results, unless it was refused, when the
+                    // turn goes on to its next round.
                     if (!hasSameRoundPrivateThink) {
                       const keepPrivate = roundToolNames.some((n) => bareToolName(n) === 'skip_reply');
                       // The round is admitted now: its targets are resolved
@@ -12932,7 +12972,9 @@ export class AgentFramework {
             // deliveries): its targets resolve now, as a live round's do.
             const finalSpeechText = speechContent.map((b) => b.text).join('\n').trim();
             const finalSegments = hadToolCalls && allText.length > 0
-              ? splitProseSegments(liveProseRouting ? terminalContent : response.content)
+              ? splitProseSegments(liveProseRouting
+                ? terminalContent
+                : withoutRoundsProse(response.content, refusedWakeRounds))
               : [];
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
@@ -13219,13 +13261,15 @@ export class AgentFramework {
               // injected message can reset. The legacy/fallback path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
-              const toolNames = response.content
+              const toolUses = response.content
                 .filter((b) => b.type === 'tool_use')
-                .map((b) => (b as unknown as { name?: string }).name)
-                .filter((n): n is string => typeof n === 'string');
+                .map((b) => b as unknown as { name?: unknown; input?: unknown })
+                .filter((b): b is { name: string; input?: unknown } => typeof b.name === 'string');
+              const toolNames = toolUses.map((b) => b.name);
+              // A refused skip_reply isn't a silencing call; a plain one is.
               const silenced = liveProseRouting
                 ? turnSilenced
-                : turnSilenced || toolNames.some(isSilencingTool);
+                : turnSilenced || toolUses.some((b) => isSilencingTool(b.name) && !this.refusesSelfWake(b));
 
               const segments = finalSegments;
 
@@ -15275,6 +15319,18 @@ export class AgentFramework {
     return best;
   }
 
+  /**
+   * Whether this host refuses a skip_reply call: it asks for a timed wake
+   * (requestedSelfWakeSeconds), the channel registry handles skip_reply, and
+   * there's no EventGate to set the wake. The dispatch that refuses the call,
+   * the round that keeps its prose private and the turn's silencing all read
+   * it here, for the model's own calls.
+   */
+  private refusesSelfWake(call: { name?: string; input?: unknown }): boolean {
+    return call.name === 'skip_reply' && !!this.channelRegistry && !this.eventGate
+      && requestedSelfWakeSeconds(call.input) !== undefined;
+  }
+
   private dispatchToolCall(agentName: string, call: ToolCall): void {
     // Enrich call with caller identity so modules can resolve the calling agent
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
@@ -15388,18 +15444,20 @@ export class AgentFramework {
       // the agent after N seconds unless something else wakes it first
       // (any turn start cancels the pending self-wake). Armed here because
       // the framework owns the EventGate; the registry only words the
-      // confirmation. Without a gate the field is stripped so that
-      // confirmation never claims a wake that can't happen.
+      // confirmation. Without a gate, a positive timer request is refused so
+      // the model learns that its turn remains open and no wake was armed.
       if (enrichedCall.name === 'skip_reply') {
-        const inputObj = (enrichedCall.input ?? {}) as Record<string, unknown>;
-        const secs = Number(inputObj.wake_in_seconds);
-        const wants = inputObj.wake_in_seconds !== undefined && Number.isFinite(secs) && secs > 0;
-        if (wants && this.eventGate) {
+        const secs = requestedSelfWakeSeconds(enrichedCall.input);
+        if (secs !== undefined && this.eventGate) {
           const { inMs } = this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
           console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
-        } else if (inputObj.wake_in_seconds !== undefined && !this.eventGate) {
-          delete inputObj.wake_in_seconds;
-          console.error(`[self-wake] agent=${agentName} wake_in_seconds requested but no EventGate — ignored`);
+        } else if (this.refusesSelfWake(enrichedCall)) {
+          const error = "Your turn didn't end, and no wake was set: this host can't wake you on a timer, so skip_reply can't take wake_in_seconds here. To end the turn and wait for the next message, call skip_reply without it. Anything you meant to come back to, do now.";
+          console.error(`[self-wake] agent=${agentName} No EventGate configured (FrameworkConfig.gate is unset). ${error}`);
+          this.toolLifecycleEmitter?.refuse(agentName, enrichedCall.id);
+          this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
+          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result: { success: false, error, isError: true } });
+          return;
         }
       }
       this.dispatchChannelToolCall(agentName, enrichedCall);
@@ -16393,6 +16451,7 @@ export class AgentFramework {
           const routing = this.turnRouting.get(agentName);
           return routing?.locus ?? routing?.triggerChannel;
         },
+        eventGatePresent: this.eventGate !== null,
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
