@@ -91,6 +91,32 @@ describe('probe S: where #546 keeps held channel traffic', () => {
     } finally { await f.close(); }
   });
 
+  it('S4: a module reading the slot gets the held row, stamped, and a held:true filter keeps it', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'noisy');
+      enter(f, 'noisy');
+      await incoming(f, 'noisy', 'm1', 'S4-HELD chatter in noisy', AMBIENT);
+      await settle(f);
+      // The function modules get as ctx.queryMessages (framework.ts:2830).
+      const query = (f.framework as unknown as {
+        queryMessages(filter: object): { messages: Array<Record<string, unknown>> };
+      }).queryMessages({});
+      const isHeldText = (m: Record<string, unknown>): boolean => JSON.stringify(m.content).includes('S4-HELD');
+      const row = query.messages.find(isHeldText);
+      // connectome-host's retrieval module: drop held:true rows, take the last 10 (retrieval-module.ts:460-465).
+      const recent = query.messages.filter((m) => m.held !== true).slice(-10);
+      const observed = {
+        returned: !!row,
+        stampedTuneOut: row ? !!(row.metadata as { tuneOut?: unknown } | undefined)?.tuneOut : null,
+        heldFlag: row ? (row.held ?? null) : null,
+        inRetrievalsLastTen: recent.some(isHeldText),
+      };
+      console.log('PROBE-S4', JSON.stringify(observed));
+      assert.deepEqual(observed, { returned: true, stampedTuneOut: true, heldFlag: null, inRetrievalsLastTen: true });
+    } finally { await f.close(); }
+  });
+
   it('S3: a restart keeps held messages, and the release after it carries them', async () => {
     const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
     try {
