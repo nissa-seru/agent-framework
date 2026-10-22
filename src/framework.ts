@@ -5449,11 +5449,16 @@ export class AgentFramework {
    * that agent are. While the host is quiesced, it waits behind what's
    * already held until resume(). While the agent's turn is alive, it waits
    * for that agent's next boundary: a tool round's results, where the live
-   * stream can hear it, or the turn's end. Otherwise it's stored now. An
-   * ordinary resident's window is the slot the residents share, so every
-   * resident reads it. A name that isn't a registered agent throws, naming
-   * it, rather than dropping the note. Content the store won't take throws
-   * MalformedContentError, as a module's write does.
+   * stream can hear it, or the turn's end. Otherwise it's stored now. It
+   * requests no turn: the agent reads the note at its next one. An ordinary
+   * resident's window is the slot the residents share, so every resident
+   * reads it, and the hold weighs only the named agent's turn: a note for
+   * one resident can land while another resident's turn is alive. A name
+   * that isn't a registered agent throws, naming it, rather than dropping
+   * the note. So does content holding a `tool_use` or `tool_result` block,
+   * naming it: a note has no call to pair with, and a tool result would skip
+   * the hold. Content the store won't take throws MalformedContentError, as
+   * a module's write does.
    */
   addMessageFor(agentName: string, participant: string, content: ContentBlock[], metadata?: MessageMetadata): void {
     if (!this.agents.has(agentName)) {
@@ -5461,6 +5466,12 @@ export class AgentFramework {
       throw new Error(
         `addMessageFor: no registered agent is named ${JSON.stringify(agentName)}` +
         (registered.length > 0 ? `; the registered agents are ${registered.map((n) => JSON.stringify(n)).join(', ')}.` : '; no agent is registered.'),
+      );
+    }
+    const tool = content.findIndex((block) => block?.type === 'tool_use' || block?.type === 'tool_result');
+    if (tool >= 0) {
+      throw new Error(
+        `addMessageFor: content[${tool}] is a ${content[tool].type} block; a note holds no tool call or result, since it has no call to pair with.`,
       );
     }
     this.addMessage(participant, content, metadata, { forAgent: agentName });

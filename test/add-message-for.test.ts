@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MalformedContentError } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
-import type { ProcessEvent } from '../src/index.js';
+import type { Module, ModuleContext, ProcessEvent, ProcessState, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function internals(framework: AgentFramework) {
@@ -51,6 +51,25 @@ function channelIncoming(body: string, targetAgents: string[]): ProcessEvent {
     triggerInference: true,
     targetAgents,
   } as unknown as ProcessEvent;
+}
+
+/** A tool whose call leaves the primary a note through addMessageFor while its round is pending. */
+class NoteModule implements Module {
+  readonly name = 'notes';
+  framework: AgentFramework | null = null;
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'note', description: 'Leave a note', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    this.framework!.addMessageFor('scout', 'host', text('mid-turn note'));
+    return { success: true, data: { ok: true } };
+  }
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return { addMessages: [{ participant: 'user', content: text('go') }], requestInference: true };
+  }
 }
 
 describe('addMessageFor', () => {
@@ -144,6 +163,36 @@ describe('addMessageFor', () => {
     await framework.stop();
   });
 
+  it("holds a note written during the agent's own tool round, and lands it after that round's results, where the live stream hears it", async () => {
+    const module = new NoteModule();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [module],
+    });
+    module.framework = framework;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'n1', name: 'notes--note', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+
+    // The live stream heard it with the round's results.
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.deepEqual(injected.map((m) => (m.content[0] as { text?: string }).text), ['mid-turn note']);
+    // Stored after the round's results, before the reply that followed.
+    const rows = framework.getAgent('scout')!.getContextManager().getAllMessages();
+    const at = (pred: (m: (typeof rows)[number]) => boolean) => rows.findIndex(pred);
+    const result = at((m) => m.content.some((b) => b.type === 'tool_result'));
+    const note = at((m) => (m.content[0] as { text?: string }).text === 'mid-turn note');
+    const reply = at((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'done'));
+    assert.ok(result >= 0 && result < note && note < reply, JSON.stringify({ result, note, reply }));
+    assert.equal(internals(framework).deferredMessages.length, 0);
+    await framework.stop();
+  });
+
   it('throws for a name that is no registered agent, naming it, and stores and holds nothing', async () => {
     const framework = await makeFramework();
     const before = texts(framework, 'scout').length;
@@ -153,6 +202,29 @@ describe('addMessageFor', () => {
     );
     assert.equal(internals(framework).deferredMessages.length, 0);
     assert.equal(texts(framework, 'scout').length, before);
+    await framework.stop();
+  });
+
+  it('throws for content holding a tool call or result, naming the block, and stores and holds nothing', async () => {
+    const framework = await makeFramework();
+    const before = texts(framework, 'scout').length;
+    assert.throws(
+      () => framework.addMessageFor('shade', 'host', [
+        { type: 'text', text: 'see' },
+        { type: 'tool_result', toolUseId: 't1', content: 'ok' },
+      ] as unknown as ContentBlock[]),
+      { message: 'addMessageFor: content[1] is a tool_result block; a note holds no tool call or result, since it has no call to pair with.' },
+    );
+    assert.throws(
+      () => framework.addMessageFor('shade', 'host', [{ type: 'tool_use', id: 't2', name: 'x', input: {} }] as unknown as ContentBlock[]),
+      { message: 'addMessageFor: content[0] is a tool_use block; a note holds no tool call or result, since it has no call to pair with.' },
+    );
+    // Held while quiesced or not, a tool result would have skipped the hold.
+    await framework.quiesce({ reason: 'test' });
+    assert.throws(() => framework.addMessageFor('shade', 'host', [{ type: 'tool_result', toolUseId: 't3', content: 'ok' }] as unknown as ContentBlock[]));
+    assert.equal(internals(framework).deferredMessages.length, 0);
+    assert.equal(texts(framework, 'scout').length, before);
+    await framework.resume();
     await framework.stop();
   });
 
