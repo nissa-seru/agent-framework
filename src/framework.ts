@@ -5444,6 +5444,29 @@ export class AgentFramework {
   }
 
   /**
+   * Write a message into the named agent's window, for host code that leaves
+   * an agent a note. It's held and lands as the framework's own writes for
+   * that agent are. While the host is quiesced, it waits behind what's
+   * already held until resume(). While the agent's turn is alive, it waits
+   * for that agent's next boundary: a tool round's results, where the live
+   * stream can hear it, or the turn's end. Otherwise it's stored now. An
+   * ordinary resident's window is the slot the residents share, so every
+   * resident reads it. A name that isn't a registered agent throws, naming
+   * it, rather than dropping the note. Content the store won't take throws
+   * MalformedContentError, as a module's write does.
+   */
+  addMessageFor(agentName: string, participant: string, content: ContentBlock[], metadata?: MessageMetadata): void {
+    if (!this.agents.has(agentName)) {
+      const registered = [...this.agents.keys()];
+      throw new Error(
+        `addMessageFor: no registered agent is named ${JSON.stringify(agentName)}` +
+        (registered.length > 0 ? `; the registered agents are ${registered.map((n) => JSON.stringify(n)).join(', ')}.` : '; no agent is registered.'),
+      );
+    }
+    this.addMessage(participant, content, metadata, { forAgent: agentName });
+  }
+
+  /**
    * Get the per-channel conversation router (null unless config.conversations
    * was set). Exposed for modules/UIs that surface active engagements.
    */
