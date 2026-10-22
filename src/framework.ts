@@ -5446,21 +5446,35 @@ export class AgentFramework {
   /**
    * Write a message into the named agent's window, for host code that leaves
    * an agent a note. It's held and lands as the framework's own writes for
-   * that agent are. While the host is quiesced, it waits behind what's
-   * already held until resume(). While the agent's turn is alive, it waits
-   * for that agent's next boundary: a tool round's results, where the live
-   * stream can hear it, or the turn's end. Otherwise it's stored now. It
-   * requests no turn: the agent reads the note at its next one. An ordinary
-   * resident's window is the slot the residents share, so every resident
-   * reads it, and the hold weighs only the named agent's turn: a note for
-   * one resident can land while another resident's turn is alive. A name
-   * that isn't a registered agent throws, naming it, rather than dropping
-   * the note. So does content holding a `tool_use` or `tool_result` block,
-   * naming it: a note has no call to pair with, and a tool result would skip
-   * the hold. Content the store won't take throws MalformedContentError, as
-   * a module's write does.
+   * that agent are:
+   * - Stored now, while the host isn't quiesced and the agent is idle: no
+   *   turn of its alive and no tool cycle of its pending.
+   * - Otherwise held, in order behind what's already held for the agent,
+   *   until the first of that agent's boundaries: a tool round's results,
+   *   where a stream that takes injected messages hears it (a turn still
+   *   running out a quiesce's drain included); once the host isn't
+   *   quiesced, its turn's end or its next turn's start, before that
+   *   request is compiled; or resume(), while the host is quiesced. A note
+   *   whose participant is the agent's own name would read as the agent's
+   *   own words, so it isn't heard at a tool round, and what's held behind
+   *   it waits with it.
+   * It requests no turn: the agent reads the note at its next one. An
+   * ordinary resident's window is the slot the residents share, so every
+   * resident reads it, and the hold weighs only the named agent's turn: a
+   * note for one resident can land while another resident's turn is alive.
+   *
+   * It throws, naming what it refuses, rather than dropping the note: once
+   * stop() has begun, as the other operator calls do; for a name that isn't
+   * a registered agent now (a conversation fork leaves the registry when
+   * it's disposed, as a stop disposes every one, and an ephemeral agent when
+   * its run ends, and a note still held for one when it leaves isn't read
+   * by it); and for content holding a `tool_use` or `tool_result` block,
+   * since a note has no call to pair with and a tool result would skip the
+   * hold. Content the store won't take throws MalformedContentError, as a
+   * module's write does.
    */
   addMessageFor(agentName: string, participant: string, content: ContentBlock[], metadata?: MessageMetadata): void {
+    this.refuseOperatorAfterStop('addMessageFor');
     if (!this.agents.has(agentName)) {
       const registered = [...this.agents.keys()];
       throw new Error(
@@ -5468,7 +5482,10 @@ export class AgentFramework {
         (registered.length > 0 ? `; the registered agents are ${registered.map((n) => JSON.stringify(n)).join(', ')}.` : '; no agent is registered.'),
       );
     }
-    const tool = content.findIndex((block) => block?.type === 'tool_use' || block?.type === 'tool_result');
+    // Content that isn't an array is the store's to refuse, as malformed.
+    const tool = Array.isArray(content)
+      ? content.findIndex((block) => block?.type === 'tool_use' || block?.type === 'tool_result')
+      : -1;
     if (tool >= 0) {
       throw new Error(
         `addMessageFor: content[${tool}] is a ${content[tool].type} block; a note holds no tool call or result, since it has no call to pair with.`,

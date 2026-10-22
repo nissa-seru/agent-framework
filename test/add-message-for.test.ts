@@ -53,17 +53,30 @@ function channelIncoming(body: string, targetAgents: string[]): ProcessEvent {
   } as unknown as ProcessEvent;
 }
 
-/** A tool whose call leaves the primary a note through addMessageFor while its round is pending. */
+/**
+ * A tool whose call leaves the primary a note through addMessageFor while its
+ * round is pending. With quiesceFirst, the call first starts a quiesce, which
+ * waits for this turn to drain, and writes the note once the host is quiesced.
+ */
 class NoteModule implements Module {
   readonly name = 'notes';
   framework: AgentFramework | null = null;
+  quiesceFirst = false;
+  quiesce: Promise<unknown> | null = null;
+  quiescedAtWrite: boolean | null = null;
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
     return [{ name: 'note', description: 'Leave a note', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
-    this.framework!.addMessageFor('scout', 'host', text('mid-turn note'));
+    const framework = this.framework!;
+    if (this.quiesceFirst) {
+      this.quiesce = framework.quiesce({ reason: 'test', timeoutMs: 5_000 });
+      for (let n = 0; n < 200 && !framework.getHostModeStatus().quiesced; n++) await new Promise((r) => setTimeout(r, 5));
+      this.quiescedAtWrite = framework.getHostModeStatus().quiesced;
+    }
+    framework.addMessageFor('scout', 'host', text('mid-turn note'));
     return { success: true, data: { ok: true } };
   }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -98,10 +111,15 @@ describe('addMessageFor', () => {
     });
   }
 
-  it('stores a note for an idle agent at once, in its window', async () => {
+  it('stores a note for an idle agent at once, in its window, with its participant and metadata', async () => {
     const framework = await makeFramework();
-    framework.addMessageFor('shade', 'host', text('note for shade'));
-    assert.ok(texts(framework, 'shade').includes('note for shade'));
+    framework.addMessageFor('shade', 'host-update', text('note for shade'), { source: 'host-update', step: 4 });
+    const row = framework.getAgent('shade')!.getContextManager().getAllMessages()
+      .find((m) => (m.content[0] as { text?: string }).text === 'note for shade');
+    assert.ok(row, 'stored');
+    assert.equal(row.participant, 'host-update');
+    assert.equal(row.metadata?.source, 'host-update');
+    assert.equal(row.metadata?.step, 4);
     // The ordinary residents share one slot, so the primary reads it too.
     assert.ok(texts(framework, 'scout').includes('note for shade'));
     assert.equal(internals(framework).deferredMessages.length, 0);
@@ -150,6 +168,7 @@ describe('addMessageFor', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'scout says hi' }]));
     framework.pushEvent(channelIncoming('wake scout', ['scout']));
     await framework.runUntilIdle();
+    assert.ok(texts(framework, 'scout').includes('scout says hi'), "the primary's turn ran");
     assert.equal(i.deferredMessages.length, 1, "shade's note survives the primary's boundary");
     assert.ok(!texts(framework, 'shade').includes('note for busy shade'));
 
@@ -193,6 +212,35 @@ describe('addMessageFor', () => {
     await framework.stop();
   });
 
+  it("lands a note written while quiesced at the tool round of a turn still running out the quiesce's drain, before resume", async () => {
+    const module = new NoteModule();
+    module.quiesceFirst = true;
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [module],
+    });
+    module.framework = framework;
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'n1', name: 'notes--note', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    const status = await module.quiesce as { quiesced: boolean; drained: boolean };
+    assert.equal(module.quiescedAtWrite, true, 'written while quiesced');
+    assert.deepEqual([status.quiesced, status.drained], [true, true]);
+
+    const injected = membrane.lastStream!.receivedToolResultOptions[0]?.injectedMessages ?? [];
+    assert.deepEqual(injected.map((m) => (m.content[0] as { text?: string }).text), ['mid-turn note']);
+    assert.ok(texts(framework, 'scout').includes('mid-turn note'), 'stored before resume');
+    assert.equal(framework.getHostModeStatus().quiesced, true);
+    assert.equal(internals(framework).deferredMessages.length, 0);
+    await framework.resume();
+    await framework.stop();
+  });
+
   it('throws for a name that is no registered agent, naming it, and stores and holds nothing', async () => {
     const framework = await makeFramework();
     const before = texts(framework, 'scout').length;
@@ -203,6 +251,50 @@ describe('addMessageFor', () => {
     assert.equal(internals(framework).deferredMessages.length, 0);
     assert.equal(texts(framework, 'scout').length, before);
     await framework.stop();
+
+    const empty = await AgentFramework.create({
+      storePath: join(tempDir, 'empty.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [],
+      modules: [],
+    });
+    assert.throws(
+      () => empty.addMessageFor('scout', 'host', text('lost')),
+      { message: 'addMessageFor: no registered agent is named "scout"; no agent is registered.' },
+    );
+    await empty.stop();
+  });
+
+  it('throws for an ephemeral agent whose run has ended, as for any name no longer registered', async () => {
+    const framework = await makeFramework();
+    const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Work.' });
+    created.contextManager.addMessage('user', text('Complete.'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    await framework.runUntilIdle();
+    await run;
+    assert.equal(framework.getAgent('worker'), null);
+    assert.throws(
+      () => framework.addMessageFor('worker', 'host', text('late')),
+      { message: 'addMessageFor: no registered agent is named "worker"; the registered agents are "scout", "shade".' },
+    );
+    created.cleanup();
+    await framework.stop();
+  });
+
+  it('refuses once stop() has begun, and after it resolves', async () => {
+    const framework = await makeFramework();
+    const stopping = framework.stop();
+    assert.throws(
+      () => framework.addMessageFor('scout', 'host', text('late')),
+      { message: 'addMessageFor refused: the framework is stopping' },
+    );
+    assert.equal(internals(framework).deferredMessages.length, 0);
+    await stopping;
+    assert.throws(
+      () => framework.addMessageFor('scout', 'host', text('later')),
+      { message: 'addMessageFor refused: the framework is stopping' },
+    );
   });
 
   it('throws for content holding a tool call or result, naming the block, and stores and holds nothing', async () => {
@@ -228,13 +320,25 @@ describe('addMessageFor', () => {
     await framework.stop();
   });
 
-  it("throws for content the store won't take, as a module's write does", async () => {
+  it("throws for content the store won't take, as a module's write does, whether or not the note would be held", async () => {
     const framework = await makeFramework();
     assert.throws(
       () => framework.addMessageFor('shade', 'host', [{ type: 'text', text: 5 }] as unknown as ContentBlock[]),
       MalformedContentError,
     );
+    // Content that isn't an array at all, as an untyped caller could pass.
+    assert.throws(
+      () => framework.addMessageFor('shade', 'host', 'note' as unknown as ContentBlock[]),
+      MalformedContentError,
+    );
+    // While quiesced, refused at once rather than held.
+    await framework.quiesce({ reason: 'test' });
+    assert.throws(
+      () => framework.addMessageFor('shade', 'host', [{ type: 'text', text: 5 }] as unknown as ContentBlock[]),
+      MalformedContentError,
+    );
     assert.equal(internals(framework).deferredMessages.length, 0);
+    await framework.resume();
     await framework.stop();
   });
 });
