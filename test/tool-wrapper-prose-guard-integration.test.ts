@@ -391,7 +391,8 @@ describe('tool wrapper prose guard integration', () => {
       disposeConversationAgent(agentName: string): void;
       agents: Map<string, object>;
     };
-    const fork = { name: 'fork' };
+    // Disposal cancels the agent's stream, whatever it holds, as any end of a live agent does.
+    const fork = { name: 'fork', cancelStream() {} };
     internals.agents.set('fork', fork);
     internals.logicalTurnToolCalls.set(fork, { turnToken: 1, count: 1 });
     internals.disposeConversationAgent('fork');
