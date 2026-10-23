@@ -71,7 +71,11 @@ framework.listPolicyEpochs();                   // tune-out holds in force
 framework.listHeldMail();                       // results not yet delivered, and why
 ```
 
-Ended agents stay inspectable. The registry keeps live records in the Chronicle state `framework/dendrite` and ended records in the append log `framework/dendrite/ended`.
+Ended agents stay inspectable. The registry keeps live records, held mail and incarnation counters in a snapshot, and ended records in an append-only log. With a `storePath`, both are recovery files beside the store, `recovery/agent-registry.json` and `recovery/agent-registry-ended.jsonl`, as host mode and the deferred-write queue are, so switching the store's branch (an undo, an operator's surgery) doesn't rewind them. A framework given a `store` and no `storePath` keeps them in the Chronicle state `framework/dendrite` and the append log `framework/dendrite/ended`, where a branch switch does rewind them. A store from before the recovery files is moved into them at its first boot: its ended history first, then the snapshot.
+
+What the registry stores, `create()` reads strictly. A snapshot or ended-log line that can't be read, or isn't in a form the registry reads (another version, held mail that isn't mail), refuses `create()` with an error naming the record and leaves it as it was: taken as empty, the next write would replace it, held results included. Nothing stored is an empty registry. The ended log's last line without its newline is an append a crash cut short; it is dropped, and the file is cut back to the last whole line.
+
+A write that fails isn't taken as done. A change a caller asks for (`stopAgent`, `reparentAgent`, `sendAgentMessage`, `deliverAgentResult`, and each agent's registration) is stored before it takes effect: when the write fails, the call throws and the registry is as it was. A fact the registry records after it happened (a run's end, an idle reap, a landed message's release, a restart's interruptions) can't be undone, so a failed write keeps it in memory, raises an `agent-registry` ops alert, and the registry's next write carries it. An ended record is stored in the snapshot that records the end, then appended to the log; a record the log couldn't take stays in the snapshot until it can.
 
 ## Lifecycle
 
@@ -86,7 +90,7 @@ framework.reparentAgent('job', 'mira');
 ```
 
 - `cancelActivation` aborts the run in flight and leaves the agent registered. A bounded job lives for one run, so cancelling its run ends it.
-- `stopAgent` ends the agent. The caller that is awaiting its run receives an `AgentStoppedError`. The agent with `defaultDelivery` cannot be stopped; cancel its activation instead.
+- `stopAgent` ends the agent. The caller that is awaiting its run receives an `AgentStoppedError`. The agent with `defaultDelivery` cannot be stopped; cancel its activation instead. A stopped agent's window is released as an idle conversation fork's is: writes still queued for it land in its own context, and a delivery-failure notice it never read goes on to the primary. While the host is quiesced, the release waits for `resume()`.
 - A `task` lifetime's `deadlineMs` is enforced: the run is rejected with `AgentStoppedError` when it passes.
 
 ### When a parent ends
@@ -111,6 +115,8 @@ A host's `stop()` does not end bounded work it cuts off: a fork or job still run
 - A persistent agent that the configuration no longer declares is ended with reason `not-configured`.
 - Results held from before the restart are delivered, once.
 
+These run after host mode and the deferred-write queue are restored. On a host that boots quiesced, the restart notices and redelivered mail wait in the queue for `resume()`, like any write. Held mail whose message the restored queue already carries lands with that entry rather than a second time.
+
 ## Messages and results
 
 ```ts
@@ -122,7 +128,7 @@ Both put the sender's content in the recipient's context **under the sender's ow
 
 Published is not delivered. `dendrite:mail-deferred` fires when a message is queued for a recipient's next boundary; `dendrite:mail-delivered` fires only when it has entered the recipient's store. Neither says the model has seen it; that is a separate event the framework does not yet record.
 
-A result is written to the registry and synced to disk before delivery is attempted. It is released only when its message has entered the recipient's store. Consequences:
+A result is written to the registry and synced to disk before delivery is attempted; if it can't be, `deliverAgentResult` throws and nothing is held or delivered. It is released only when its message has entered the recipient's store, and, with the registry in its recovery file, only once the store has synced, so the release never reaches disk before the message does. Consequences:
 
 - If the recipient is mid-turn, the result waits for its next boundary and stays held until then.
 - If the process stops in between, the next boot delivers it, after checking the recipient's store for the mail id so it is never delivered twice.

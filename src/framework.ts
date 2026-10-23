@@ -4,8 +4,8 @@ import { dirname, join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceBlockForScript, referenceRegistry, referenceStubOrNull, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import {
-  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
-  writeFileSync,
+  appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, truncateSync,
+  unlinkSync, writeFileSync,
 } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
@@ -116,6 +116,8 @@ import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttemp
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import {
   AgentRegistry,
+  RegistryFormError,
+  checkEndedRecords,
   conversationForkSpec,
   residentSpec,
   subconsciousSpec,
@@ -2634,6 +2636,12 @@ export class AgentFramework {
    *  deferredWritesPath). Undefined → branch-local slot fallback. */
   private hostModePath: string | undefined;
   private deferredWritesPath: string | undefined;
+  /** The agent registry's recovery files, beside the store, so a branch
+   *  switch doesn't rewind it: its snapshot, and its ended log, one JSON
+   *  record a line. Undefined without a storePath: the registry keeps to
+   *  the store's own states (AGENT_REGISTRY_STATE_ID and _ENDED_ID). */
+  private agentRegistryPath: string | undefined;
+  private agentRegistryEndedPath: string | undefined;
   private recoveryFallbackWarned = false;
   /**
    * Deferred writes that have been handed to a context manager but whose
@@ -2792,6 +2800,8 @@ export class AgentFramework {
   private readonly registry: AgentRegistry = new AgentRegistry({
     persist: (snapshot) => this.persistAgentRegistry(snapshot),
     appendEnded: (record) => this.appendEndedAgentRecord(record),
+    onWriteFailed: (error, what) => this.agentRegistryWriteFailed(error, what),
+    onWriteCaughtUp: () => console.error(`[dendrite] the agent registry's writes succeed again: ${this.agentRegistryRecord()} holds it as it stands`),
   });
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
@@ -3278,7 +3288,14 @@ export class AgentFramework {
 
     // What the previous process left in the agent registry. Read before any
     // agent is declared so a restored persistent agent becomes a new
-    // incarnation of the same identity rather than a stranger.
+    // incarnation of the same identity rather than a stranger. Its records
+    // live outside branch history, like host mode and the deferred queue
+    // below: a rollback mustn't take back held mail, or the ends that keep
+    // a name's incarnations counting.
+    if (config.storePath) {
+      framework.agentRegistryPath = join(config.storePath, 'recovery', 'agent-registry.json');
+      framework.agentRegistryEndedPath = join(config.storePath, 'recovery', 'agent-registry-ended.jsonl');
+    }
     const interruptedAgents = framework.restoreAgentRegistry();
 
     // Create agents
@@ -3297,11 +3314,6 @@ export class AgentFramework {
         await framework.createSubconsciousAgent(config.subconscious);
       }
     }
-
-    // Configuration has now declared its agents: settle what the previous
-    // process left unfinished (interrupted bounded work, persistent agents
-    // no longer configured, results still held for delivery).
-    framework.reconcileAgentRegistry(interruptedAgents);
 
     // Finish any branch-local suppression interrupted after Chronicle switched
     // branches. This runs before modules, MCPL connections, or inbound traffic.
@@ -3502,6 +3514,14 @@ export class AgentFramework {
         });
       }
     }
+
+    // Configuration has declared its agents, and host mode and the deferred
+    // queue are restored: settle what the previous process left unfinished
+    // (interrupted bounded work, persistent agents no longer configured,
+    // results still held for delivery). Its notices and redelivered mail go
+    // through addMessage like any write, so a host that boots quiesced holds
+    // them in the queue until resume().
+    framework.reconcileAgentRegistry(interruptedAgents);
 
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
@@ -8830,7 +8850,9 @@ export class AgentFramework {
         `stopAgent: "${name}" owns default delivery and cannot be stopped; use cancelActivation to end its current run`,
       );
     }
-    const outcome = this.registry.end(name, 'stopped', options.by)!;
+    // Stored before anything is torn down: a stop that can't be stored
+    // fails and leaves the agent running.
+    const outcome = this.registry.transact(() => this.registry.end(name, 'stopped', options.by))!;
     this.teardownEndedAgent(outcome.ended, options.reason);
     this.settleEndedAgent(outcome);
     return structuredClone(outcome);
@@ -8842,7 +8864,7 @@ export class AgentFramework {
    * produced for the lost recipient are delivered to the new one.
    */
   reparentAgent(name: string, newParent: string, options: { by?: string } = {}): AgentRecord {
-    const { record, deliverable } = this.registry.reparent(name, newParent);
+    const { record, deliverable } = this.registry.transact(() => this.registry.reparent(name, newParent));
     this.emitTrace({
       type: 'dendrite:agent-reparented',
       agentName: name,
@@ -8874,13 +8896,17 @@ export class AgentFramework {
   ): { mailId: string; delivered: boolean } {
     if (!this.registry.inspect(from)) throw new Error(`sendAgentMessage: sender "${from}" is not a known agent`);
     if (!this.registry.inspect(to)) throw new Error(`sendAgentMessage: recipient "${to}" is not a known agent`);
-    this.registry.noteMessagePath(from, to);
-    const mail = this.registry.holdMail({
-      kind: 'message',
-      from: this.registry.ref(from),
-      to,
-      content,
-      ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
+    // Held, and its path noted, before delivery is attempted: a message
+    // that can't be stored isn't sent, and the call fails.
+    const mail = this.registry.transact(() => {
+      this.registry.noteMessagePath(from, to);
+      return this.registry.holdMail({
+        kind: 'message',
+        from: this.registry.ref(from),
+        to,
+        content,
+        ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
+      });
     });
     return { mailId: mail.id, delivered: this.attemptMailDelivery(mail, options.wake ?? true) };
   }
@@ -8909,15 +8935,35 @@ export class AgentFramework {
         `deliverAgentResult: "${from}" returns its result as a ${route.as}; the caller awaiting the run delivers it`,
       );
     }
-    const mail = this.registry.holdMail({
+    // A finished job's output must survive a hard exit before its delivery
+    // is attempted. A result that can't be held durably isn't delivered, and
+    // the call fails with nothing held, so calling again holds it once.
+    const mail = this.registry.transact(() => this.registry.holdMail({
       kind: 'result',
       from: { agent: from, incarnation: record.incarnation },
       to: route.to,
       content,
       ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
-    });
-    // A finished job's output must survive a hard exit from here on.
-    try { this.store.sync(); } catch (error) { console.error('[dendrite] sync after holding a result failed:', error); }
+    }));
+    // The recovery file is synced as it's written. The store's state isn't
+    // until the store syncs, so without the file the hold is taken back
+    // when that sync fails.
+    if (!this.agentRegistryPath) {
+      try {
+        this.store.sync();
+      } catch (error) {
+        try {
+          this.registry.transact(() => this.registry.releaseMail(mail.id));
+        } catch (releaseError) {
+          console.error(`[dendrite] ${from}'s result ${mail.id} couldn't be taken back after a failed sync:`, releaseError);
+        }
+        throw new Error(
+          `deliverAgentResult: "${from}"'s result couldn't be made durable (the store's sync failed: ${thrownText(error)}), ` +
+            'so it was neither held nor delivered',
+          { cause: error },
+        );
+      }
+    }
     return { mailId: mail.id, delivered: this.attemptMailDelivery(mail), to: route.to };
   }
 
@@ -9116,7 +9162,8 @@ export class AgentFramework {
   /**
    * Remove an ended agent's live object from the framework. A bounded run
    * is ended through its awaiting caller (whose teardown owns the
-   * name-keyed state); any other agent is torn down here.
+   * name-keyed state and releases the run's window); any other agent is
+   * torn down here (removeLiveAgent).
    */
   private teardownEndedAgent(record: AgentRecord, detail?: string): void {
     const name = record.name;
@@ -9130,24 +9177,55 @@ export class AgentFramework {
     }
     const agent = this.agents.get(name);
     if (!agent) return;
-    if (record.homeChannel && this.conversationRouter?.getBinding(record.homeChannel)?.agentName === name) {
-      this.conversationRouter.unbind(record.homeChannel);
+    this.removeLiveAgent(agent, record.homeChannel);
+  }
+
+  /**
+   * Take a non-ephemeral agent's live object out of the framework, however
+   * it ended: stopAgent, a cascade from its parent's end, or a conversation
+   * fork's idle reap. Its stream is cancelled before deregistration, so a
+   * late stream event is discarded by driveStream's Agent-identity check
+   * once the name no longer maps to it. Then its window is released
+   * (releaseWindowNowOrAfterResume): writes still queued for it land there
+   * rather than wait for a boundary it never reaches, and a failure notice
+   * it never read goes on to the primary. Everything the framework keeps by
+   * its name goes with it.
+   */
+  private removeLiveAgent(agent: Agent, homeChannel: string | undefined): void {
+    const name = agent.name;
+    if (homeChannel && this.conversationRouter?.getBinding(homeChannel)?.agentName === name) {
+      this.conversationRouter.unbind(homeChannel);
     }
     this.closingConversationAgents.delete(name);
-    // Cancel before deregistration: a late stream event is discarded by
-    // driveStream's Agent-identity check once the name no longer maps to it.
     agent.cancelStream();
     this.activeStreams.delete(name);
     this.pendingAssistantBlocks.delete(name);
+    this.turnRouting.delete(name);
+    this.proseSpeechChains.delete(name);
+    this.openLogical.delete(name);
     this.eventGate?.onInferenceEnded(name);
     this.agents.delete(name);
+    this.releaseWindowNowOrAfterResume(agent);
     this.agentConfigs.delete(name);
     this.toolImageLedgers.delete(name);
+    this.toolSurfaceOwners.delete(name);
     this.evictTurnCheckpoints(name);
     this.activeTurnTokens.delete(name);
     this.activeTurnTriggers.delete(name);
     this.logicalTurnToolCalls.delete(agent);
     this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== name);
+    // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
+    // its timer would requeue held wakes for an agent that is gone, and a wait
+    // held until released would re-arm for the name indefinitely. The recorded
+    // wait stays, and binds the name if its channel binds again.
+    const cooldown = this.providerAccelerationCooldowns.get(name);
+    if (cooldown) {
+      clearTimeout(cooldown.timer);
+      this.providerAccelerationCooldowns.delete(name);
+      console.error(`[provider-wait] agent=${name} removed while held` +
+        `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
+        `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
+    }
     if (name === this.subconsciousAgentName) {
       this.tuneOutCoordinator?.stop();
       this.subconsciousAgentName = null;
@@ -9208,30 +9286,189 @@ export class AgentFramework {
     }
   }
 
+  /** Where the registry's snapshot is recorded, as an operator would look for it. */
+  private agentRegistryRecord(): string {
+    return this.agentRegistryPath ?? `the store's ${AGENT_REGISTRY_STATE_ID} state`;
+  }
+
+  private agentRegistryEndedRecord(): string {
+    return this.agentRegistryEndedPath ?? `the store's ${AGENT_REGISTRY_ENDED_ID} log`;
+  }
+
+  /** Store the registry's snapshot. What the write throws is thrown, naming the record. */
   private persistAgentRegistry(snapshot: RegistrySnapshot): void {
-    this.store.setStateJson(AGENT_REGISTRY_STATE_ID, snapshot);
+    try {
+      if (this.agentRegistryPath) this.writeRecoveryFile(this.agentRegistryPath, snapshot);
+      else this.store.setStateJson(AGENT_REGISTRY_STATE_ID, snapshot);
+    } catch (error) {
+      throw Object.assign(
+        new Error(`the agent registry couldn't be stored in ${this.agentRegistryRecord()}: ${thrownText(error)}`, { cause: error }),
+        { code: (error as NodeJS.ErrnoException | null)?.code },
+      );
+    }
   }
 
+  /** Append one ended record to the ended log. What the append throws is thrown, naming the log. */
   private appendEndedAgentRecord(record: AgentRecord): void {
-    this.store.appendToStateJson(AGENT_REGISTRY_ENDED_ID, record);
+    try {
+      if (this.agentRegistryEndedPath) this.appendRecoveryLine(this.agentRegistryEndedPath, record);
+      else this.store.appendToStateJson(AGENT_REGISTRY_ENDED_ID, record);
+    } catch (error) {
+      throw Object.assign(
+        new Error(`an ended agent record couldn't be appended to ${this.agentRegistryEndedRecord()}: ${thrownText(error)}`, { cause: error }),
+        { code: (error as NodeJS.ErrnoException | null)?.code },
+      );
+    }
   }
 
-  /** Load the previous process's registry. Returns the bounded work it interrupted. */
+  /**
+   * A write of a fact the registry records after it happened failed (an
+   * ended run, a landed release, a restart's interruptions): the fact stays
+   * in memory, and the registry's next write carries it. Until a write
+   * succeeds, a restart restores the registry as it was last stored.
+   */
+  private agentRegistryWriteFailed(error: unknown, what: 'snapshot' | 'ended-log'): void {
+    const record = what === 'snapshot' ? this.agentRegistryRecord() : this.agentRegistryEndedRecord();
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    this.opsAlert('agent-registry', 'framework',
+      `${thrownText(error)}. The registry keeps the change in memory, and its next change writes it again; ` +
+        `until a write succeeds, a restart restores ${record} as it was last written`,
+      { data: { record, ...(code ? { code } : {}) } });
+  }
+
+  /**
+   * Append one JSON record as a line to a recovery log, durably: the line is
+   * synced before this returns, and the directory too when the file is new.
+   * What the append throws is thrown. A crash mid-append can leave the last
+   * line cut short, which the log's reader drops (readRecoveryLog).
+   */
+  private appendRecoveryLine(path: string, record: unknown): void {
+    const directory = dirname(path);
+    mkdirSync(directory, { recursive: true });
+    const created = !existsSync(path);
+    const fd = openSync(path, 'a', 0o600);
+    try {
+      writeFileSync(fd, `${JSON.stringify(record)}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (created) {
+      this.syncRecoveryDirectory(directory, path);
+      this.syncRecoveryDirectory(dirname(directory), path);
+    }
+  }
+
+  /**
+   * A recovery log's last `limit` records, oldest first, or undefined when
+   * there's no file. A last line without its newline is an append a crash
+   * cut short, so it never returned to its caller: it's dropped, and the
+   * file is cut back to the last whole line so the next append starts on
+   * its own. Any other line that isn't JSON throws a StoredFormError naming
+   * the line. A failure to read the file other than its absence throws.
+   */
+  private readRecoveryLog(path: string, limit: number): unknown[] | undefined {
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === 'ENOENT') return undefined;
+      throw error;
+    }
+    const whole = text.lastIndexOf('\n') + 1;
+    if (whole < text.length) {
+      console.error(`[dendrite] ${path} ends in a line a crash cut short (${text.length - whole} bytes): dropping it`);
+      truncateSync(path, Buffer.byteLength(text.slice(0, whole), 'utf8'));
+      text = text.slice(0, whole);
+    }
+    const lines = text.split('\n');
+    lines.pop();
+    const records: unknown[] = [];
+    lines.forEach((line, index) => {
+      try {
+        records.push(JSON.parse(line));
+      } catch (error) {
+        throw new StoredFormError(`line ${index + 1} of ${lines.length} isn't JSON: ${thrownText(error)}`, { cause: error });
+      }
+    });
+    return records.slice(-limit);
+  }
+
+  /**
+   * Load the previous process's registry. Returns the bounded work it
+   * interrupted. The recovery files win whenever they exist; without them,
+   * the store's states are read, as for a store from before the files or a
+   * framework given a store and no storePath. A store from before the files
+   * moves into them: its ended history here, so the counters of the names
+   * it holds survive the first snapshot the file takes, and its snapshot at
+   * the registry's first write, which the residents' registrations make at
+   * boot. Nothing
+   * stored is an empty registry. A record that can't be read, or that reads
+   * as anything but a registry, throws: taken as empty, the registry's next
+   * write would replace it, held mail and the ends that keep a name's
+   * incarnations counting included.
+   */
   private restoreAgentRegistry(): AgentRecord[] {
-    let snapshot: RegistrySnapshot | null = null;
-    let ended: AgentRecord[] = [];
-    try {
-      snapshot = this.store.getStateJson(AGENT_REGISTRY_STATE_ID) as RegistrySnapshot | null;
-    } catch {
-      // No persisted registry yet
+    let snapshotWhere = this.agentRegistryRecord();
+    let endedWhere = this.agentRegistryEndedRecord();
+    const refuse = (where: string, problem: string, cause?: unknown): Error => new Error(
+      `the agent registry (${where}) ${problem}. The framework doesn't start without it, since its next write ` +
+        `would replace what's stored, results and messages held for delivery included. It's unchanged, and the ` +
+        `framework starts once it can be read${cause === undefined ? ' as a registry' : ''}.`,
+      cause === undefined ? undefined : { cause },
+    );
+    const read = <T>(where: () => string, reader: () => T): T => {
+      try {
+        return reader();
+      } catch (error) {
+        throw error instanceof StoredFormError
+          ? refuse(where(), `holds text that isn't JSON: ${error.message}`)
+          : refuse(where(), `could not be read: ${thrownText(error)}`, error);
+      }
+    };
+
+    let snapshot = read(() => snapshotWhere, () =>
+      this.agentRegistryPath ? this.readRecoveryFile(this.agentRegistryPath) : undefined);
+    if (snapshot === undefined) {
+      snapshotWhere = `the store's ${AGENT_REGISTRY_STATE_ID} state`;
+      snapshot = read(() => snapshotWhere, () => this.store.getStateJson(AGENT_REGISTRY_STATE_ID));
     }
-    try {
-      const tail = this.store.getStateTail(AGENT_REGISTRY_ENDED_ID, AGENT_REGISTRY_ENDED_RELOAD);
-      if (tail) ended = JSON.parse(tail.toString('utf8')) as AgentRecord[];
-    } catch {
-      // No ended history yet
+    let ended = read(() => endedWhere, () => this.agentRegistryEndedPath
+      ? this.readRecoveryLog(this.agentRegistryEndedPath, AGENT_REGISTRY_ENDED_RELOAD)
+      : undefined);
+    const endedFromStore = ended === undefined;
+    if (endedFromStore) {
+      endedWhere = `the store's ${AGENT_REGISTRY_ENDED_ID} log`;
+      const parsed = read(() => endedWhere, () => {
+        const tail = this.store.getStateTail(AGENT_REGISTRY_ENDED_ID, AGENT_REGISTRY_ENDED_RELOAD);
+        try {
+          return tail ? JSON.parse(tail.toString('utf8')) as unknown : [];
+        } catch (error) {
+          throw new StoredFormError(thrownText(error), { cause: error });
+        }
+      });
+      if (!Array.isArray(parsed)) throw refuse(endedWhere, `holds ${jsonKind(parsed)}, not a list of ended records`);
+      ended = parsed;
     }
-    return this.registry.restore(snapshot, Array.isArray(ended) ? ended : []).interrupted;
+    const endedRecords = ended!;
+    try {
+      checkEndedRecords(endedRecords);
+    } catch (error) {
+      if (error instanceof RegistryFormError) throw refuse(endedWhere, error.message);
+      throw error;
+    }
+
+    if (this.agentRegistryEndedPath && endedFromStore) {
+      for (const record of endedRecords) this.appendEndedAgentRecord(record as AgentRecord);
+    }
+    let interrupted: AgentRecord[];
+    try {
+      interrupted = this.registry.restore(snapshot, endedRecords).interrupted;
+    } catch (error) {
+      if (error instanceof RegistryFormError) throw refuse(snapshotWhere, error.message);
+      throw error;
+    }
+    return interrupted;
   }
 
   /**
@@ -9275,7 +9512,16 @@ export class AgentFramework {
       });
     }
 
+    // Mail whose message the restored queue holds lands with that entry,
+    // whose landing releases it (releaseLandedMail): delivered again here,
+    // it would land twice under one mail id.
+    const queued = new Set<string>();
+    for (const write of this.durableDeferredWrites()) {
+      const mailId = (write.metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId;
+      if (typeof mailId === 'string') queued.add(mailId);
+    }
     for (const mail of this.registry.listMail()) {
+      if (queued.has(mail.id)) continue;
       const recipient = this.agents.get(mail.to);
       if (recipient) {
         // The message may have reached the store in the same sync that the
@@ -9443,7 +9689,7 @@ export class AgentFramework {
     // Admit it to the registry first: a spec the registry refuses (spawner
     // or result recipient gone since creation) must not leave a live agent.
     this.announceAgentCreated(
-      this.registry.register(candidate.spec, { resume: candidate.resume === true }),
+      this.registry.transact(() => this.registry.register(candidate.spec, { resume: candidate.resume === true })),
     );
     // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
@@ -12444,7 +12690,8 @@ export class AgentFramework {
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     // The first resident declared owns default delivery.
     this.announceAgentCreated(
-      this.registry.register({ ...residentSpec(config.name, { primary: !this.primaryAgentName }), model: config.model }),
+      this.registry.transact(() =>
+        this.registry.register({ ...residentSpec(config.name, { primary: !this.primaryAgentName }), model: config.model })),
     );
     let restoredSettings: AgentRuntimeSettingsOverrides | null;
     try {
@@ -12545,7 +12792,7 @@ export class AgentFramework {
     // through its merged view (held traffic included), never a broadcast
     // recipient, and outlives policy epochs.
     this.announceAgentCreated(
-      this.registry.register({ ...subconsciousSpec(name, primaryName), model: agentConfig.model }),
+      this.registry.transact(() => this.registry.register({ ...subconsciousSpec(name, primaryName), model: agentConfig.model })),
     );
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
@@ -13870,14 +14117,14 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-      this.announceAgentCreated(this.registry.register({
+      this.announceAgentCreated(this.registry.transact(() => this.registry.register({
         ...conversationForkSpec(name, {
           template: router.templateAgent,
           channelId,
           idleTtlMs: router.idleTtlMs,
         }),
         model: config.model,
-      }));
+      })));
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       return agent;
@@ -13996,31 +14243,11 @@ export class AgentFramework {
    * forever. The fork's context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
-    this.closingConversationAgents.delete(agentName);
     const channelId = this.registry.homeChannel(agentName);
     const agent = this.agents.get(agentName);
-    this.agents.delete(agentName);
-    if (agent) this.releaseWindowNowOrAfterResume(agent);
-    this.turnRouting.delete(agentName);
-    this.proseSpeechChains.delete(agentName);
-    this.openLogical.delete(agentName);
-    this.toolImageLedgers.delete(agentName);
-    this.agentConfigs.delete(agentName);
+    if (agent) this.removeLiveAgent(agent, channelId);
+    else this.closingConversationAgents.delete(agentName);
     this.settleEndedAgent(this.registry.end(agentName, 'idle-ttl', 'framework'));
-    this.evictTurnCheckpoints(agentName);
-    if (agent) this.logicalTurnToolCalls.delete(agent);
-    // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
-    // its timer would requeue held wakes for an agent that is gone, and a wait
-    // held until released would re-arm for the name indefinitely. The recorded
-    // wait stays, and binds the name if its channel binds again.
-    const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    if (cooldown) {
-      clearTimeout(cooldown.timer);
-      this.providerAccelerationCooldowns.delete(agentName);
-      console.error(`[provider-wait] agent=${agentName} disposed while held` +
-        `${cooldown.waitModel !== undefined ? ` on ${cooldown.waitModel}` : ''}: ` +
-        `${cooldown.heldRequests.length} held request(s) dropped with it (the recorded wait stays)`);
-    }
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -22811,13 +23038,15 @@ export class AgentFramework {
    * Held agent mail is released only when its message has actually entered
    * the recipient's store — never on a deferral. Called at every site that
    * writes a message into a context: the direct path above and the two
-   * deferred-write flushes (turn start, tool boundary). Both writes reach
-   * disk in the same sync, so a crash keeps either both or neither.
+   * deferred-write flushes (turn start, tool boundary). The release never
+   * reaches disk before the message does (releaseMailOnceStored), so a
+   * crash keeps the mail held or the message stored, and boot's check of
+   * the recipient's store settles the first.
    */
   private releaseLandedMail(metadata: MessageMetadata | undefined, recipient: string): void {
     const stamp = (metadata as { dendrite?: { mailId?: unknown; kind?: unknown; from?: { agent?: unknown } } } | undefined)?.dendrite;
     if (typeof stamp?.mailId !== 'string') return;
-    this.registry.releaseMail(stamp.mailId);
+    this.releaseMailOnceStored(stamp.mailId, recipient);
     this.emitTrace({
       type: 'dendrite:mail-delivered',
       mailId: stamp.mailId,
@@ -22825,6 +23054,31 @@ export class AgentFramework {
       from: String(stamp.from?.agent ?? ''),
       to: recipient,
     });
+  }
+
+  /**
+   * Release held mail whose message has entered its recipient's store. The
+   * registry's recovery file is synced as it's written, and the store's
+   * message only when the store syncs, so the store syncs first: a release
+   * written before its message is on disk would lose the mail to a crash
+   * between them. When that sync fails, the mail stays held, and a restart
+   * finds the message in the store, if it got there, and releases it then
+   * (reconcileAgentRegistry). Without the file, both are the store's writes
+   * and reach disk in the same sync.
+   */
+  private releaseMailOnceStored(mailId: string, recipient: string): void {
+    if (this.agentRegistryPath) {
+      try {
+        this.store.sync();
+      } catch (error) {
+        console.error(
+          `[dendrite] mail ${mailId} to ${recipient} stays held: the store's sync before its release failed ` +
+            `(${thrownText(error)}); a restart releases it once it finds the message in the store`,
+        );
+        return;
+      }
+    }
+    this.registry.releaseMail(mailId);
   }
 
   /**

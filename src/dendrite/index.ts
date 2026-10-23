@@ -1,4 +1,4 @@
-export { AgentRegistry, AgentSpecError } from './registry.js';
+export { AgentRegistry, AgentSpecError, RegistryFormError, checkEndedRecords } from './registry.js';
 export type { AgentRegistryOptions, RestoreOutcome, ReconcileOutcome } from './registry.js';
 export {
   residentSpec,

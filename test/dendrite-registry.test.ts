@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
   AgentRegistry,
   AgentSpecError,
+  RegistryFormError,
   conversationForkSpec,
   residentSpec,
   subconsciousSpec,
@@ -292,11 +293,105 @@ describe('AgentRegistry restart behaviour follows lifetime', () => {
     assert.equal(registry.list({ includeEnded: true }).filter((r) => r.name === 'job').length, 2);
   });
 
-  it('tolerates a missing or unreadable snapshot', () => {
+  it('takes nothing stored as empty, and refuses a form it doesn\'t read rather than taking it as empty', () => {
     const registry = new AgentRegistry();
     assert.deepEqual(registry.restore(null), { interrupted: [] });
-    assert.deepEqual(registry.restore({ version: 9 } as unknown as RegistrySnapshot), { interrupted: [] });
+    for (const [stored, says] of [
+      [{ version: 9 }, /is version 9, which this framework doesn't read/],
+      ['text', /holds a string, not an agent registry/],
+      [{ version: 1, records: [], incarnations: {} }, /has no mail list/],
+      [{ version: 1, records: [{ name: 'x' }], incarnations: {}, mail: [] }, /has a record \(1 of 1\) that has no incarnation/],
+      [{ version: 1, records: [], incarnations: { x: '1' }, mail: [] }, /has an incarnation for "x" that is a string/],
+    ] as const) {
+      const fresh = new AgentRegistry();
+      assert.throws(() => fresh.restore(stored), (error: Error) => error instanceof RegistryFormError && says.test(error.message));
+      assert.deepEqual(fresh.list({ includeEnded: true }), [], 'nothing restored');
+    }
+    assert.throws(() => new AgentRegistry().restore(null, [{ name: 'x', incarnation: 1, lifetime: { kind: 'task' } }]),
+      /has an ended record \(1 of the 1 read\) that hasn't ended/);
     registry.register(residentSpec('mira', { primary: true }));
     assert.equal(registry.get('mira')!.incarnation, 1);
+  });
+});
+
+describe('AgentRegistry writes', () => {
+  /** A registry whose writes can be made to fail. */
+  function failing() {
+    const state = { snapshot: null as RegistrySnapshot | null, ended: [] as AgentRecord[], failSnapshot: false, failEnded: false, failures: [] as string[], caughtUp: 0 };
+    const registry = new AgentRegistry({
+      persist: (snapshot) => {
+        if (state.failSnapshot) throw new Error('EIO snapshot');
+        state.snapshot = JSON.parse(JSON.stringify(snapshot));
+      },
+      appendEnded: (record) => {
+        if (state.failEnded) throw new Error('EIO ended');
+        state.ended.push(JSON.parse(JSON.stringify(record)));
+      },
+      onWriteFailed: (_error, what) => { state.failures.push(what); },
+      onWriteCaughtUp: () => { state.caughtUp++; },
+    });
+    return { state, registry };
+  }
+
+  it('a transaction whose write fails changes nothing and throws the write\'s error', () => {
+    const { state, registry } = failing();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(workerSpec('job', { spawnedBy: 'mira' }));
+    const stored = JSON.stringify(state.snapshot);
+    state.failSnapshot = true;
+    assert.throws(() => registry.transact(() => registry.end('job', 'stopped')), /EIO snapshot/);
+    assert.throws(() => registry.transact(() => registry.holdMail({ kind: 'message', from: registry.ref('mira'), to: 'job', content: [] })), /EIO snapshot/);
+    assert.equal(registry.get('job')?.ended, undefined, 'job is still live');
+    assert.deepEqual(registry.listMail(), [], 'nothing held');
+    assert.equal(registry.inspect('job')?.incarnation, 1);
+    assert.equal(JSON.stringify(state.snapshot), stored, 'nothing stored');
+    assert.equal(state.ended.length, 0, 'no end logged');
+    assert.deepEqual(state.failures, [], 'the caller hears it, so no failure is reported');
+
+    state.failSnapshot = false;
+    registry.transact(() => registry.end('job', 'stopped'));
+    assert.equal(registry.inspect('job')?.ended?.reason, 'stopped');
+    assert.deepEqual(state.ended.map((r) => r.name), ['job']);
+  });
+
+  it('a fact whose write fails is kept and reported, and the next write carries it', () => {
+    const { state, registry } = failing();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(workerSpec('job', { spawnedBy: 'mira' }));
+    state.failSnapshot = true;
+    registry.end('job', 'completed');
+    assert.equal(registry.inspect('job')?.ended?.reason, 'completed', 'kept in memory');
+    assert.deepEqual(state.failures, ['snapshot']);
+    assert.ok(state.snapshot!.records.some((r) => r.name === 'job'), 'the stored registry is behind');
+    assert.equal(state.ended.length, 0, 'and the end isn\'t logged before its snapshot is stored');
+
+    state.failSnapshot = false;
+    registry.noteMessagePath('mira', 'mira');
+    assert.equal(state.caughtUp, 1, 'the next write says it caught up');
+    assert.ok(!state.snapshot!.records.some((r) => r.name === 'job'), 'and carries the end');
+    assert.deepEqual(state.ended.map((r) => r.name), ['job']);
+  });
+
+  it('an end is stored with its snapshot, logged after it, and a restore logs what the log lacks', () => {
+    const { state, registry } = failing();
+    registry.register(residentSpec('mira', { primary: true }));
+    registry.register(workerSpec('job', { spawnedBy: 'mira' }));
+    state.failEnded = true;
+    registry.transact(() => registry.end('job', 'stopped'));
+    assert.deepEqual(state.failures, ['ended-log'], 'the append\'s failure is reported, not thrown: the end is stored');
+    assert.deepEqual(state.snapshot!.unlogged?.map((r) => r.name), ['job'], 'the snapshot carries it');
+
+    const { state: next, registry: restored } = failing();
+    restored.restore(state.snapshot, state.ended);
+    assert.equal(restored.inspect('job')?.ended?.reason, 'stopped');
+    assert.deepEqual(next.ended.map((r) => r.name), ['job'], 'logged at the restore');
+    restored.register(residentSpec('mira', { primary: true }));
+    assert.equal(next.snapshot!.unlogged, undefined, 'and the next snapshot no longer carries it');
+
+    // One the log already has isn't logged again.
+    const { state: again, registry: twice } = failing();
+    twice.restore(state.snapshot, next.ended);
+    assert.deepEqual(again.ended, []);
+    assert.equal(twice.list({ includeEnded: true }).filter((r) => r.name === 'job').length, 1);
   });
 });

@@ -31,15 +31,49 @@ export class AgentSpecError extends Error {
 
 export interface AgentRegistryOptions {
   now?: () => number;
-  /** Called after every durable mutation with the state to persist. */
+  /**
+   * Called after every durable mutation with the state to persist. A write
+   * that throws isn't taken as done: see {@link AgentRegistry.transact} for
+   * a change a caller asked for, and `onWriteFailed` for the rest.
+   */
   persist?: (snapshot: RegistrySnapshot) => void;
   /**
-   * Called once per ended record. Ended records are append-only history,
-   * kept out of the snapshot so a mutation never rewrites them.
+   * Called once per ended record, after a snapshot that carries it (its
+   * `unlogged`) has been persisted. Ended records are append-only history,
+   * kept out of the snapshot's records so a mutation never rewrites them; a
+   * record whose append throws stays in `unlogged` and is appended again
+   * with the next write.
    */
   appendEnded?: (record: AgentRecord) => void;
+  /**
+   * A write of a fact that had already happened failed: an ended run, a
+   * landed release, a restart's interruptions. Nothing can undo the fact, so
+   * the registry keeps it in memory, and its next write carries it. Called
+   * for each such failure, with what failed to be written.
+   */
+  onWriteFailed?: (error: unknown, what: 'snapshot' | 'ended-log') => void;
+  /** A write succeeded after a run of failures (onWriteFailed). */
+  onWriteCaughtUp?: () => void;
   /** How many ended records stay inspectable in memory (oldest dropped first). */
   endedRetention?: number;
+}
+
+/** A stored registry, or ended-log record, in a form this registry doesn't read. */
+export class RegistryFormError extends Error {
+  constructor(problem: string) {
+    super(problem);
+    this.name = 'RegistryFormError';
+  }
+}
+
+/** The registry's state, held whole while a transaction can still undo it. */
+interface RegistryState {
+  live: Array<[AgentName, AgentRecord]>;
+  ended: AgentRecord[];
+  awaiting: Array<[AgentName, AgentRecord]>;
+  incarnations: Array<[AgentName, number]>;
+  mail: HeldMail[];
+  unlogged: AgentRecord[];
 }
 
 /** What a restore found that the previous process left unfinished. */
@@ -60,6 +94,49 @@ function clone<T>(value: T): T {
   return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }
 
+/** An ended record's identity: one end per incarnation of a name. */
+const endedKey = (record: AgentRecord): string => `${record.name}#${record.incarnation}`;
+
+function kindOf(value: unknown): string {
+  return value === null ? 'null' : Array.isArray(value) ? 'a list' : typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/** What's wrong with a stored agent record, or null when restore can read it. */
+function recordProblem(raw: unknown, ended: boolean): string | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return `is ${kindOf(raw)}, not an agent record`;
+  const record = raw as Partial<AgentRecord>;
+  if (typeof record.name !== 'string' || record.name === '') return 'has no name';
+  if (typeof record.incarnation !== 'number') return `has no incarnation (agent "${record.name}")`;
+  if (!record.lifetime || typeof record.lifetime !== 'object' || typeof record.lifetime.kind !== 'string') {
+    return `has no lifetime (agent "${record.name}")`;
+  }
+  if (ended && (!record.ended || typeof record.ended !== 'object')) return `hasn't ended (agent "${record.name}")`;
+  return null;
+}
+
+/**
+ * Check records read from the ended log before any is taken: each must be an
+ * ended agent record. Throws a {@link RegistryFormError} naming the first
+ * that isn't.
+ */
+export function checkEndedRecords(records: readonly unknown[]): void {
+  records.forEach((raw, index) => {
+    const problem = recordProblem(raw, true);
+    if (problem) throw new RegistryFormError(`has an ended record (${index + 1} of the ${records.length} read) that ${problem}`);
+  });
+}
+
+/** What's wrong with a stored held item, or null when restore can read it. */
+function mailProblem(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return `is ${kindOf(raw)}, not held mail`;
+  const item = raw as Partial<HeldMail>;
+  if (typeof item.id !== 'string') return 'has no id';
+  if (typeof item.to !== 'string') return `has no recipient (mail ${item.id})`;
+  if (!item.from || typeof item.from !== 'object' || typeof item.from.agent !== 'string') return `has no sender (mail ${item.id})`;
+  if (!Array.isArray(item.content)) return `has no content (mail ${item.id})`;
+  return null;
+}
+
 export class AgentRegistry {
   private readonly live = new Map<AgentName, AgentRecord>();
   /** Ended records, oldest first. */
@@ -68,16 +145,60 @@ export class AgentRegistry {
   private readonly awaiting = new Map<AgentName, AgentRecord>();
   private readonly incarnations = new Map<AgentName, number>();
   private mail: HeldMail[] = [];
+  /** Ended records not yet in the ended log, oldest first. Each snapshot
+   *  carries them, so an end is stored with the snapshot that records it. */
+  private unlogged: AgentRecord[] = [];
+  /** Open while a transaction's change is being made: writes wait for it. */
+  private transaction: { dirty: boolean } | null = null;
+  /** A write of a fact failed, and none has succeeded since. */
+  private behind = false;
   private readonly now: () => number;
   private readonly persistFn?: (snapshot: RegistrySnapshot) => void;
   private readonly appendEndedFn?: (record: AgentRecord) => void;
+  private readonly onWriteFailed?: (error: unknown, what: 'snapshot' | 'ended-log') => void;
+  private readonly onWriteCaughtUp?: () => void;
   private readonly endedRetention: number;
 
   constructor(options: AgentRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
     this.persistFn = options.persist;
     this.appendEndedFn = options.appendEnded;
+    this.onWriteFailed = options.onWriteFailed;
+    this.onWriteCaughtUp = options.onWriteCaughtUp;
     this.endedRetention = options.endedRetention ?? DEFAULT_ENDED_RETENTION;
+  }
+
+  /**
+   * Make a change a caller asked for, such as an agent stopped, a message
+   * sent or a result held, so that it's stored or not made at all. The
+   * registry writes once, after `fn`; a write that throws puts the registry
+   * back as it was before `fn` and throws the write's error, so the call
+   * fails and changes nothing. An `fn` that throws does the same with its
+   * own error. A transaction inside another is part of it.
+   */
+  transact<T>(fn: () => T): T {
+    if (this.transaction) return fn();
+    const before = this.capture();
+    const transaction = (this.transaction = { dirty: false });
+    let result: T;
+    try {
+      result = fn();
+    } catch (error) {
+      this.transaction = null;
+      this.restoreState(before);
+      throw error;
+    }
+    this.transaction = null;
+    if (!transaction.dirty || !this.persistFn) return result;
+    try {
+      this.persistFn(this.snapshot());
+    } catch (error) {
+      this.restoreState(before);
+      throw error;
+    }
+    this.caughtUp();
+    this.logEnded();
+    return result;
   }
 
   // ==========================================================================
@@ -433,7 +554,13 @@ export class AgentRegistry {
     ]);
     const incarnations: Record<AgentName, number> = {};
     for (const [name, value] of this.incarnations) if (referable.has(name)) incarnations[name] = value;
-    return { version: 1, records, incarnations, mail: clone(this.mail) };
+    return {
+      version: 1,
+      records,
+      incarnations,
+      mail: clone(this.mail),
+      ...(this.unlogged.length > 0 ? { unlogged: clone(this.unlogged) } : {}),
+    };
   }
 
   /**
@@ -444,20 +571,35 @@ export class AgentRegistry {
    * be told. Held mail is kept for redelivery.
    *
    * `endedHistory` is the tail of the ended-record log, oldest first.
+   *
+   * Nothing stored (`null` or `undefined`) is an empty registry. A snapshot
+   * or ended record in any form this registry doesn't read throws a
+   * {@link RegistryFormError} saying what's wrong, and nothing is restored:
+   * taken as empty, the registry's next write would replace what was
+   * stored, held mail included. Ended records the snapshot carries that the
+   * log doesn't have yet are taken into history and appended to the log
+   * with the next write.
    */
-  restore(snapshot: RegistrySnapshot | null | undefined, endedHistory: AgentRecord[] = []): RestoreOutcome {
+  restore(snapshot: unknown, endedHistory: readonly unknown[] = []): RestoreOutcome {
+    const checked = this.checkStored(snapshot, endedHistory);
     const interrupted: AgentRecord[] = [];
-    for (const raw of endedHistory.slice(-this.endedRetention)) {
-      if (raw && typeof raw === 'object' && raw.ended) this.ended.push(clone(raw));
-    }
-    if (!snapshot || snapshot.version !== 1) return { interrupted };
+    for (const record of checked.ended.slice(-this.endedRetention)) this.ended.push(clone(record));
+    if (!checked.snapshot) return { interrupted };
+    const stored = checked.snapshot;
 
-    for (const [name, value] of Object.entries(snapshot.incarnations ?? {})) {
-      if (typeof value === 'number') this.incarnations.set(name, value);
-    }
-    this.mail = Array.isArray(snapshot.mail) ? clone(snapshot.mail) : [];
+    for (const [name, value] of Object.entries(stored.incarnations)) this.incarnations.set(name, value);
+    this.mail = clone(stored.mail);
 
-    for (const raw of snapshot.records ?? []) {
+    const logged = new Set(checked.ended.map(endedKey));
+    for (const raw of this.appendEndedFn ? stored.unlogged ?? [] : []) {
+      if (logged.has(endedKey(raw))) continue;
+      const record = clone(raw);
+      this.ended.push(record);
+      this.unlogged.push(clone(record));
+    }
+    if (this.ended.length > this.endedRetention) this.ended.splice(0, this.ended.length - this.endedRetention);
+
+    for (const raw of stored.records) {
       const record = clone(raw);
       if (record.ended) continue; // history lives in the ended log
       if (record.lifetime.kind === 'persistent') {
@@ -467,8 +609,53 @@ export class AgentRegistry {
       this.recordEnded(record, 'host-restart');
       interrupted.push(record);
     }
-    if (interrupted.length > 0) this.persist();
+    if (interrupted.length > 0 || this.unlogged.length > 0) this.persist();
     return { interrupted };
+  }
+
+  /** Check what restore was handed, before any of it is taken. */
+  private checkStored(
+    snapshot: unknown,
+    endedHistory: readonly unknown[],
+  ): { snapshot: RegistrySnapshot | null; ended: AgentRecord[] } {
+    checkEndedRecords(endedHistory);
+    const ended = endedHistory as AgentRecord[];
+    if (snapshot === null || snapshot === undefined) return { snapshot: null, ended };
+    if (typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      throw new RegistryFormError(`holds ${kindOf(snapshot)}, not an agent registry`);
+    }
+    const stored = snapshot as Partial<RegistrySnapshot> & { version?: unknown };
+    if (stored.version !== 1) {
+      throw new RegistryFormError(
+        stored.version === undefined
+          ? 'has no version, so it is not an agent registry this framework wrote'
+          : `is version ${JSON.stringify(stored.version)}, which this framework doesn't read (it reads version 1)`,
+      );
+    }
+    const notA = (field: string, value: unknown, want: string) => new RegistryFormError(
+      value === undefined ? `has no ${field}` : `has ${field} that is ${kindOf(value)}, not ${want}`);
+    if (!Array.isArray(stored.records)) throw notA('records list', stored.records, 'a list');
+    if (!Array.isArray(stored.mail)) throw notA('mail list', stored.mail, 'a list');
+    if (!stored.incarnations || typeof stored.incarnations !== 'object' || Array.isArray(stored.incarnations)) {
+      throw notA('incarnations map', stored.incarnations, 'a map');
+    }
+    for (const [name, value] of Object.entries(stored.incarnations)) {
+      if (typeof value !== 'number') throw new RegistryFormError(`has an incarnation for "${name}" that is ${kindOf(value)}, not a number`);
+    }
+    if (stored.unlogged !== undefined && !Array.isArray(stored.unlogged)) throw notA('unlogged list', stored.unlogged, 'a list');
+    stored.records.forEach((raw, index) => {
+      const problem = recordProblem(raw, false);
+      if (problem) throw new RegistryFormError(`has a record (${index + 1} of ${stored.records!.length}) that ${problem}`);
+    });
+    stored.unlogged?.forEach((raw, index) => {
+      const problem = recordProblem(raw, true);
+      if (problem) throw new RegistryFormError(`has an unlogged ended record (${index + 1}) that ${problem}`);
+    });
+    stored.mail.forEach((raw, index) => {
+      const problem = mailProblem(raw);
+      if (problem) throw new RegistryFormError(`has held mail (${index + 1} of ${stored.mail!.length}) that ${problem}`);
+    });
+    return { snapshot: stored as RegistrySnapshot, ended };
   }
 
   /**
@@ -502,20 +689,79 @@ export class AgentRegistry {
     if (this.ended.length > this.endedRetention) {
       this.ended.splice(0, this.ended.length - this.endedRetention);
     }
-    if (!this.appendEndedFn) return;
-    try {
-      this.appendEndedFn(clone(record));
-    } catch (error) {
-      console.error('[dendrite] failed to append an ended agent record:', error);
-    }
+    // Logged after the snapshot that carries it is stored (logEnded).
+    if (this.appendEndedFn) this.unlogged.push(clone(record));
   }
 
+  /**
+   * Store the registry after a change. Inside a transaction the write waits
+   * for the transaction to end. Otherwise the change records a fact that
+   * has already happened, so a write that fails keeps it in memory, says so
+   * (onWriteFailed), and leaves it to the next write, which stores the
+   * registry whole.
+   */
   private persist(): void {
+    if (this.transaction) {
+      this.transaction.dirty = true;
+      return;
+    }
     if (!this.persistFn) return;
     try {
       this.persistFn(this.snapshot());
     } catch (error) {
-      console.error('[dendrite] failed to persist the agent registry:', error);
+      this.behind = true;
+      this.onWriteFailed ? this.onWriteFailed(error, 'snapshot') : console.error('[dendrite] failed to store the agent registry:', error);
+      return;
     }
+    this.caughtUp();
+    this.logEnded();
+  }
+
+  /** Append the ended records a stored snapshot carries to the ended log, oldest first. */
+  private logEnded(): void {
+    if (!this.appendEndedFn) return;
+    while (this.unlogged.length > 0) {
+      try {
+        this.appendEndedFn(clone(this.unlogged[0]!));
+      } catch (error) {
+        this.behind = true;
+        this.onWriteFailed ? this.onWriteFailed(error, 'ended-log') : console.error('[dendrite] failed to append an ended agent record:', error);
+        return;
+      }
+      this.unlogged.shift();
+    }
+  }
+
+  private caughtUp(): void {
+    if (!this.behind) return;
+    this.behind = false;
+    this.onWriteCaughtUp?.();
+  }
+
+  /** What a transaction can change, kept to put back. Live and awaiting
+   *  records, and held mail, are changed in place, so they're copied whole;
+   *  ended records aren't changed once ended, so their lists are copied
+   *  shallow. */
+  private capture(): RegistryState {
+    return {
+      live: clone([...this.live]),
+      ended: [...this.ended],
+      awaiting: clone([...this.awaiting]),
+      incarnations: [...this.incarnations],
+      mail: clone(this.mail),
+      unlogged: [...this.unlogged],
+    };
+  }
+
+  private restoreState(state: RegistryState): void {
+    this.live.clear();
+    for (const [name, record] of state.live) this.live.set(name, record);
+    this.ended = state.ended;
+    this.awaiting.clear();
+    for (const [name, record] of state.awaiting) this.awaiting.set(name, record);
+    this.incarnations.clear();
+    for (const [name, value] of state.incarnations) this.incarnations.set(name, value);
+    this.mail = state.mail;
+    this.unlogged = state.unlogged;
   }
 }

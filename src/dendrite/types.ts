@@ -339,8 +339,8 @@ export interface HeldMail {
 }
 
 /**
- * Persisted shape of the registry (Chronicle snapshot state). Ended records
- * are history and live in a separate append-only log.
+ * Persisted shape of the registry. Ended records are history and live in a
+ * separate append-only log.
  */
 export interface RegistrySnapshot {
   version: 1;
@@ -349,6 +349,12 @@ export interface RegistrySnapshot {
   /** Highest incarnation issued, for names that can still be referred to. */
   incarnations: Record<AgentName, number>;
   mail: HeldMail[];
+  /**
+   * Ended records that may not be in the ended log yet, oldest first. An
+   * end is stored with the snapshot that records it, and appended to the
+   * log after; a restore appends any the log doesn't have.
+   */
+  unlogged?: AgentRecord[];
 }
 
 /** Outcome of ending an agent: who was affected. */
