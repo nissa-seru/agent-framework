@@ -28,6 +28,17 @@
  *    back). Predicted: stopAgent throws, the registry records the agent
  *    ended while it keeps running, and a second stop is refused as "not a
  *    registered agent".
+ * U. (Round 2, at 61491b30, by reading of `requested` around `end`.) A run's
+ *    end is something that has already happened, but `AgentRegistry.end`
+ *    runs as a requested change, put back when its write fails. Predicted:
+ *    with the write failing as a job's run ends, the agent is gone and the
+ *    registry still lists the job live.
+ * V. (Round 2, same reading.) The idle reap of a conversation fork, with its
+ *    end's write failing. Predicted: the fork is removed, and the registry
+ *    still lists it live. Whether the reap throws is logged, not predicted.
+ * W. (Round 2.) A version-1 registry file whose mail isn't a list.
+ *    Predicted at 61491b30 and later: create() refuses, naming it, and the
+ *    file is left as it was.
  * S. Finding 2, a failed sync. Predicted: deliverAgentResult throws on a
  *    failed sync with the result still held; a caller that retries
  *    delivers the second hold now, and the first is delivered again at the
@@ -37,13 +48,15 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, workerSpec } from '../../src/index.js';
 import type { AgentSpec } from '../../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from '../helpers/dendrite.js';
+import { MockMembrane, createMockResponse } from '../helpers/mock-membrane.js';
+import type { ProcessEvent } from '../../src/index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const textOf = (content: ContentBlock[]) => content.map((b) => (b.type === 'text' ? b.text : `<${b.type}>`)).join('');
@@ -238,12 +251,64 @@ describe('probes K, M, R, S and T: findings 2 and 3 at 6ba5f166', () => {
     } catch (error) {
       secondStop = String(error).slice(0, 160);
     }
-    const observed = { threw, afterThrow, secondStop, stillRunning: framework.getAgent('boss') !== null };
+    // A stop rejects the run, whose own end removes the agent: wait for it, briefly.
+    const deadline = Date.now() + 2_000;
+    while (framework.getAgent('boss') !== null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    let endedLogged: unknown = null;
+    try {
+      const doc = JSON.parse(readFileSync(join(storePath(), 'recovery', 'dendrite-ended.json'), 'utf8')) as { ended?: Array<{ name: string; incarnation: number; ended?: { reason?: string } }> };
+      endedLogged = (doc.ended ?? []).filter((r) => r.name === 'boss').map((r) => [r.incarnation, r.ended?.reason]);
+    } catch (error) {
+      endedLogged = `unread: ${String(error).slice(0, 60)}`;
+    }
+    const observed = { threw, afterThrow, secondStop, stillRunning: framework.getAgent('boss') !== null, ended: framework.getAgentRecord('boss')?.ended?.reason ?? null, endedLogged };
     console.log('IMOGEN-T', JSON.stringify(observed));
     assert.ok(threw, 'predicted: the stop throws');
     assert.equal(afterThrow.recordEnded, 'stopped', 'predicted: the registry already records it ended');
     assert.equal(afterThrow.running, true, 'predicted: but the agent is still running');
     assert.ok(secondStop, 'predicted: and a second stop is refused');
+  });
+
+  it('U: a run whose end can\'t be written: the run fails with the write\'s error, and the registry keeps the ended job live', async () => {
+    const gates = new GateModule();
+    const framework = await boot(gates);
+    framework.start();
+    const job = await startBlocked(framework, gates, 'job4', 'g-job4', workerSpec('job4', { spawnedBy: 'mira' }));
+    const internals = framework as unknown as { persistAgentRegistry(snapshot: unknown): void };
+    const original = internals.persistAgentRegistry.bind(framework);
+    internals.persistAgentRegistry = () => { throw new Error('EIO: simulated write failure'); };
+    let settled: { ok: boolean; error?: unknown };
+    try {
+      gates.release('g-job4');
+      settled = await job.settled;
+    } finally {
+      internals.persistAgentRegistry = original;
+    }
+    const observed = {
+      runOk: settled.ok,
+      runError: settled.ok ? null : String((settled as { error: unknown }).error).slice(0, 120),
+      agentGone: framework.getAgent('job4') === null,
+      recordEnded: framework.getAgentRecord('job4')?.ended?.reason ?? null,
+      listedLive: framework.listAgents().some((r) => r.name === 'job4'),
+    };
+    console.log('IMOGEN-U', JSON.stringify(observed));
+    assert.equal(observed.agentGone, true, 'the run is over and its agent gone');
+    assert.equal(observed.recordEnded, null, 'predicted: the registry put the end back, so it still lists the job');
+    assert.equal(observed.listedLive, true);
+  });
+
+  it('W: a version-1 registry whose mail is not a list is refused, naming it', async () => {
+    const first = await boot();
+    await first.stop();
+    const file = join(storePath(), 'recovery', 'dendrite-registry.json');
+    const stored = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    writeFileSync(file, JSON.stringify({ ...stored, mail: 'not a list' }));
+    let refused: string | null = null;
+    try { await boot(); } catch (error) { refused = String(error).slice(0, 300); }
+    const unchanged = (JSON.parse(readFileSync(file, 'utf8')) as { mail: unknown }).mail === 'not a list';
+    console.log('IMOGEN-W', JSON.stringify({ refused, unchanged }));
+    assert.ok(refused, 'refused');
+    assert.ok(unchanged, 'the file is left as it was');
   });
 
   it('S: a failed sync makes deliverAgentResult throw with the result held; a retry delivers it, and the restart delivers the first again', async () => {
@@ -276,5 +341,67 @@ describe('probes K, M, R, S and T: findings 2 and 3 at 6ba5f166', () => {
     assert.equal(heldAfterThrow, 1);
     assert.equal(inMiraAfterRetry, 1, 'the retry delivers');
     assert.equal(inMiraAfterRestart, 2, 'predicted: the restart delivers the first hold again');
+  });
+});
+
+describe('probe V: the idle reap of a conversation fork whose end can\'t be written', () => {
+  it('V: the fork is removed, the reap throws, and the registry keeps the fork live', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imogen-546-reap-'));
+    const membrane = new MockMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'primary', model: 'test-model', systemPrompt: 'Primary.', proseRouting: 'locus' }],
+      modules: [],
+      conversations: { templateAgent: 'primary' },
+      speech: { locus: 'latest-inbound' },
+    });
+    const internals = framework as unknown as {
+      initializeMcpl(servers: []): Promise<void>;
+      closingConversationAgents: Set<string>;
+      lastConversationSweep: number;
+      sweepExpiredConversations(): void;
+      persistAgentRegistry(snapshot: unknown): void;
+      activeTurnTokens: Map<string, number>;
+      pendingAssistantBlocks: Map<string, unknown[]>;
+    };
+    try {
+      await internals.initializeMcpl([]);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Reply from the fork.' }]));
+      framework.pushEvent({
+        type: 'mcpl:channel-incoming', serverId: 'srv', channelId: 'missing-channel', messageId: 'incoming-1',
+        author: { id: 'user-1', name: 'User' }, content: [{ type: 'text', text: 'Hello fork.' }],
+        timestamp: new Date().toISOString(), metadata: { channel_type: 'im' }, triggerInference: true,
+      } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+      const fork = framework.getConversationRouter()!.getBinding('missing-channel')!.agentName;
+      const original = internals.persistAgentRegistry.bind(framework);
+      internals.persistAgentRegistry = () => { throw new Error('EIO: simulated write failure'); };
+      let threw: string | null = null;
+      try {
+        internals.closingConversationAgents.add(fork);
+        internals.lastConversationSweep = 0;
+        internals.sweepExpiredConversations();
+      } catch (error) {
+        threw = String(error).slice(0, 120);
+      } finally {
+        internals.persistAgentRegistry = original;
+      }
+      const observed = {
+        threw,
+        agentGone: framework.getAgent(fork) === null,
+        recordEnded: framework.getAgentRecord(fork)?.ended?.reason ?? null,
+        listedLive: framework.listAgents().some((r) => r.name === fork),
+      };
+      console.log('IMOGEN-V', JSON.stringify(observed));
+      assert.equal(observed.agentGone, true, 'the fork is removed');
+      assert.equal(observed.recordEnded, null, 'predicted: the registry put the end back');
+      assert.equal(observed.listedLive, true, 'and still lists the fork live');
+    } finally {
+      internals.activeTurnTokens.clear();
+      internals.pendingAssistantBlocks.clear();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
