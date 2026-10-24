@@ -1,9 +1,7 @@
 /**
  * Probes for findings a review of #546's catch-up merge raised in
- * Dendrite's reader-fork code, which the merge doesn't change. Run at
- * 83b66cae with chronicle d553ce9 (feat/dendrite-views-main) and
- * context-manager fea7a940f (feat/dendrite-fork-main) built and linked in
- * (the published packages skip reader forks):
+ * Dendrite's reader-fork code, which the merge doesn't change (run at
+ * 83b66cae and at the merge's head):
  *
  * R13: after a cadence-triggered reader fork, do later cadence ticks with
  *      no new traffic derive more reader forks, with nothing held for them?
@@ -30,13 +28,19 @@ const CHANNEL = 'disc:guild:noisy';
 /** Routes by the reader's framing; each stream takes one queued response. */
 class RoutedMembrane {
   calls: NormalizedRequest[] = [];
+  streams: Array<{ who: string; stream: MockYieldingStream }> = [];
   private queues = { resident: [] as NormalizedResponse[], reader: [] as NormalizedResponse[] };
   push(who: 'resident' | 'reader', ...responses: NormalizedResponse[]): void { this.queues[who].push(...responses); }
   streamYielding(request: NormalizedRequest): MockYieldingStream {
     this.calls.push(request);
     const who = JSON.stringify(request.messages).includes('[Tune-out reader') ? 'reader' : 'resident';
-    const next = this.queues[who].shift() ?? createMockResponse([{ type: 'text', text: `${who}-default` }]);
-    return new MockYieldingStream([next]);
+    // As test/helpers/reader-fork-rig.ts: one stream takes every response queued for its role,
+    // so a tool round and its continuation go in together.
+    const responses = this.queues[who].splice(0);
+    if (responses.length === 0) responses.push(createMockResponse([{ type: 'text', text: `${who}-default` }]));
+    const stream = new MockYieldingStream(responses);
+    this.streams.push({ who, stream });
+    return stream;
   }
   asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
 }
@@ -106,37 +110,44 @@ describe('reader-fork probes', () => {
     } finally { await h.cleanup(); }
   });
 
-  it('PROBE R14: a deliver_summary whose mail cannot be created, then the fork answers in prose', { timeout: 90_000 }, async () => {
-    const h = await boot();
-    try {
-      const entered = h.i.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 5, maxWakes: 5 }, 'agent-tool');
-      assert.ok(entered.ok);
-      // The registry's durable mail creation fails once.
-      const holdMail = h.i.registry.holdMail.bind(h.i.registry);
-      let failures = 0;
-      h.i.registry.holdMail = (...args: unknown[]) => {
-        if (failures++ === 0) throw new Error('zz durable mail write failed');
-        return holdMail(...args);
-      };
-      h.membrane.push('reader',
-        createMockResponse([{ type: 'tool_use', id: 'call-report', name: 'deliver_summary', input: { text: 'zz-summary', channelId: CHANNEL } }], 'tool_use'),
-        createMockResponse([{ type: 'text', text: 'zz-prose-fallback' }]),
-      );
-      h.emit('addressed', 'm1', 'hey scout, quick question');
-      await waitFor(() => h.forks().length >= 1, 'a reader fork', 30_000);
-      const fork = h.forks()[0]!.agentName;
-      const ended = await waitFor(() => h.framework.getAgentRecord(fork)?.ended !== undefined, 'the fork ends', 30_000).then(() => true, () => false);
-      await sleep(2_000);
-      const results = h.traces.filter((t) => (t as { agentName?: string }).agentName === fork).map((t) => t.type);
-      console.log(`# PROBE-R14 fork ended within 30 s: ${ended}; record: ${JSON.stringify(h.framework.getAgentRecord(fork)?.ended ?? null)}; its traces: ${JSON.stringify(results)}`);
-      console.log(`# PROBE-R14 reader requests made: ${h.membrane.calls.filter((c) => JSON.stringify(c.messages).includes('[Tune-out reader')).length}`);
-      const scout = h.framework.getAgent('scout')!.getContextManager().getAllMessages() as unknown as Array<{ participant: string; content: Array<{ type: string; text?: string }> }>;
-      const fromFork = scout.filter((m) => m.participant === fork).map((m) => m.content.map((b) => b.text ?? '').join(''));
-      const proseTraced = h.traces.some((t) => t.type === 'tune-out:reader-prose-delivered');
-      console.log(`# PROBE-R14 holdMail failures thrown: ${Math.min(failures, 1)}; fork ended: ${h.framework.getAgentRecord(fork)?.ended?.reason}; reader-reported: ${h.i.tuneOutCoordinator.readerReported(fork)}`);
-      console.log(`# PROBE-R14 messages from the fork in scout's context: ${fromFork.length} ${JSON.stringify(fromFork)}; prose delivery traced: ${proseTraced}`);
-      console.log(`# PROBE-R14 log lines naming the failure: ${JSON.stringify(h.log.filter((l) => l.includes('zz durable')).map((l) => l.slice(0, 300)))}`);
-      console.log(`# PROBE-R14 log lines naming the fork: ${JSON.stringify(h.log.filter((l) => l.includes(fork)).map((l) => l.slice(0, 300)).slice(0, 12))}`);
-    } finally { await h.cleanup(); }
-  });
+  type R14 = 'prose-only' | 'summary-ok' | 'summary-mail-fails';
+  for (const mode of ['prose-only', 'summary-ok', 'summary-mail-fails'] as R14[]) {
+    it(`PROBE R14 (${mode}): what of a reader fork's report reaches the resident`, { timeout: 90_000 }, async () => {
+      const h = await boot();
+      try {
+        const entered = h.i.tuneOutCoordinator.enter('disc', CHANNEL, { cadenceSeconds: 3600, backlogCap: 5, maxWakes: 5 }, 'agent-tool');
+        assert.ok(entered.ok);
+        const holdMail = h.i.registry.holdMail.bind(h.i.registry);
+        let mailCalls = 0;
+        let reportedAtMail: boolean | undefined;
+        h.i.registry.holdMail = (...args: unknown[]) => {
+          mailCalls++;
+          const fork = h.forks()[0]?.agentName;
+          if (fork) reportedAtMail = h.i.tuneOutCoordinator.readerReported(fork);
+          if (mode === 'summary-mail-fails' && mailCalls === 1) throw new Error('zz durable mail write failed');
+          return holdMail(...args);
+        };
+        const summary = createMockResponse([{ type: 'tool_use', id: 'call-report', name: 'deliver_summary', input: { text: 'zz-summary', channelId: CHANNEL } }], 'tool_use');
+        const prose = createMockResponse([{ type: 'text', text: 'zz-prose-fallback' }]);
+        if (mode === 'prose-only') h.membrane.push('reader', prose);
+        else h.membrane.push('reader', summary, prose);
+        h.emit('addressed', 'm1', 'hey scout, quick question');
+        await waitFor(() => h.forks().length >= 1, 'a reader fork', 30_000);
+        const fork = h.forks()[0]!.agentName;
+        let reportedAtEnd: boolean | undefined;
+        const ended = await waitFor(() => {
+          if (h.framework.getAgentRecord(fork)?.ended !== undefined) return true;
+          reportedAtEnd = h.i.tuneOutCoordinator.readerReported(fork);
+          return false;
+        }, 'the fork ends', 30_000).then(() => true, () => false);
+        await sleep(3_000);
+        const readerStream = h.membrane.streams.find((x) => x.who === 'reader')?.stream;
+        const scout = h.framework.getAgent('scout')!.getContextManager().getAllMessages() as unknown as Array<{ participant: string; content: Array<{ type: string; text?: string }>; metadata?: { kind?: string } }>;
+        const withText = (t: string) => scout.filter((m) => m.content.some((b) => (b.text ?? '').includes(t))).map((m) => `${m.participant}/${m.metadata?.kind ?? '-'}`);
+        console.log(`# PROBE-R14 ${mode}: fork ended: ${ended} (${h.framework.getAgentRecord(fork)?.ended?.reason}); holdMail calls: ${mailCalls}; readerReported when holdMail was called: ${reportedAtMail}; last seen before the end: ${reportedAtEnd}`);
+        console.log(`# PROBE-R14 ${mode}: tool results: ${JSON.stringify(readerStream?.receivedToolResults ?? null).slice(0, 300)}`);
+        console.log(`# PROBE-R14 ${mode}: in scout's store: zz-summary ${JSON.stringify(withText('zz-summary'))}, zz-prose-fallback ${JSON.stringify(withText('zz-prose-fallback'))}; prose delivery traced: ${h.traces.some((t) => t.type === 'tune-out:reader-prose-delivered')}`);
+      } finally { await h.cleanup(); }
+    });
+  }
 });

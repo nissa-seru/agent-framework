@@ -44,13 +44,19 @@ class WaitModule implements Module {
 
 class RoutedMembrane {
   calls: NormalizedRequest[] = [];
+  streams: Array<{ who: string; stream: MockYieldingStream }> = [];
   private queues = { resident: [] as NormalizedResponse[], reader: [] as NormalizedResponse[] };
   push(who: 'resident' | 'reader', ...responses: NormalizedResponse[]): void { this.queues[who].push(...responses); }
   streamYielding(request: NormalizedRequest): MockYieldingStream {
     this.calls.push(request);
     const who = JSON.stringify(request.messages).includes('[Tune-out reader') ? 'reader' : 'resident';
-    const next = this.queues[who].shift() ?? createMockResponse([{ type: 'text', text: `${who}-default` }]);
-    return new MockYieldingStream([next]);
+    // As test/helpers/reader-fork-rig.ts: one stream takes every response queued for its role,
+    // so a tool round and its continuation go in together.
+    const responses = this.queues[who].splice(0);
+    if (responses.length === 0) responses.push(createMockResponse([{ type: 'text', text: `${who}-default` }]));
+    const stream = new MockYieldingStream(responses);
+    this.streams.push({ who, stream });
+    return stream;
   }
   asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
 }
