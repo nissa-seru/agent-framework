@@ -259,6 +259,7 @@ function endedAsStop(h: { framework: AgentFramework; traces: TraceEvent[]; reque
   assert.equal(h.requests.length, 0, 'nothing was sent');
   assert.deepEqual(abortReasons(h.traces), [reason], "one inference:aborted, with the stop's reason");
   assert.deepEqual(otherTerminals(h.traces), [], 'and no other terminal');
+  assert.equal(h.traces.filter((t) => t.type === 'inference:request').length, 0, 'and no inference:request, since nothing was sent');
   const rows = h.framework.queryInferenceLogs({ agentName: h.agent.name }).entries.map((e) => e.entry);
   assert.equal(rows.length, 1, 'the inference log has one row for the turn');
   assert.equal(stopRows(h.framework, h.agent.name, reason).length, 1, "and it's the stop's");

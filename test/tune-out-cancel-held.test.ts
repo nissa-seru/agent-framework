@@ -16,7 +16,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 
 interface Row { participant: string; content: ContentBlock[]; metadata?: Record<string, unknown> }
-interface Added { participant: string; content: ContentBlock[]; metadata?: Record<string, unknown>; forAgent?: string }
+interface Added { participant: string; content: ContentBlock[]; metadata?: Record<string, unknown>; forAgent?: string; id: string }
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
 const IMAGE = { type: 'image', source: { type: 'base64', data: 'iVBORw0KGgo=', mediaType: 'image/png' } } as ContentBlock;
@@ -33,6 +33,8 @@ const textOf = (content: ContentBlock[]): string =>
 function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; held: Row[]; note?: string }) {
   const added: Added[] = [];
   const inferences: string[] = [];
+  // The rows each wake is for, by the ids their placements were given.
+  const wakeFor = new Map<string, string[]>();
   const registry = {
     // Each channel's id is unique here, so it's shown by its id.
     nameShown: (channel: { channelId: string }) => channel.channelId,
@@ -42,10 +44,15 @@ function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; h
     }),
   };
   const hooks = {
-    addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
-      added.push({ participant, content, metadata, forAgent });
+    addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string, placement?: { agent?: string; messageId?: string }) => {
+      const id = `row-${added.length}`;
+      added.push({ participant, content, metadata, forAgent, id });
+      if (placement) Object.assign(placement, { agent: forAgent ?? 'scout', messageId: id });
     },
-    requestInference: (agentName: string) => { inferences.push(agentName); },
+    requestInference: (agentName: string, _reason: string, _source: string, forWrites?: ReadonlyArray<{ messageId?: string }>) => {
+      inferences.push(agentName);
+      wakeFor.set(agentName, (forWrites ?? []).map((w) => w.messageId!));
+    },
     subconsciousName: () => 'Subconscious',
     primaryName: () => 'scout',
     getStoredMessages: () => opts.stored,
@@ -64,7 +71,8 @@ function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; h
     assert.equal(m.forAgent, 'Subconscious', 'each held row is for the subconscious');
     assert.equal(m.participant, 'user', "each held row is a user row, which the subconscious's boundary can inject");
   }
-  return { dump: textOf(dump.content), notice, held: held.map((m) => m.content), inferences };
+  const idsOf = (kind: string) => added.filter((m) => m.metadata?.kind === kind).map((m) => m.id);
+  return { dump: textOf(dump.content), notice, held: held.map((m) => m.content), inferences, wakeFor, idsOf };
 }
 
 const OTHERS = {
@@ -137,6 +145,20 @@ test('with media on both sides of the cut, the notice carries each held message 
   assert.equal(held[0]![2], IMAGE);
   assert.equal(held[1]![1], URL_IMAGE);
   assert.equal(held[2]![1], AUDIO);
+});
+
+test("each row the cancel writes is in the wake it's for: the dump and the subconscious's note in the resident's, the notice and the held rows in the subconscious's", () => {
+  const { wakeFor, idsOf } = cancelWith({
+    backlogCap: 0,
+    source: 'agent-tool',
+    stored: [row('Ann', [text('A1 stored')], 'eA')],
+    held: [row('Bo', [text('A2 held')], 'eA')],
+    note: 'Ann asked about the release.',
+  });
+  assert.equal(idsOf('subconscious-note').length, 1, 'premise: the note is written');
+  assert.equal(idsOf('tune-out-cancel-held').length, 1, 'premise: a held row is written');
+  assert.deepEqual(wakeFor.get('scout'), [...idsOf('tune-out-cancel'), ...idsOf('subconscious-note')]);
+  assert.deepEqual(wakeFor.get('Subconscious'), [...idsOf('tune-out-cancel-report'), ...idsOf('tune-out-cancel-held')]);
 });
 
 test('a cancel the subconscious makes itself gets the notice and a report turn when a held message goes to it', () => {

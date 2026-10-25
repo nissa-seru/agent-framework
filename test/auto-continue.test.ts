@@ -223,12 +223,19 @@ describe('autoContinue', () => {
     const framework = await createFramework(true);
     stubRegistry(framework);
     const triggers = script(framework, [empty(), skipReply()]);
+    const traces: Array<{ type: string; messageId?: string; source?: string; agentName?: string; delivered?: Array<{ messageId: string }> }> = [];
+    framework.onTrace((e) => traces.push(e as (typeof traces)[number]));
     try {
       trigger(framework);
       await within(framework.runUntilIdle(), 'the run to settle');
       assert.equal(triggers.length, 2);
       assert.equal(triggers[1]!.reason, 'auto-continue');
       assert.equal(notices(framework).length, 1);
+      // Fleet telemetry: the row is the framework's notice for the
+      // continuation's wake, addressed to the agent and delivered by its request.
+      const row = traces.find((e) => e.type === 'message:added' && e.source === 'auto-continue')!.messageId;
+      assert.ok(traces.some((e) => e.type === 'message:addressed' && e.messageId === row && e.agentName === 'assistant'), 'the row is addressed');
+      assert.deepEqual(traces.filter((e) => e.type === 'inference:request').map((e) => e.delivered?.some((d) => d.messageId === row) ?? false), [false, true]);
     } finally {
       await framework.stop();
     }

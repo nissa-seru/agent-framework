@@ -7,6 +7,7 @@
  * Spec references: Section 6 (Feature Sets), Appendix A (Error Codes).
  */
 
+import type { EmittedTraceEvent } from '../types/trace.js';
 import type {
   McplCapabilities,
   FeatureSetDeclaration,
@@ -136,7 +137,7 @@ export class FeatureSetManager {
    *   turned off. Omit for scratch derivations (nothing is installed).
    */
   constructor(
-    private readonly emitTrace?: (event: { type: string; [key: string]: unknown }) => void,
+    private readonly emitTrace?: (event: EmittedTraceEvent) => void,
   ) {}
 
   /**

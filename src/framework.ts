@@ -23,8 +23,10 @@ import type {
   StoredMessage,
   TokenBudget,
 } from '@animalabs/context-manager';
+import { AddressedMessages } from './addressed-messages.js';
 import {
   bodyGroupRun,
+  bodyHeadId,
   bodyRangeIn,
   locateMessageIndex,
   locateMessageIndices,
@@ -40,6 +42,9 @@ import type {
   FrameworkState,
   TraceEvent,
   TraceEventListener,
+  EmittedTraceEvent,
+  AddressedDelivery,
+  OpsAlertKind,
   InferenceLogEntry,
   InferenceLogQuery,
   InferenceLogQueryResult,
@@ -749,7 +754,7 @@ const utilityOneLiner = (description: string): string => {
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { toolArgsProblems } from './tool-args.js';
-import { EventGate, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
+import { EventGate, checkToolInput, formatShadowWarning, shownValue, triggerVerdict, wakeLineText, type WritePlacement } from './gate/event-gate.js';
 import type { GateEntryRef, WakeLine } from './gate/types.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
@@ -1308,6 +1313,15 @@ let lastTurnId = 0;
 /** Record that a channel has been the turn's trigger or its locus (TurnRouting.wasIn). */
 function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined): void {
   if (channel && !routing.wasIn.some((c) => sameChannel(c, channel))) routing.wasIn.push(channel);
+}
+
+/** A `message:added` trace's fields for where addMessage put a message: the
+ *  agent whose window holds it, and a write deferred at arrival's queue id. */
+function addedFields(placement: { agent?: string; deferredId?: string }): { agentName: string | undefined; deferredId?: string } {
+  return {
+    agentName: placement.agent || undefined,
+    ...(placement.deferredId !== undefined ? { deferredId: placement.deferredId } : {}),
+  };
 }
 
 function freshTurnRouting(): TurnRouting {
@@ -2098,6 +2112,14 @@ interface LocalProviderGate {
   auxiliaryWaiters: Array<() => void>;
   idleWaiters: Array<() => void>;
   deferredAuxiliary: number;
+}
+/** What an ops alert's raiser can add beside its kind, agent and message. */
+interface OpsAlertOptions {
+  data?: Record<string, unknown>;
+  skipLog?: boolean;
+  /** Tells this alert apart from others of its agent and kind for the
+   *  webhook's cooldown, such as the batch a retirement names. */
+  key?: string;
 }
 interface ProviderAccelerationCooldown {
   startedAt: number;
@@ -2995,6 +3017,12 @@ export class AgentFramework {
    * it; disposal drops it, and stop() clears every agent's.
    */
   private openLogical: Map<string, TurnRouting> = new Map();
+  /** Each context manager's summaries on the branch it's on, by id, to the
+   *  stored messages they cover (summaryCovers). */
+  private readonly summaryCoverage = new WeakMap<ContextManager, { branch: string; covers: Map<string, ReadonlySet<string>> }>();
+  /** Fleet telemetry's addressed messages not yet delivered (noteAddressed,
+   *  deliverAddressed). In memory: a restart loses it. */
+  private readonly addressedMessages = new AddressedMessages();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
@@ -3822,10 +3850,17 @@ export class AgentFramework {
         configPath,
         initialConfig: config.gate.config,
         privilegedUsersPath: config.gate.privilegedUsersPath,
-        emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
-        addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
-          forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
+        emitTrace: (e) => framework.emitTrace(e),
+        addMessage: (p, c, m, forAgent, placement) => {
+          const landed: WritePlacement = placement ?? {};
+          const id = framework.addMessage(p, c, m as MessageMetadata, { ...(forAgent ? { forAgent } : {}), placement: landed });
+          const source = (m as { source?: unknown } | undefined)?.source;
+          framework.emitTrace({ type: 'message:added', messageId: id, source: typeof source === 'string' ? source : 'gate', ...addedFields(landed) });
+          return id;
+        },
         requestInference: (agentName, reason, source, provenance, after) => {
+          // A notice the gate wrote with its own wake (a self-wake's).
+          if (after) framework.noteAddressed(agentName, after);
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             ...framework.readsDeferredFor(after, agentName),
@@ -3860,8 +3895,7 @@ export class AgentFramework {
             })(),
           });
         },
-        getAgentNames: () => [...framework.agents.keys()].filter(
-          (n) => n !== framework.subconsciousAgentName),
+        getAgentNames: () => framework.gateWakeAgents(),
         // Push events reach the gate with the adapter's raw channel id; map
         // them to the registered composite id the same way ingestion does
         // (handleMcplPushEvent registers that channel on arrival, before any
@@ -4024,10 +4058,18 @@ export class AgentFramework {
         framework.channelRegistry,
         framework.mcplServerRegistry!,
         {
-          addMessage: (participant, content, metadata, forAgent) =>
-            framework.addMessage(participant, content, metadata as MessageMetadata,
-              forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
+          addMessage: (participant, content, metadata, forAgent, placement) => {
+            const landed: { agent?: string; messageId?: MessageId; deferredId?: string } = {};
+            const id = framework.addMessage(participant, content, metadata as MessageMetadata,
+              { ...(forAgent ? { forAgent } : {}), placement: landed });
+            if (placement) Object.assign(placement, landed);
+            const kind = metadata?.kind;
+            framework.emitTrace({ type: 'message:added', messageId: id, source: typeof kind === 'string' ? kind : 'tune-out', ...addedFields(landed) });
+            return id;
+          },
+          requestInference: (agentName, reason, source, forWrites) => {
+            // The coordinator's own notices, written for this wake.
+            for (const write of forWrites ?? []) framework.noteAddressed(agentName, write);
             framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
           },
           subconsciousName: () => framework.subconsciousAgentName,
@@ -4064,7 +4106,7 @@ export class AgentFramework {
           isPrivilegedAuthor: (authorId) =>
             framework.eventGate?.isPrivilegedUser(authorId) ?? false,
           allowChannelSpeech: () => framework.subconsciousConfig?.allowChannelSpeech === true,
-          emitTrace: (e) => framework.emitTrace(e as never),
+          emitTrace: (e) => framework.emitTrace(e),
         },
       );
       framework.tuneOutCoordinator.resumeActiveEpochs();
@@ -5965,7 +6007,11 @@ export class AgentFramework {
     // traces per abort. Only the non-streaming inference path has no stream
     // driver to report for it.
     if (result && !hadStream) {
-      this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: result.durationMs });
+      // The agent's latest routing is this inference's turn only while it's
+      // live: one settled is an earlier turn's, and a direct Agent
+      // inference after it has none.
+      const routing = this.turnRouting.get(agentName);
+      this.emitTrace({ type: 'inference:aborted', turnId: routing && !this.settledTurns.has(routing) ? routing.turnId : undefined, agentName, reason, durationMs: result.durationMs });
     }
     // A turn with no stream and a check still ahead (checkAhead) ends at that
     // check, before it sends anything more, and reports the stop there. One
@@ -6064,6 +6110,7 @@ export class AgentFramework {
     // carries the honest cause without any of that.
     this.emitTrace({
       type: 'inference:aborted',
+      turnId: (args.stream ?? closes)?.turnId,
       agentName: agent.name,
       reason,
       durationMs,
@@ -6195,6 +6242,7 @@ export class AgentFramework {
     }
     this.emitTrace({
       type: 'inference:aborted',
+      turnId: closes?.turnId,
       agentName: agent.name,
       durationMs,
       reason: kind,
@@ -9510,6 +9558,7 @@ export class AgentFramework {
         this.thinkingLossIncidents.forget(agent.name);
         // Its pending self-wake ends with it, as a fork's does.
         this.eventGate?.agentGone(agent.name);
+        this.withdrawAddressedFor(agent.name);
         this.releaseWindowNowOrAfterResume(agent);
       }
       this.toolImageLedgers.delete(agent.name);
@@ -12561,9 +12610,12 @@ export class AgentFramework {
         // The call this result answers, as this round holds it: a new round
         // that reuses the call's id holds a new entry for it.
         const owed = agent.state.pending.get(event.callId);
+        // The batch's turn, read before the hook runs, since the hook can
+        // outlast it and a newer turn start meanwhile.
+        const turnId = this.turnRouting.get(event.agentName)?.turnId;
         const failures = await this.moduleRegistry.notifyToolBatchComplete(event.agentName);
         for (const failure of failures) {
-          this.emitTrace({ type: 'module:batch_hook_failed', agentName: event.agentName, module: failure.module, error: failure.error });
+          this.emitTrace({ type: 'module:batch_hook_failed', turnId, agentName: event.agentName, module: failure.module, error: failure.error });
         }
         // The turn may have been reset, cancelled or replaced while the hook
         // ran, even back to waiting on a new batch, whose calls may reuse this
@@ -12595,6 +12647,9 @@ export class AgentFramework {
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
         if (currentState.status === 'ready') {
+          // The round's turn, read before the awaits below, which a newer
+          // turn can outlast: the events of this round name it.
+          const roundTurnId = this.turnRouting.get(agent.name)?.turnId;
           // Effective inline cap: agent_settings override → durable config →
           // house default, clamped to the strategy bound (see resolver).
           const { cap: maxChars, bound } = this.resolveToolResultInlineCap(agent);
@@ -12987,7 +13042,7 @@ export class AgentFramework {
             if (currentState.stream) {
               this.streamBoundaryEnds.get(currentState.stream)?.('turn_ended');
             }
-            this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
+            this.emitTrace({ type: 'inference:turn_ended', turnId: roundTurnId, agentName: agent.name });
           } else if ((overBudget || overPhysical) && this.providerAdmissionClosed) {
             // A stopping framework starts no continuation: the turn ends with
             // its stream, as stop() ends a live stream's turn.
@@ -13029,6 +13084,7 @@ export class AgentFramework {
             }
             this.emitTrace({
               type: 'inference:stream_restarted',
+              turnId: roundTurnId,
               agentName: agent.name,
               // 'physical_window' only when the budget check alone would
               // have let the doomed request through — overBudget keeps its
@@ -13101,9 +13157,17 @@ export class AgentFramework {
               agent.markContextShown();
               if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
             }
+            // Delivered here only where the stream declares it carries what
+            // it's given, as the consumed mark is; otherwise the next compile
+            // delivers them.
+            const delivered = currentState.supportsInjectedMessages === true && heard.length > 0
+              ? this.deliverAddressed(agent, () => heard.map((h) => h.id), false)
+              : [];
             agent.setStreaming(currentState.stream);
             this.emitTrace({
               type: 'inference:stream_resumed',
+              ...(delivered.length > 0 ? { delivered } : {}),
+              turnId: roundTurnId,
               agentName: agent.name,
               ...(midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections.length } : {}),
             });
@@ -13258,6 +13322,9 @@ export class AgentFramework {
     const eventChannel = (event as { metadata?: { channelId?: unknown } }).metadata?.channelId;
     const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
     let added: { agent?: string; deferredId?: string } | undefined;
+    // Where each added message landed, for the agents a wake below is asked
+    // of (noteAddressed).
+    const placements: Array<{ agent?: string; messageId?: string; deferredId?: string }> = [];
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
         step.at = `adding message ${i + 1} of ${response.addMessages.length}`;
@@ -13267,10 +13334,11 @@ export class AgentFramework {
           metadata = rest;
         }
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
-        const placement: { agent?: string; deferredId?: string } = {};
+        const placement: { agent?: string; messageId?: string; deferredId?: string } = {};
         const id = this.addMessage(msg.participant, msg.content, metadata, { placement });
         if (response.addMessages.length === 1 && !surface && !namesChannel && metadata?.channelId === undefined) added = placement;
-        this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
+        placements.push(placement);
+        this.emitTrace({ type: 'message:added', messageId: id, source: event.type, ...addedFields(placement) });
       }
     }
 
@@ -13299,6 +13367,17 @@ export class AgentFramework {
       step.at = 'its inference request';
       const source = 'source' in event ? (event as { source: string }).source : 'unknown';
 
+      // Broadcast requests exclude conversation forks — they are driven by
+      // their own channel's messages, not by framework-wide events.
+      const targetAgents =
+        response.requestInference === true
+          ? Array.from(this.agents.keys()).filter(
+              (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName)
+          : response.requestInference;
+      const noteAddressedFor = (agentNames: Iterable<string>, held?: 'sleep'): void => {
+        for (const agentName of agentNames) for (const placement of placements) this.noteAddressed(agentName, placement, held);
+      };
+
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
         const decision = this.eventGate.evaluate({
@@ -13307,20 +13386,21 @@ export class AgentFramework {
           serverId: source,
           channelId: '',
         });
-        if (!decision.trigger) return;
+        const verdict = triggerVerdict(decision);
+        if (verdict !== true) {
+          // A debounce batch's end wakes every agent but the subconscious
+          // (gateWakeAgents), whatever the request named; the sleep holds the
+          // wakes it suppressed.
+          if (verdict !== false && verdict.later === 'debounce') noteAddressedFor(this.gateWakeAgents());
+          else if (verdict !== false) noteAddressedFor(targetAgents.filter((n) => this.agents.get(n)?.canBeTriggeredBy(source)), 'sleep');
+          return;
+        }
       }
-
-      // Broadcast requests exclude conversation forks — they are driven by
-      // their own channel's messages, not by framework-wide events.
-      const targetAgents =
-        response.requestInference === true
-          ? Array.from(this.agents.keys()).filter(
-              (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName)
-          : response.requestInference;
 
       for (const agentName of targetAgents) {
         const agent = this.agents.get(agentName);
         if (agent && agent.canBeTriggeredBy(source)) {
+          noteAddressedFor([agentName]);
           this.pendingRequests.push({
             agentName,
             reason: event.type,
@@ -13378,6 +13458,7 @@ export class AgentFramework {
     metadata?: Record<string, unknown>;
     tags?: string[];
     triggerInference?: boolean;
+    wakeLater?: 'debounce' | 'sleep';
     targetAgents?: string[];
     /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
     coalescingSubject?: string;
@@ -13472,7 +13553,10 @@ export class AgentFramework {
         if (this.conversationRouter.getBinding(channel)?.agentName === target.name) {
           this.conversationRouter.touch(channel);
         }
-        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming', agentName: target.name });
+        if (event.triggerInference || event.wakeLater) {
+          this.noteAddressed(target.name, { agent: target.name, messageId: id }, event.wakeLater === 'sleep' ? 'sleep' : undefined);
+        }
         if (event.triggerInference) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
@@ -13536,7 +13620,16 @@ export class AgentFramework {
 
     const placement: CoalescingPlacement = { agent: '' };
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming', ...addedFields(placement) });
+    // Addressed: a diverted message to the subconscious, whose invocations
+    // (a mention's, or the cadence's) read it; any other the gate wakes for,
+    // now or later, to the agents that wake reaches (noteAddressedForWake).
+    const untargeted = (): string[] => [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
+    if (divert) {
+      if (this.subconsciousAgentName) this.noteAddressed(this.subconsciousAgentName, placement);
+    } else if (event.triggerInference || event.wakeLater) {
+      this.noteAddressedForWake(event, placement, untargeted);
+    }
 
     if (event.triggerInference && !divert) {
       const addressed = isAddressedMessage(event.tags, event.metadata);
@@ -13545,8 +13638,7 @@ export class AgentFramework {
       // keeps the historical broadcast. (targetAgents was declared on
       // McplChannelIncomingEvent from the start but never honored here —
       // tune-out's wake routing is the first setter.)
-      const targetAgents = event.targetAgents
-        ?? [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
+      const targetAgents = event.targetAgents ?? untargeted();
       for (const agentName of targetAgents) {
         if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
@@ -13586,6 +13678,7 @@ export class AgentFramework {
       metadata?: Record<string, unknown>;
       tags?: string[];
       triggerInference?: boolean;
+      wakeLater?: 'debounce' | 'sleep';
       coalescingSubject?: string;
     },
     messageMetadata: Record<string, unknown>,
@@ -13662,7 +13755,14 @@ export class AgentFramework {
     }
     const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(channel);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming', agentName: agent.name });
+    // Addressed when the fork is woken for it: by the router now, or by the
+    // gate later, in a debounce batch, whose end wakes every agent but the
+    // subconscious, forks included (gateWakeAgents), or under its sleep,
+    // which holds the router's wake.
+    if (trigger || event.wakeLater === 'debounce' || (decision.trigger && event.wakeLater === 'sleep')) {
+      this.noteAddressed(agent.name, { agent: agent.name, messageId: id }, trigger || event.wakeLater !== 'sleep' ? undefined : 'sleep');
+    }
 
     if (trigger) {
       this.pendingRequests.push({
@@ -13969,6 +14069,7 @@ export class AgentFramework {
     this.thinkingLossIncidents.forget(agentName);
     // Its pending self-wake ends with it, rather than wake a name that's gone.
     this.eventGate?.agentGone(agentName);
+    this.withdrawAddressedFor(agentName);
     if (agent) this.releaseWindowNowOrAfterResume(agent);
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
@@ -14061,11 +14162,14 @@ export class AgentFramework {
         this.conversationAgentHomes.delete(binding.agentName);
         continue;
       }
-      agent.getContextManager().addMessage(
+      const closure = agent.getContextManager().addMessage(
         'user',
         [{ type: 'text', text: this.conversationRouter.closurePrompt }],
         { channelId: binding.channelId, conversationClosure: true },
       );
+      this.emitTrace({ type: 'message:added', messageId: closure, source: 'conversation:closure', agentName: binding.agentName });
+      // The framework's own notice with a wake of its own.
+      this.noteAddressed(binding.agentName, { agent: binding.agentName, messageId: closure });
       this.pendingRequests.push({
         agentName: binding.agentName,
         reason: 'conversation:closure',
@@ -14873,6 +14977,7 @@ export class AgentFramework {
         metadata: origin,
         tags: push.tags,
         triggerInference: assemblingFor ? false : push.triggerInference,
+        ...(!assemblingFor && push.wakeLater ? { wakeLater: push.wakeLater } : {}),
         targetAgents: push.targetAgents,
         coalescingSubject,
         eventId: occ.eventId,
@@ -14882,6 +14987,10 @@ export class AgentFramework {
         ...frozenSource(push.inboundSource),
       };
       const placement = await this.handleMcplChannelIncoming(event);
+      // The request being assembled carries it, so the wake it asked, now or
+      // held, is answered there (unless a tune-out diverted it, which
+      // noteAddressed leaves to the subconscious).
+      if (assemblingFor && (push.triggerInference || push.wakeLater) && placement) this.noteAddressed(assemblingFor, placement);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
     }
@@ -14892,15 +15001,37 @@ export class AgentFramework {
       ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event', occ.serverId)) } : {}),
       coalescingSubject,
       // §5.2: the materialized occurrence is consumed by the request being
-      // assembled; the wake that started it is not repeated.
-      ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
+      // assembled; the wake that started it is not repeated, now or held.
+      ...(assemblingFor ? { assemblingFor, triggerInference: false, wakeLater: undefined } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
       ...firstViewMark,
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
+    // The request being assembled carries it, so the wake it asked, now or
+    // held, is answered there, as on a channel.
+    if (assemblingFor && (occ.event.event.triggerInference || occ.event.event.wakeLater) && placement) this.noteAddressed(assemblingFor, placement);
     await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
     return placement;
+  }
+
+  /** Whether a tune-out diverted the message out of the residents' view:
+   *  its row's (or held write's, queued or stored and not yet acked)
+   *  `tuneOut` stamp, read as their view filter reads it (truthy). `placement` is where it
+   *  is now (landedPlacement). A row that can't be read reads as not
+   *  diverted. */
+  private divertedPlacement(placement: { agent?: string; messageId?: string; deferredId?: string }): boolean {
+    if (placement.deferredId !== undefined) {
+      return [...this.deferredMessages, ...this.unackedDeferredWrites]
+        .some((m) => m.id === placement.deferredId && !!(m.metadata as { tuneOut?: unknown } | undefined)?.tuneOut);
+    }
+    if (!placement.messageId || !placement.agent) return false;
+    try {
+      const row = this.agents.get(placement.agent)?.getContextManager().getMessage(placement.messageId as MessageId);
+      return !!(row?.metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+    } catch {
+      return false;
+    }
   }
 
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
@@ -14922,6 +15053,15 @@ export class AgentFramework {
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
     for (const agentName of await this.coalescedAudience(occ)) {
+      // A render placed in the agent's deferred queue is a held write this
+      // wake is for, unless a request already carried it and was answered
+      // across the awaits before this: the scheduler drops that wake
+      // (deferredWriteDone, asked as it asks it), so none is for it.
+      if (readsDeferredWrite !== undefined) {
+        const agent = this.agents.get(agentName);
+        const to = channelId === undefined || allAmbient ? undefined : { serverId: occ.serverId, channelId };
+        if (agent && !this.deferredWriteDone(agent, readsDeferredWrite, to)) this.noteAddressed(agentName, { agent: agentName, deferredId: readsDeferredWrite });
+      }
       this.pendingRequests.push({
         agentName,
         reason: 'mcpl:push-event',
@@ -15055,14 +15195,18 @@ export class AgentFramework {
       if (!held || held.landing === 'unknown') return false;
       this.deferredMessages = this.deferredMessages.filter((m) => m !== held);
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      this.withdrawAddressedEverywhere(held.id, 'removed');
       return true;
     }
     if (!p.messageId) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {
-      removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
+      // A sharded body is withdrawn by its first shard's id, which its entry
+      // goes by, whichever shard the placement found.
+      const removed = removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
+      this.withdrawAddressedEverywhere(removed, 'removed');
       return true;
     } catch (err) {
       console.error(`[coalescing] could not remove unread message ${p.messageId} for ${agent.name}:`, err);
@@ -15174,16 +15318,19 @@ export class AgentFramework {
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event', ...addedFields(placement) });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
 
+    // Default broadcast excludes conversation forks (channel-driven).
+    const untargeted = (): string[] => [...this.agents.keys()].filter(
+      (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+    if (event.triggerInference || event.wakeLater) {
+      this.noteAddressedForWake(event, placement, untargeted);
+    }
     if (event.triggerInference) {
-      // Default broadcast excludes conversation forks (channel-driven).
-      const targetAgents = event.targetAgents
-        ?? [...this.agents.keys()].filter(
-          (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+      const targetAgents = event.targetAgents ?? untargeted();
       for (const agentName of targetAgents) {
         this.pendingRequests.push({
           agentName,
@@ -15574,6 +15721,8 @@ export class AgentFramework {
         console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the wake's channel where it carries one not marked ambient, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
+          // No compile follows to withdraw what's gone (a removed write's).
+          this.withdrawGoneAddressed(agentName);
           this.endPendingPrimary(agentName);
           continue;
         }
@@ -15595,6 +15744,7 @@ export class AgentFramework {
           this.endContinuedTurn(agentName, { kind: 'dropped', why: 'the inference policy dropped its continuation' });
         }
         if (requests.some(carriesContinuation)) this.giveBackAutoContinue(agentName, 'the inference policy dropped its wake');
+        this.withdrawGoneAddressed(agentName);
         this.endPendingPrimary(agentName);
         continue;
       }
@@ -15832,7 +15982,7 @@ export class AgentFramework {
         for (const segment of segments) {
           for (const envelope of splitHybridEnvelopes(segment)) {
             const parsed = parseHybridProsePrefix(envelope);
-            if (parsed.kind === 'private' && parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
+            if (parsed.kind === 'private' && parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent, routing.turnId);
           }
         }
       }
@@ -15864,7 +16014,7 @@ export class AgentFramework {
         if (parsed.kind === 'private') {
           delete routing.pin;
           routing.hybridHold = 'private';
-          if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
+          if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent, routing.turnId);
           privateCount++;
         } else if (parsed.kind === 'target') {
           // As deliverHybridProse resolves it: a channel its server declared
@@ -15948,6 +16098,7 @@ export class AgentFramework {
     console.error(`[drafts] ${agent.name}: held ${held.length} segment(s) as ${held.map((d) => d.id).join(', ')} (${reason})`);
     this.emitTrace({
       type: 'prose:drafts-held',
+      turnId: opts.routing.turnId,
       agentName: agent.name,
       reason,
       draftIds: held.map((d) => d.id),
@@ -16138,7 +16289,7 @@ export class AgentFramework {
         [{ type: 'text', text }],
         { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: pending.map((d) => d.id) } as MessageMetadata,
       );
-      this.emitTrace({ type: 'message:added', messageId: mid, source: 'prose-drafts' });
+      this.emitTrace({ type: 'message:added', messageId: mid, source: 'prose-drafts', agentName: agent.name });
     } catch (err) {
       console.error('[drafts] catch-up notice failed:', err);
       return;
@@ -16187,7 +16338,7 @@ export class AgentFramework {
     // Recorded as soon as it's stored, so nothing after can leave it stored and unrecorded.
     workspace.headMoveNoticeStored(agent.name, due.mounts, mid);
     try {
-      this.emitTrace({ type: 'message:added', messageId: mid, source: 'workspace-head-move' });
+      this.emitTrace({ type: 'message:added', messageId: mid, source: 'workspace-head-move', agentName: agent.name });
     } catch (err) {
       console.error('[workspace] head-move notice trace failed:', err);
     }
@@ -16266,8 +16417,8 @@ export class AgentFramework {
   /** The drafts tool's answer to a resident's call, from the model's own
    *  dispatch or an agent-origin call through executeToolCall (a puppet's):
    *  a failure the handler throws is answered as one. */
-  private draftsToolResult(agentName: string, rawInput: unknown, turn?: TurnRouting, callId?: string): Promise<ToolResult> {
-    return this.handleDraftsTool(agentName, rawInput, turn, callId).catch((err): ToolResult => ({
+  private draftsToolResult(agentName: string, rawInput: unknown, turn?: TurnRouting, callId?: string, callTurnId?: number): Promise<ToolResult> {
+    return this.handleDraftsTool(agentName, rawInput, turn, callId, callTurnId).catch((err): ToolResult => ({
       success: false,
       error: `drafts failed: ${thrownText(err)}`,
       isError: true,
@@ -16282,8 +16433,10 @@ export class AgentFramework {
    * `turn` is the turn the call was made in (callingTurnOf), none for a
    * call made outside the agent's current turn: a resend's destination names
    * its own channels (ownChannels) by their ids, and its sends engage it.
+   * `callTurnId` is the call's own turn (ToolCall.callerTurnId), which its
+   * prose events name, as its tool events do (callTraced).
    */
-  private async handleDraftsTool(agentName: string, rawInput: unknown, turn?: TurnRouting, callId?: string): Promise<ToolResult> {
+  private async handleDraftsTool(agentName: string, rawInput: unknown, turn?: TurnRouting, callId?: string, callTurnId?: number): Promise<ToolResult> {
     const input = (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) ? rawInput : {}) as Record<string, unknown>;
     const own = turn ? this.ownChannels(turn) : [];
     // The turn that sends: a resent draft's channel is recorded as engaged on
@@ -16418,7 +16571,7 @@ export class AgentFramework {
           // into it, so say what the draft reads as now rather than guess.
           const now = this.draftStateNow(agentName, d.id);
           if (now === 'dismissed') dismissed.push(d.id);
-          if (dismissed.length > 0) this.emitTrace({ type: 'prose:drafts-dismissed', agentName, draftIds: dismissed });
+          if (dismissed.length > 0) this.emitTrace({ type: 'prose:drafts-dismissed', turnId: callTurnId, agentName, draftIds: dismissed });
           return refuse(
             `${lines.length > 0 ? `${lines.join('\n')}\n` : ''}Recording the dismissal of ${d.id} failed ` +
             `(${err instanceof Error ? err.message : String(err)}): it reads as ${now} now.${now === 'dismissed' ? risk : ''}`,
@@ -16427,7 +16580,7 @@ export class AgentFramework {
         dismissed.push(d.id);
         lines.push(`${d.id}: dismissed (your history keeps the words).${risk}`);
       }
-      if (dismissed.length > 0) this.emitTrace({ type: 'prose:drafts-dismissed', agentName, draftIds: dismissed });
+      if (dismissed.length > 0) this.emitTrace({ type: 'prose:drafts-dismissed', turnId: callTurnId, agentName, draftIds: dismissed });
       return ok(lines.join('\n'));
     }
 
@@ -16549,6 +16702,7 @@ export class AgentFramework {
         }
         this.emitTrace({
           type: 'prose:draft-resent',
+          turnId: callTurnId,
           agentName,
           draftId: d.id,
           status: outcome.status,
@@ -16744,7 +16898,7 @@ export class AgentFramework {
           ...(drafts.length > 0 ? { draftOwner: agent.name, draftIds: drafts.map((d) => d.id) } : {}),
         } as MessageMetadata,
       );
-      this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
+      this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt', agentName: agent.name });
     } catch (err) {
       console.error('delivery receipt append failed:', err);
     }
@@ -16830,7 +16984,7 @@ export class AgentFramework {
       // The baseline is what the agent was told: it moves once the notice is
       // stored, so a notice that fails is announced again at the next turn.
       this.lastAnnouncedLocus.set(agentName, locus);
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice', agentName });
       console.error(
         `[routing] ${agentName}: locus ${prev ? qualifiedChannelName(prev) : '(none)'} -> ${locus ? qualifiedChannelName(locus) : '(none)'} (announced in window)`,
       );
@@ -16923,7 +17077,7 @@ export class AgentFramework {
       console.error(`[clock] ${agent.name}: the clock row at ${occasion} landed though its write threw:`, err);
       id = landed[0]!.id;
     }
-    this.emitTrace({ type: 'message:added', messageId: id, source: `clock:${occasion}` });
+    this.emitTrace({ type: 'message:added', messageId: id, source: `clock:${occasion}`, agentName: agent.name });
     return { id, content: planned.content, metadata };
   }
 
@@ -16962,7 +17116,7 @@ export class AgentFramework {
             system: true, kind: STORED_INJECTION_KIND, [STORED_INJECTION_KEY]: row.mark,
           } as MessageMetadata);
           traced.add(key(row.mark));
-          this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.mark.namespace}` });
+          this.emitTrace({ type: 'message:added', messageId: id, source: `context-injection:${row.mark.namespace}`, agentName: agent.name });
         }
       } catch (err) {
         // A write can throw after its row landed, as storeDueClock's can: the
@@ -16981,7 +17135,7 @@ export class AgentFramework {
           kept.add(key(mark));
           if (!traced.has(key(mark))) {
             traced.add(key(mark));
-            this.emitTrace({ type: 'message:added', messageId: copy.id, source: `context-injection:${mark.namespace}` });
+            this.emitTrace({ type: 'message:added', messageId: copy.id, source: `context-injection:${mark.namespace}`, agentName: agent.name });
           }
         }
         const rest = plan.rows.filter((row) => !kept.has(key(row.mark)));
@@ -17205,7 +17359,7 @@ export class AgentFramework {
     try {
       const id = agent.getContextManager().addMessage('user', content, metadata);
       this.lastAnnouncedLocus.set(agent.name, channel);
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice', agentName: agent.name });
       console.error(`[routing] ${agent.name}: ${cause} re-pin ${prevPin ? qualifiedChannelName(prevPin) : '(none)'} -> ${qualifiedChannelName(channel)}`);
       return { participant: 'user', content, metadata, id };
     } catch (err) {
@@ -17767,7 +17921,9 @@ export class AgentFramework {
       console.error(`[continue] ${agent.name}: the continuation row landed though its write threw:`, err);
       id = landed[0]!.id;
     }
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue' });
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue', agentName: agent.name });
+    // The framework's own notice, for the wake now starting.
+    this.noteAddressed(agent.name, { agent: agent.name, messageId: id });
     console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
     return true;
   }
@@ -18107,7 +18263,7 @@ export class AgentFramework {
         delete routing.pin;
         routing.hybridHold = 'private';
         // `>>>skip_reply {{unsent}}`: the resident sets the bounced draft aside.
-        if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
+        if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent, routing.turnId);
         console.error(`[prose] ${agent.name}: >>>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
         continue;
       }
@@ -18195,7 +18351,7 @@ export class AgentFramework {
    *  recording fails (with the state the draft reads as after it, and whether
    *  `{{unsent}}` still names it) and one whose draft may already have been
    *  posted. */
-  private dismissLatestBounce(agent: Agent): void {
+  private dismissLatestBounce(agent: Agent, turnId: number | undefined): void {
     const draft = this.proseDrafts.latestBounce(agent.name);
     if (!draft) return;
     const tell = (text: string, what: string): void => {
@@ -18215,13 +18371,13 @@ export class AgentFramework {
     const risk = draftState(draft) === 'unconfirmed' ? this.riskText(draft) : undefined;
     try {
       this.proseDrafts.dismiss(agent.name, draft.id);
-      this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });
+      this.emitTrace({ type: 'prose:drafts-dismissed', turnId, agentName: agent.name, draftIds: [draft.id] });
     } catch (err) {
       console.error(`[drafts] ${agent.name}: could not dismiss ${draft.id}:`, err);
       // A write that failed after reaching the journal was reconciled into
       // it, so say what the draft reads as now rather than guess.
       const now = this.draftStateNow(agent.name, draft.id);
-      if (now === 'dismissed') this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });
+      if (now === 'dismissed') this.emitTrace({ type: 'prose:drafts-dismissed', turnId, agentName: agent.name, draftIds: [draft.id] });
       const named = this.proseDrafts.latestBounce(agent.name)?.id === draft.id;
       tell(`[prose-routing] Recording setting aside draft ${draft.id}, which {{unsent}} named, failed ` +
         `(${err instanceof Error ? err.message : String(err)}): it reads as ${now} now, and {{unsent}} ` +
@@ -18250,7 +18406,7 @@ export class AgentFramework {
       // The text already lives in the assistant message (window/chronicle);
       // "delivery" is deliberately a no-op. `>>skip_reply {{unsent}}` sets
       // the bounced draft aside.
-      if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
+      if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent, routing.turnId);
       console.error(`[prose] ${name}: >>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
       return;
     }
@@ -18430,8 +18586,9 @@ export class AgentFramework {
       const target = this.noticeTargetFor(name, 'unknown-send');
       try {
         if (target) {
-          const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, target);
-          this.emitTrace({ type: 'message:added', messageId: id ?? 'deferred', source: 'prose-bounce' });
+          const placement: { agent?: string; messageId?: string; deferredId?: string } = {};
+          const id = this.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'prose-bounce' } as MessageMetadata, { ...target, placement });
+          this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce', ...addedFields(placement) });
         }
       } catch (err) {
         console.error('bounceProse: failed to record the unknown-send notice:', err);
@@ -18494,6 +18651,7 @@ export class AgentFramework {
       `[prose-routing] Your text (${text.length} chars) ${delivered} — ${reason}.${cand} ${kept}${risky}` +
       (prefix === '>>' && this.canAgentUseTool(agent.name, 'prose_help') ? ' The prose_help tool shows the full syntax.' : '');
     const target = this.noticeTargetFor(name, 'prose-bounce');
+    const bounced: { agent?: string; messageId?: string; deferredId?: string } = {};
     if (target) {
       try {
         // Through framework.addMessage, NOT the context manager directly: while
@@ -18507,10 +18665,9 @@ export class AgentFramework {
           'user',
           [{ type: 'text', text: notice }],
           { system: true, kind: 'prose-bounce', ...(draft ? { draftOwner: name, draftIds: [draft.id] } : {}) } as MessageMetadata,
-          target,
+          { ...target, placement: bounced },
         );
-        if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
-        else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce', ...addedFields(bounced) });
       } catch (err) {
         console.error('bounceProse: failed to record bounce notice:', err);
       }
@@ -18523,6 +18680,7 @@ export class AgentFramework {
     if (!capped && target) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
+      this.noteAddressed(name, bounced);
       this.pendingRequests.push({
         agentName: name,
         reason: 'prose-bounce',
@@ -18571,7 +18729,7 @@ export class AgentFramework {
         [{ type: 'text', text: proseModePrimer(mode, this.canAgentUseTool(agent.name, 'prose_help')) }],
         { system: true, kind: 'prose-routing-primer' },
       );
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-routing-primer' });
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-routing-primer', agentName: agent.name });
       console.error(`[prose] ${agent.name}: mode primer appended (${mode})`);
     } catch (err) {
       console.error('maybePrimeProseMode: failed to append primer:', err);
@@ -18856,7 +19014,8 @@ export class AgentFramework {
     } else {
       const owner = this.activeTurnTokens.get(agentName);
       this.abortDroppedTurn(agentName, owner ?? -1,
-        drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt);
+        drop.kind === 'dropped' ? CONTINUATION_DROPPED : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt,
+        (this.openLogical.get(agentName) ?? this.turnRouting.get(agentName))?.turnId);
       this.channelRegistry?.stopTyping();
       if (agent) {
         agent.toolResultGuard.recovering = false;
@@ -18886,9 +19045,9 @@ export class AgentFramework {
    * an inference:aborted saying so. Nothing is written. True when it ended
    * the turn.
    */
-  private endFailureAtStop(agentName: string, turnToken: number, startedAt: number): boolean {
+  private endFailureAtStop(agentName: string, turnToken: number, startedAt: number, turnId: number | undefined): boolean {
     if (!this.providerAdmissionClosed) return false;
-    this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt);
+    this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt, turnId);
     return true;
   }
 
@@ -18900,9 +19059,9 @@ export class AgentFramework {
    * find the held retry (abortInference's drop), not a window nothing will
    * collect.
    */
-  private endHeldStart(agent: Agent, checkWindow: CheckWindow, turnToken: number, startedAt: number): void {
+  private endHeldStart(agent: Agent, checkWindow: CheckWindow, turnToken: number, startedAt: number, turnId: number | undefined): void {
     if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-    this.endFailureAtStop(agent.name, turnToken, startedAt);
+    this.endFailureAtStop(agent.name, turnToken, startedAt, turnId);
     this.eventGate?.onInferenceEnded(agent.name);
   }
 
@@ -18917,7 +19076,7 @@ export class AgentFramework {
    * event and the record carry only the name, so this frame's would end that
    * newer turn instead.
    */
-  private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number): void {
+  private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number, turnId: number | undefined): void {
     const owner = this.activeTurnTokens.get(agentName);
     if (owner !== undefined && owner !== turnToken) return;
     const now = Date.now();
@@ -18925,7 +19084,7 @@ export class AgentFramework {
     // (runEphemeralToCompletion deletes its record) gets none back.
     const last = this.lastInferenceAt.get(agentName);
     if (last?.startedAt === startedAt) this.lastInferenceAt.set(agentName, { ...last, endedAt: now });
-    this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: now - startedAt });
+    this.emitTrace({ type: 'inference:aborted', turnId, agentName, reason, durationMs: now - startedAt });
   }
 
   /**
@@ -19334,6 +19493,7 @@ export class AgentFramework {
     const turnStartedAt = Date.now();
     this.emitTrace({
       type: 'inference:started',
+      turnId: routing.turnId,
       agentName: agent.name,
       // The turn's locus, kept across a start that continues the turn.
       channelId: turnLocus?.channelId,
@@ -19431,7 +19591,7 @@ export class AgentFramework {
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
-        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, routing.turnId);
         return false;
       }
       // A stop made while the hooks ran had no stream to cancel.
@@ -19460,6 +19620,10 @@ export class AgentFramework {
       // it would store while the window is held.
       injections = this.storeInjections(agent, injections);
 
+      // The request's one id: named by the stream's inference-log entry and
+      // by inference:request, and given to membrane as the call's requestId
+      // option, which membrane 0.7.1 doesn't record.
+      const requestId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const {
         stream,
         request: compiledRequest,
@@ -19469,11 +19633,15 @@ export class AgentFramework {
         placeDrops,
         thinkingRecordedAfter,
         noteRequestSent,
+        carried,
+        dropped,
+        summaries,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
         // membrane's inside each attempt.
         membraneRetries: false,
+        requestId,
       });
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
@@ -19504,7 +19672,7 @@ export class AgentFramework {
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
-        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, routing.turnId);
         return false;
       }
       // A stop made while the compile ran had no stream to cancel. The stream
@@ -19539,13 +19707,13 @@ export class AgentFramework {
           // that does gets one terminal event, which listeners (a typing loop)
           // rely on. It's reported before the hold takes the turn's retry, as
           // at every failure site, so a listener's stop finds nothing held.
-          this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: providerWaitText(agent.name, agent.model, wait) });
+          this.emitTrace({ type: 'inference:failed', turnId: routing.turnId, agentName: agent.name, error: providerWaitText(agent.name, agent.model, wait) });
         })) {
           console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds after the compile ` +
             `(recorded while the turn compiled); ${this.providerAdmissionClosed ? 'the framework is stopping, so nothing is held'
               : this.providerAccelerationCooldowns.get(agent.name)?.heldRequests.some(isTurnRetry) ? 'turn held'
                 : 'the wait was released as the failure was reported, so the retry is queued'}, nothing sent`);
-          this.endFailureAtStop(agent.name, turnToken, turnStartedAt);
+          this.endFailureAtStop(agent.name, turnToken, turnStartedAt, routing.turnId);
           this.activeStreams.delete(agent.name);
           this.pendingAssistantBlocks.delete(agent.name);
           this.channelRegistry?.stopTyping();
@@ -19569,10 +19737,18 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+      // The stream sends its request when driveStream first reads it: what
+      // it carries for the first time reaches the agent's provider input now.
+      const delivered = carried ? this.deliverAddressed(agent, carried, true, dropped, summaries) : [];
+      this.emitTrace({
+        type: 'inference:request', turnId: routing.turnId, agentName: agent.name, requestId,
+        ...(delivered.length > 0 ? { delivered } : {}),
+      });
       const handle = this.driveStream(
         agent,
         stream,
         requestSnapshot,
+        requestId,
         trigger,
         attempt,
         compiledRequest,
@@ -19594,6 +19770,7 @@ export class AgentFramework {
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({
         type: 'inference:failed',
+        turnId: routing.turnId,
         agentName: agent.name,
         error: err.message,
         stack: err.stack,
@@ -19621,7 +19798,7 @@ export class AgentFramework {
           console.error(`[turn] ${agent.name}: ${reason}`);
           this.endDroppedTurn(agent.name, routing);
           this.eventGate?.onInferenceEnded(agent.name);
-          this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+          this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, routing.turnId);
           return false;
         }
         this.endStoppedStart(agent, stopAtFailure, routing, turnStartedAt, undefined, opensTurn);
@@ -19633,14 +19810,14 @@ export class AgentFramework {
         // one later fresh compile; no immediate retry or exhaustion marker.
         // (Once stop() has closed admission, nothing is held, and the turn
         // ends here: endFailureAtStop.)
-        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt);
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing.turnId);
         return false;
       }
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
         // A conversation agent held by the provider's stated wait, as a
         // resident is: the hold's release owns the later compile.
-        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt);
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing.turnId);
         return false;
       }
 
@@ -19658,7 +19835,7 @@ export class AgentFramework {
           // inference:failed above, and its record's end. Nothing is written;
           // this frame still owns its token, since no retry frame replaced it.
           this.abortDroppedTurn(agent.name, turnToken,
-            this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_ACROSS_RESTART, turnStartedAt);
+            this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_ACROSS_RESTART, turnStartedAt, routing.turnId);
           if (this.activeTurnTokens.get(agent.name) === turnToken) {
             this.activeTurnTokens.delete(agent.name);
             this.activeTurnTriggers.delete(agent.name);
@@ -19703,6 +19880,7 @@ export class AgentFramework {
         }, routing);
         this.emitTrace({
           type: 'inference:exhausted',
+          turnId: routing.turnId,
           agentName: agent.name,
           error: err.message,
           // Drives the poison-history breaker (shedMayHelp: an
@@ -19734,6 +19912,8 @@ export class AgentFramework {
     agent: Agent,
     stream: YieldingStream,
     requestSnapshot: InferenceToolSnapshot,
+    /** The request's id (beginAgentTurn): its inference-log entries'. */
+    requestId: string,
     trigger?: InferenceRequest,
     attempt = 0,
     compiledRequest?: NormalizedRequest,
@@ -19747,7 +19927,6 @@ export class AgentFramework {
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     const startTime = Date.now();
-    const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
     // Membrane's usage events are cumulative across the stream's tool loop,
     // so the latest is everything the stream has been billed for so far:
@@ -19807,9 +19986,11 @@ export class AgentFramework {
       const tokenUsage = tokenUsageOf(used);
       this.emitTrace({
         type: 'inference:completed',
+        turnId: streamRouting.turnId,
         agentName: agent.name,
         durationMs,
         tokenUsage,
+        ...(response ? { stopReason: response.stopReason } : {}),
       });
       countUsage(used);
       logStream(response
@@ -19955,6 +20136,7 @@ export class AgentFramework {
       this.channelRegistry?.sendOutgoingChunk(to, agent.name, outgoingInferenceId, index, delta);
       this.emitTrace({
         type: 'inference:published',
+        turnId: streamRouting.turnId,
         agentName: agent.name,
         serverId: to.serverId,
         channelId: to.channelId,
@@ -19980,6 +20162,7 @@ export class AgentFramework {
         this.channelRegistry?.sendOutgoingComplete(to, agent.name, outgoingInferenceId, text);
         this.emitTrace({
           type: 'inference:published_complete',
+          turnId: streamRouting.turnId,
           agentName: agent.name,
           serverId: to.serverId,
           channelId: to.channelId,
@@ -20240,6 +20423,7 @@ export class AgentFramework {
           case 'tokens': {
             const trace: Parameters<AgentFramework['emitTrace']>[0] = {
               type: 'inference:tokens',
+              turnId: streamRouting.turnId,
               agentName: agent.name,
               content: event.content,
               blockType: event.meta.type,
@@ -20274,6 +20458,7 @@ export class AgentFramework {
             discardGuardHeld();
             this.emitTrace({
               type: 'inference:tokens',
+              turnId: streamRouting.turnId,
               agentName: agent.name,
               content: '',
               blockType: 'text',
@@ -20287,6 +20472,7 @@ export class AgentFramework {
             const { event: phase, index, block } = event.event;
             this.emitTrace({
               type: 'inference:content_block',
+              turnId: streamRouting.turnId,
               agentName: agent.name,
               phase,
               blockType: block.type,
@@ -20308,6 +20494,7 @@ export class AgentFramework {
             this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
+              turnId: streamRouting.turnId,
               agentName: agent.name,
               calls: event.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
             });
@@ -20638,7 +20825,7 @@ export class AgentFramework {
                 });
                 console.error(`[tool-result-guard] agent=${agent.name} withheld ${withheld.length} result(s); retrying inference`);
                 this.emitTrace({
-                  type: 'inference:stream_restarted', agentName: agent.name,
+                  type: 'inference:stream_restarted', turnId: streamRouting.turnId, agentName: agent.name,
                   reason: 'tool_result_guard', inputTokens: agent.lastStreamInputTokens,
                   budget: agent.maxStreamTokens,
                 });
@@ -21308,6 +21495,7 @@ export class AgentFramework {
 
             this.emitTrace({
               type: 'inference:failed',
+              turnId: streamRouting.turnId,
               agentName: agent.name,
               error: err.message,
               stack: err.stack,
@@ -21328,13 +21516,13 @@ export class AgentFramework {
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
-              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting.turnId);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
             const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
             if (statedWait === 'held') {
-              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting.turnId);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
@@ -21383,7 +21571,7 @@ export class AgentFramework {
                 const owner = this.activeTurnTokens.get(agent.name);
                 if (owner === undefined || owner === myTurnToken) {
                   this.emitTrace({
-                    type: 'inference:aborted', agentName: agent.name,
+                    type: 'inference:aborted', turnId: streamRouting.turnId, agentName: agent.name,
                     durationMs: Date.now() - startTime, reason: RETRY_CANCELLED_BY_STOP,
                   });
                 }
@@ -21396,6 +21584,7 @@ export class AgentFramework {
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
               this.emitTrace({
                 type: 'inference:exhausted',
+                turnId: streamRouting.turnId,
                 agentName: agent.name,
                 error: err.message,
                 // Drives the poison-history breaker. `retryable` is kept for
@@ -21481,6 +21670,7 @@ export class AgentFramework {
                 }, streamRouting);
                 this.emitTrace({
                   type: 'inference:exhausted',
+                  turnId: streamRouting.turnId,
                   agentName: agent.name,
                   error: terminal,
                 });
@@ -21634,6 +21824,7 @@ export class AgentFramework {
 
             this.emitTrace({
               type: 'inference:usage',
+              turnId: streamRouting.turnId,
               agentName: agent.name,
               tokenUsage: {
                 input: event.usage.inputTokens,
@@ -21736,11 +21927,11 @@ export class AgentFramework {
       // stream's error event and at a start's failure: a listener's stop
       // finds nothing held, and one made after it ends the held turn.
       agent.reset();
-      this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+      this.emitTrace({ type: 'inference:failed', turnId: streamRouting.turnId, agentName: agent.name, error: err.message, stack: err.stack });
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
-        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting.turnId);
         logStream({ success: false,
           error: `Provider acceleration cooldown: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
@@ -21754,7 +21945,7 @@ export class AgentFramework {
       // says why it ends.
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
       if (statedWait === 'held') {
-        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime);
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting.turnId);
         logStream({ success: false,
           error: `Provider wait: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
@@ -21769,6 +21960,7 @@ export class AgentFramework {
       }, streamRouting);
       this.emitTrace({
         type: 'inference:exhausted',
+        turnId: streamRouting.turnId,
         agentName: agent.name,
         error: err.message,
         ...this.classifyInferenceError(err),
@@ -22207,7 +22399,7 @@ export class AgentFramework {
       // denial here is a failure. It's this call's end, so it's traced here.
       const failure = this.agentToolPermissionFailure(origin.agentName, call, false);
       if (failure) {
-        this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: failure.error ?? '' });
+        this.emitTrace({ type: 'tool:failed', ...this.callTraced(call.callerAgentName, call), module: 'framework', tool: call.name, callId: call.id, error: failure.error ?? '' });
         return failure;
       }
     }
@@ -22250,7 +22442,8 @@ export class AgentFramework {
     // and isn't noted as the resident's speech (callingTurnOf). A module
     // holds no drafts.
     if (call.name === 'drafts' && this.channelRegistry && origin.kind === 'agent') {
-      return this.draftsToolResult(origin.agentName, call.input);
+      // Its prose events name the turn the call carries, as its tool events do.
+      return this.draftsToolResult(origin.agentName, call.input, undefined, undefined, call.callerTurnId);
     }
 
     // The utils meta-tool, for callers that await a tool's result. A call
@@ -22328,6 +22521,7 @@ export class AgentFramework {
   private dispatchCodeExecutionToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({
       type: 'tool:started',
+      ...this.callTraced(agentName, call),
       module: 'code_execution',
       tool: call.name,
       callId: call.id,
@@ -22352,6 +22546,7 @@ export class AgentFramework {
         if (result.isError) {
           this.emitTrace({
             type: 'tool:failed',
+            ...this.callTraced(agentName, call),
             module: 'code_execution',
             tool: call.name,
             callId: call.id,
@@ -22360,6 +22555,7 @@ export class AgentFramework {
         } else {
           this.emitTrace({
             type: 'tool:completed',
+            ...this.callTraced(agentName, call),
             module: 'code_execution',
             tool: call.name,
             callId: call.id,
@@ -22650,7 +22846,7 @@ export class AgentFramework {
     const target = this.noticeTargetFor(agentName, `script ${scriptId} wake`);
     if (!target) throw new Error(`agent ${agentName} has no context to wake`);
     try {
-      const placement: { agent?: string; deferredId?: string } = {};
+      const placement: { agent?: string; messageId?: string; deferredId?: string } = {};
       const messageId = this.addMessage('user', [{ type: 'text', text: shown }], {
         source: 'code-execution-script',
         scriptId,
@@ -22665,9 +22861,11 @@ export class AgentFramework {
       });
       this.emitTrace({
         type: 'message:added',
-        messageId: messageId || 'deferred',
+        messageId,
         source: `code-execution-script:${label}`,
+        ...addedFields(placement),
       });
+      this.noteAddressed(agentName, placement);
     } catch (err) {
       console.error(`[code_execution:${agentName}:${label}] wake injection failed: ${err instanceof Error ? err.message : String(err)}`);
       throw err;
@@ -23816,7 +24014,7 @@ export class AgentFramework {
     const error = `${why}.`;
     const refusal = this.refusedResult(agentName, call.id, error);
     this.emitTrace({
-      type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
+      type: 'tool:failed', ...this.callTraced(agentName, call), module: 'framework', tool: call.name, callId: call.id, error,
     });
     return refusal;
   }
@@ -23877,20 +24075,19 @@ export class AgentFramework {
    * script left running, which no call watches, has none.
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
-    const refusal = this.agentToolPermissionFailure(agentName, call);
+    // Enrich call with caller identity so modules can resolve the calling agent,
+    // and with the turn it was made in, a refusal's trace included. Here both
+    // are the framework's to set: a turn id the call arrives with never survives.
+    const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
+    if (turnId !== undefined) enrichedCall.callerTurnId = turnId;
+    else delete enrichedCall.callerTurnId;
+    const refusal = this.agentToolPermissionFailure(agentName, enrichedCall);
     if (refusal) {
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'framework', result: refusal,
       });
       return;
     }
-
-    // Enrich call with caller identity so modules can resolve the calling agent,
-    // and with the turn it was made in. Here both are the framework's to set:
-    // a turn id the call arrives with never survives.
-    const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
-    if (turnId !== undefined) enrichedCall.callerTurnId = turnId;
-    else delete enrichedCall.callerTurnId;
     if (isPresentationTool(call.name)) {
       const result = this.editToolPresentation(agentName, enrichedCall);
       this.pushEvent({type:'tool-result',callId:call.id,toolName:call.name,agentName,moduleName:'tool-presentation',result});
@@ -24015,7 +24212,7 @@ export class AgentFramework {
           const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
           console.error(`[self-wake] agent=${agentName} wake_in_seconds=${logValue(wakeValue)} skip_reply refused: ${logDetail(this.eventGate ? "wake_in_seconds isn't a number of seconds" : 'No EventGate configured (FrameworkConfig.gate is unset)')}`);
           const result = this.refusedResult(agentName, enrichedCall.id, error);
-          this.emitTrace({ type: 'tool:failed', module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
+          this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, enrichedCall), module: 'channels', tool: enrichedCall.name, callId: enrichedCall.id, error });
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
           return;
         }
@@ -24044,10 +24241,10 @@ export class AgentFramework {
     // publish executor, so the result arrives asynchronously.
     if (enrichedCall.name === 'drafts' && this.channelRegistry) {
       const startedAt = Date.now();
-      this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
-      void this.draftsToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall), enrichedCall.id)
+      this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, enrichedCall), module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
+      void this.draftsToolResult(agentName, enrichedCall.input, this.callingTurnOf(agentName, enrichedCall), enrichedCall.id, enrichedCall.callerTurnId)
         .then((result) => {
-          this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
+          this.emitTrace({ type: 'tool:completed', ...this.callTraced(agentName, enrichedCall), module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
           this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'framework', result });
         });
       return;
@@ -24057,7 +24254,7 @@ export class AgentFramework {
     // Answered inline — the grammar is a tool RESULT (model-requested), never
     // ambient context (see PROSE_ROUTING_HELP / teach-by-bounce).
     if (enrichedCall.name === 'prose_help') {
-      this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'prose_help', callId: enrichedCall.id, durationMs: 0 });
+      this.emitTrace({ type: 'tool:completed', ...this.callTraced(agentName, enrichedCall), module: 'framework', tool: 'prose_help', callId: enrichedCall.id, durationMs: 0 });
       this.pushEvent({
         type: 'tool-result',
         callId: enrichedCall.id,
@@ -24090,6 +24287,7 @@ export class AgentFramework {
     const { call, agentName, moduleName } = event;
     this.emitTrace({
       type: 'tool:started',
+      ...this.callTraced(agentName, call),
       module: moduleName,
       tool: call.name,
       callId: call.id,
@@ -24104,6 +24302,7 @@ export class AgentFramework {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
           type: 'tool:completed',
+          ...this.callTraced(agentName, call),
           module: moduleName,
           tool: call.name,
           callId: call.id,
@@ -24125,6 +24324,7 @@ export class AgentFramework {
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed',
+          ...this.callTraced(agentName, call),
           module: moduleName,
           tool: call.name,
           callId: call.id,
@@ -24423,7 +24623,7 @@ export class AgentFramework {
         console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
         id = landed[0]!.id;
       }
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line', agentName: slot.name });
       this.placedWakeLines.add(line);
     }
   }
@@ -24458,6 +24658,278 @@ export class AgentFramework {
       : this.primaryAgentName
         ? this.agents.get(this.primaryAgentName)
         : this.agents.values().next().value;
+  }
+
+  /**
+   * Fleet telemetry: a message stored in `placement.agent`'s store, or held
+   * for it, with a wake asked of `agentName` for it, is addressed to that
+   * agent when its window holds the message (readsStoreOf). It goes into the
+   * record (AddressedMessages) and is said (`message:addressed`) once while
+   * it's recorded, named by the id its arrival named: its stored id, or its
+   * deferred id while held. Past the record's bound it's said, `untracked`,
+   * each time its wake is asked. A write held while the host is quiesced is held by the quiesce;
+   * `held` names a sleep's hold. Nothing is recorded for a placement that
+   * names no message (a silent heartbeat's), for a held write that has gone
+   * (landedPlacement), or for a tune-out's diverted message to any agent but
+   * the subconscious, whose window alone holds it (every other agent's view
+   * filter leaves it out), whatever path asked its wake.
+   */
+  private noteAddressed(
+    agentName: string,
+    given: { agent?: string; messageId?: string; deferredId?: string },
+    held?: 'sleep',
+  ): void {
+    // Named by the id its arrival named, and found by the id it's stored
+    // under now, a held write's whose drain ran before this note included.
+    const name = given.deferredId ?? given.messageId;
+    const placement = this.landedPlacement(given);
+    if (placement.gone) return;
+    const stored = placement.deferredId === undefined;
+    const id = placement.deferredId ?? placement.messageId;
+    if (!id || !name || !placement.agent || !this.readsStoreOf(agentName, placement.agent)) return;
+    if (agentName !== this.subconsciousAgentName && this.divertedPlacement(placement)) return;
+    const recorded = this.addressedMessages.add(agentName, id, placement.agent, stored, name);
+    if (recorded === 'present') return;
+    const hold = held ?? (!stored && this.quiesced ? 'quiesce' : undefined);
+    this.emitTrace({
+      type: 'message:addressed', messageId: name, agentName,
+      ...(hold ? { held: hold } : {}),
+      ...(recorded === 'full' ? { untracked: true as const } : {}),
+    });
+  }
+
+  /**
+   * Whether `reader`'s window holds what is stored in `storedIn`'s store:
+   * its own, and, where that store is the residents' shared slot, every
+   * agent that reads the slot, the ordinary residents and the subconscious
+   * through its merged view (sharedSlotAgents). A fork's or a run's store is
+   * its own. It answers for stores, not messages: an ordinary resident's
+   * view also leaves out a tune-out's diverted messages, which noteAddressed
+   * addresses to the subconscious alone. An agent no longer registered has
+   * no window.
+   */
+  private readsStoreOf(reader: string, storedIn: string): boolean {
+    const agent = this.agents.get(reader);
+    // An agent no longer registered reads nothing: a late note for a fork
+    // disposed meanwhile records nothing its disposal could withdraw.
+    if (!agent) return false;
+    if (reader === storedIn) return true;
+    const store = this.agents.get(storedIn);
+    return !!store && this.isOrdinaryResident(store) && this.sharedSlotAgents.has(agent);
+  }
+
+  /**
+   * A held placement whose write a drain has stored since, by its stored id
+   * (its body's first shard's): a note made after an await can come after
+   * the drain's one re-key (writeDrainedInOrder). A write still queued, its
+   * landing known, isn't stored, so it isn't searched for; one whose landing
+   * is unknown may be, so it is. One found nowhere keeps its deferred id
+   * while it's queued or stored and not yet acked, and is `gone` otherwise,
+   * as one a drain dropped is; one whose store can't be searched keeps it.
+   */
+  private landedPlacement(placement: { agent?: string; messageId?: string; deferredId?: string }): { agent?: string; messageId?: string; deferredId?: string; gone?: true } {
+    const writeId = placement.deferredId;
+    if (writeId === undefined || !placement.agent) return placement;
+    const queued = this.deferredMessages.find((m) => m.id === writeId);
+    if (queued && queued.landing !== 'unknown') return placement;
+    const store = this.agents.get(placement.agent);
+    if (!store) return placement;
+    let row: StoredMessage | null;
+    try {
+      row = this.landedRow(store.getContextManager(), writeId);
+    } catch {
+      return placement;
+    }
+    if (row) return { agent: placement.agent, messageId: row.id };
+    return queued || this.unackedDeferredWrites.some((m) => m.id === writeId) ? placement : { ...placement, gone: true };
+  }
+
+  /** An MCPL event's message, whose wake the gate asked now or holds,
+   *  addressed to each agent that wake reaches: a debounce batch's end, the
+   *  agents gateWakeAgents names; a wake now, or one the sleep holds, the
+   *  agents the event names, or, naming none, its lane's (`untargeted`). */
+  private noteAddressedForWake(
+    event: { targetAgents?: string[]; wakeLater?: 'debounce' | 'sleep' },
+    placement: { agent?: string; messageId?: string; deferredId?: string },
+    untargeted: () => string[],
+  ): void {
+    const woken = event.wakeLater === 'debounce' ? this.gateWakeAgents() : event.targetAgents ?? untargeted();
+    for (const agentName of woken) this.noteAddressed(agentName, placement, event.wakeLater === 'sleep' ? 'sleep' : undefined);
+  }
+
+  /** The agents a wake the gate gives every agent reaches (its debounce
+   *  batch's end, a sleep's end that names no agent): every agent but the
+   *  subconscious, conversation forks included. */
+  private gateWakeAgents(): string[] {
+    return [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
+  }
+
+  /** An addressed message that won't reach its agent leaves the record, and
+   *  its `message:withdrawn` says why. */
+  private withdrawAddressed(agentName: string, id: string, reason: 'removed' | 'agent-gone' | 'branch-moved' | 'dropped'): void {
+    const name = this.addressedMessages.withdraw(agentName, id);
+    if (name !== undefined) this.emitTrace({ type: 'message:withdrawn', messageId: name, agentName, reason });
+  }
+
+  /** Every addressed message waiting for an agent that has gone leaves the
+   *  record (`agent-gone`). */
+  private withdrawAddressedFor(agentName: string): void {
+    for (const name of this.addressedMessages.dropAgent(agentName)) {
+      this.emitTrace({ type: 'message:withdrawn', messageId: name, agentName, reason: 'agent-gone' });
+    }
+  }
+
+  /** Every addressed message found by `id`, whatever agent it's addressed
+   *  to, leaves the record for `reason`. */
+  private withdrawAddressedEverywhere(id: string, reason: 'removed' | 'dropped'): void {
+    for (const agentName of this.addressedMessages.agentsWith(id)) this.withdrawAddressed(agentName, id, reason);
+  }
+
+  /**
+   * The addressed messages a request of `agent`'s carries for the first
+   * time, taken out of the record: each by its name, and in which form. A
+   * stored body the request carries (`carried`) is `whole`, and one only a
+   * summary it carries covers (`summaries`, resolved by summaryCovers) is
+   * `summary`: the first form stands, since the entry leaves the record
+   * here. A compile's request (`compiled`) also withdraws each waiting one
+   * that no request can carry any more: a stored one its window no longer
+   * holds (`branch-moved`, as after an undo or a rollback), a held one
+   * neither queued nor stored, and one the request drops (`dropped`,
+   * StartStreamResult.dropped), which every request will.
+   */
+  private deliverAddressed(
+    agent: Agent,
+    carried: () => Iterable<string>,
+    compiled: boolean,
+    dropped?: () => Iterable<string>,
+    summaries?: () => Iterable<string>,
+  ): AddressedDelivery[] {
+    if (!this.addressedMessages.has(agent.name)) return [];
+    // Before matching, so a held entry whose write was stored without its
+    // re-key is delivered by the request that carries it; withdrawals come
+    // after, so a message the request carries is delivered, not withdrawn.
+    const gone = compiled ? this.rekeyLandedAddressed(agent.name) : [];
+    const delivered: AddressedDelivery[] = this.addressedMessages.deliver(agent.name, carried()).map((messageId) => ({ messageId, form: 'whole' }));
+    // Only while entries are left: a summary's sources are read for nothing else.
+    const summaryIds = this.addressedMessages.has(agent.name) ? [...(summaries?.() ?? [])] : [];
+    if (summaryIds.length > 0) {
+      const cm = agent.getContextManager();
+      const covers = summaryIds.map((id) => this.summaryCovers(cm, id));
+      // Each waiting message looked up in what the summaries cover, rather
+      // than every covered id copied: the waiting ones are bounded.
+      const covered = this.addressedMessages.entriesOf(agent.name).map(([id]) => id).filter((id) => covers.some((c) => c.has(id)));
+      for (const messageId of this.addressedMessages.deliver(agent.name, covered)) delivered.push({ messageId, form: 'summary' });
+    }
+    for (const id of dropped?.() ?? []) this.withdrawAddressed(agent.name, id, 'dropped');
+    if (compiled) this.withdrawGoneAddressed(agent.name, gone);
+    return delivered;
+  }
+
+  /**
+   * Withdraw each of `agentName`'s waiting messages that no request can
+   * carry any more: a stored one its window no longer holds
+   * (`branch-moved`, as after an undo, a rollback or a removal), and a held
+   * one that has gone (`dropped`), found where it is now as a late note
+   * finds it (landedPlacement): one stored without its re-key (its note
+   * came after the drain, or its settle couldn't find its body's first
+   * shard, or its landing was unknown) is re-keyed instead
+   * (rekeyLandedAddressed; `gone`, when a compile has just run it). A
+   * compile checks after it matches what the request carries, and so does
+   * the scheduler where it drops an agent's
+   * wakes and starts no turn, since no compile follows then.
+   */
+  private withdrawGoneAddressed(agentName: string, gone: readonly string[] = this.rekeyLandedAddressed(agentName)): void {
+    for (const id of gone) this.withdrawAddressed(agentName, id, 'dropped');
+    for (const [id, entry] of this.addressedMessages.entriesOf(agentName)) {
+      if (!entry.stored) continue;
+      const window = this.agents.get(entry.storedIn);
+      if (!window) continue;
+      let inWindow: boolean;
+      try {
+        inWindow = window.getContextManager().getMessage(id as MessageId) != null;
+      } catch {
+        // A store that can't be read says nothing about the message.
+        inWindow = true;
+      }
+      if (!inWindow) this.withdrawAddressed(agentName, id, 'branch-moved');
+    }
+  }
+
+  /** Re-key each of `agentName`'s held entries whose write has been stored
+   *  since by its stored id, found as a late note finds it
+   *  (landedPlacement); returns the ids of those that have gone. A compile
+   *  runs it before it matches what the request carries, so a request that
+   *  carries one delivers it. */
+  private rekeyLandedAddressed(agentName: string): string[] {
+    const gone: string[] = [];
+    if (!this.addressedMessages.has(agentName)) return gone;
+    for (const [id, entry] of this.addressedMessages.entriesOf(agentName)) {
+      if (entry.stored) continue;
+      const where = this.landedPlacement({ agent: entry.storedIn, deferredId: id });
+      if (where.messageId !== undefined) this.addressedMessages.stored(id, where.messageId);
+      else if (where.gone) gone.push(id);
+    }
+    return gone;
+  }
+
+  /**
+   * The stored messages a summary of `cm`'s covers, by id: an L1's sources
+   * are messages, and a higher level's are summaries, read level by level
+   * (SummaryEntry.sourceIds). Memoized per context manager and branch,
+   * since a summary doesn't change once written, while its id is its own
+   * store's (a fork's `L1-3` isn't the residents') and its branch's: after
+   * an undo or a branch switch the strategy mints ids again from that
+   * branch's counter. Where the branch can't be read, each call starts
+   * afresh. A
+   * strategy that keeps no summary archive answers `getSummary` with null,
+   * so its summaries cover nothing here; a lookup that throws covers nothing
+   * this time, and neither it nor a summary above it is memoized.
+   */
+  private summaryCovers(cm: ContextManager, id: string): ReadonlySet<string> {
+    let branch: string | undefined;
+    try {
+      const { id: branchId, created } = cm.currentBranch();
+      branch = `${branchId}@${created}`;
+    } catch {
+      branch = undefined;
+    }
+    if (branch === undefined) return this.summaryWalk(cm, id, new Map()).covered;
+    let memo = this.summaryCoverage.get(cm);
+    if (memo?.branch !== branch) {
+      memo = { branch, covers: new Map() };
+      this.summaryCoverage.set(cm, memo);
+    }
+    return this.summaryWalk(cm, id, memo.covers).covered;
+  }
+
+  /** summaryCovers' walk, over one branch's memo: what a summary covers, and
+   *  whether every lookup it took answered. */
+  private summaryWalk(cm: ContextManager, id: string, memo: Map<string, ReadonlySet<string>>): { covered: ReadonlySet<string>; whole: boolean } {
+    const known = memo.get(id);
+    if (known) return { covered: known, whole: true };
+    let summary: ReturnType<ContextManager['getSummary']>;
+    try {
+      summary = cm.getSummary(id);
+    } catch {
+      return { covered: new Set(), whole: false };
+    }
+    // Set before its sources are read, so a summary that names itself
+    // among them ends the walk.
+    const covered = new Set<string>();
+    memo.set(id, covered);
+    let whole = true;
+    if (summary?.sourceLevel === 0) for (const messageId of summary.sourceIds) covered.add(messageId);
+    else if (summary) {
+      for (const source of summary.sourceIds) {
+        const below = this.summaryWalk(cm, source, memo);
+        whole &&= below.whole;
+        for (const messageId of below.covered) covered.add(messageId);
+      }
+    }
+    // A lookup below that threw leaves this one unmemoized too, so it's read
+    // again next time rather than kept short.
+    if (!whole) memo.delete(id);
+    return { covered, whole };
   }
 
   /** The notes addMessage takes for a message it stored: an arrival for the
@@ -24718,6 +25190,7 @@ export class AgentFramework {
         // Any copy readback did find was already handled above.
         if (error instanceof MalformedContentError) {
           this.logDeferredWriteError(msg, where, error, 'dropped');
+          this.withdrawAddressedEverywhere(msg.id, 'dropped');
           continue;
         }
         // Requeued as unstored, a write that had landed would be stored a
@@ -24729,6 +25202,9 @@ export class AgentFramework {
         this.logDeferredWriteError(msg, where, error, landed === undefined ? 'unknown' : undefined);
       }
     }
+    // A held write that was stored is found by its stored id from now on
+    // (AddressedMessages); one deferred again keeps its deferred id.
+    for (const [msg, { id }] of written) if (id) this.addressedMessages.stored(msg.id, id);
     return written;
   }
 
@@ -24920,7 +25396,7 @@ export class AgentFramework {
     const stored = this.writeDrainedInOrder(this.drainDeferredFor(agent.name), `${occasion} flush for ${agent.name}`, (msg) =>
       agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id)));
     for (const [msg, { id }] of stored) {
-      this.emitTrace({ type: 'message:added', messageId: id, source: `deferred-flush:${occasion}` });
+      this.emitTrace({ type: 'message:added', messageId: id, source: `deferred-flush:${occasion}`, agentName: agent.name, deferredId: msg.id });
       this.noteArrival(agent.name, msg.metadata, id);
       this.noteForOtherResidents(agent, msg.metadata, id);
     }
@@ -25623,9 +26099,20 @@ export class AgentFramework {
    * into a turn, as a flush that finds it carries it: the agent reads it at
    * its next compile, where the store holds it.
    */
-  private settleFound(msg: DeferredWrite, agent: Agent, stored: MessageId, landed: { count?: number; sharded: boolean; named?: true }): void {
+  private settleFound(
+    msg: DeferredWrite,
+    agent: Agent,
+    stored: MessageId,
+    landed: { count?: number; sharded: boolean; named?: true },
+    head: MessageId | null = stored,
+  ): void {
     this.deferredMessages = this.deferredMessages.filter((m) => m !== msg);
     this.unackedDeferredWrites.push(msg);
+    // Found by its stored id from now on, as a drained write is
+    // (writeDrainedInOrder): a sharded body's first shard's (`head`), which
+    // a compile's provenance names it by. Without one (null), it's found
+    // later.
+    if (head !== null) this.addressedMessages.stored(msg.id, head);
     this.noteStored(agent, msg.metadata, stored);
     this.logDeferredWriteError(msg, `held writes for ${agent.name}`, undefined, { ...landed, foundLater: true });
   }
@@ -25646,7 +26133,19 @@ export class AgentFramework {
     const target = msg ? this.deliveryAgent(msg.forAgent) : undefined;
     if (!msg || !target || !(target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)))) return;
     const sharded = row.bodyGroupId !== undefined;
-    this.settleFound(msg, target, row.id, { ...(sharded ? {} : { count: 1 }), sharded, named: true });
+    // The row can be any of the body's shards. Where the store can't be
+    // scanned for its body, the module's read of the row goes on, and the
+    // entry keeps its deferred id, for a compile's search to find by the
+    // body's first shard (withdrawGoneAddressed).
+    let head: MessageId | null = row.id;
+    if (sharded) {
+      try {
+        head = bodyHeadId(reader.getContextManager(), row.id);
+      } catch {
+        head = null;
+      }
+    }
+    this.settleFound(msg, target, row.id, { ...(sharded ? {} : { count: 1 }), sharded, named: true }, head);
   }
 
   /** A held write whose landing stays unknown after settling, its store
@@ -25757,10 +26256,14 @@ export class AgentFramework {
       this.refuseUnsettled(held);
       this.deferredMessages = this.deferredMessages.filter((m) => m.id !== writeId);
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      this.withdrawAddressedEverywhere(held.id, 'removed');
       return;
     }
     const landed = writeId !== undefined ? this.landedRow(agent.getContextManager(), writeId) : null;
-    removeStoredMessage(agent.getContextManager(), landed?.id ?? id);
+    // By its body's first shard's id, which the record keeps it by, whichever
+    // shard's id the module named.
+    const removed = removeStoredMessage(agent.getContextManager(), landed?.id ?? id);
+    this.withdrawAddressedEverywhere(removed, 'removed');
   }
 
   private getMessage(id: MessageId): ModuleMessage | null {
@@ -25842,7 +26345,7 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: { type: TraceEvent['type']; [key: string]: unknown }): void {
+  private emitTrace(event: EmittedTraceEvent): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -26007,15 +26510,6 @@ export class AgentFramework {
   }
 
   /**
-   * Ops alert — the one escalation path for "a human should hear about this":
-   * (1) durable failures.log record (unless the caller already wrote one),
-   * (2) an `ops:alert` trace so authorized observers get it on the wire,
-   * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
-   *     (agent, kind) per cooldown window — a persistent failure re-posts
-   *     every ~15 min instead of flooding the channel on every occurrence.
-   * See connectome docs/observability.md.
-   */
-  /**
    * Public ops-alert entry point for host-wired alarms that originate
    * OUTSIDE the framework (e.g. context-manager's repeating
    * compression-quarantine klaxon, wired in the host at strategy
@@ -26028,7 +26522,7 @@ export class AgentFramework {
     message: string,
     data?: Record<string, unknown>,
   ): void {
-    this.opsAlert(kind, agentName, message, { data });
+    this.raiseOpsAlert(kind, agentName, message, { data });
   }
 
   /**
@@ -26126,17 +26620,27 @@ export class AgentFramework {
       } });
   }
 
-  private opsAlert(
+  /** An alert of the framework's own, whose kind is one of OPS_ALERT_KINDS. */
+  private opsAlert(kind: OpsAlertKind, agentName: string, rawMessage: string, opts?: OpsAlertOptions): void {
+    this.raiseOpsAlert(kind, agentName, rawMessage, opts);
+  }
+
+  /**
+   * Ops alert — the one escalation path for "a human should hear about this":
+   * (1) durable failures.log record (unless the caller already wrote one),
+   * (2) an `ops:alert` trace so authorized observers get it on the wire,
+   * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
+   *     (agent, kind) per cooldown window — a persistent failure re-posts
+   *     every ~15 min instead of flooding the channel on every occurrence.
+   * See connectome docs/observability.md. The framework's own alerts come
+   * through opsAlert, a host's and a module's through notifyOps and
+   * notifyOpsAlert.
+   */
+  private raiseOpsAlert(
     kind: string,
     agentName: string,
     rawMessage: string,
-    opts?: {
-      data?: Record<string, unknown>;
-      skipLog?: boolean;
-      /** Tells this alert apart from others of its agent and kind for the
-       *  webhook's cooldown, such as the batch a retirement names. */
-      key?: string;
-    },
+    opts?: OpsAlertOptions,
   ): void {
     // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
     // that isn't a string; it's described as a thrown value is, rather than
@@ -26279,7 +26783,7 @@ export class AgentFramework {
    * never sees. Same per-(agent,kind) cooldown as everything else.
    */
   notifyOpsAlert(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void {
-    this.opsAlert(kind, agentName, message, { data });
+    this.raiseOpsAlert(kind, agentName, message, { data });
   }
 
   private noteInferenceExhausted(
@@ -26566,12 +27070,12 @@ export class AgentFramework {
     const coalescing = this.restorePushCoalescer();
     const checkpoints = new CheckpointManager(
       this.store,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     for (const config of serverConfigs) checkpoints.loadHostStates(config.id);
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager(
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
     this.toolLifecycleEmitter = new ToolLifecycleEmitter({
@@ -26590,14 +27094,14 @@ export class AgentFramework {
     // Find shouldTriggerInference callback:
     // Per-server callback takes precedence; fall back to EventGate; fall back to no filter.
     const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference
-      ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
+      ?? (this.eventGate ? this.eventGate.triggerVerdictCallback() : undefined);
 
     // Push events handler (Step 6)
     this.installPushCoalescer(coalescing);
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       triggerFilter,
       (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
       // An ordinary push: freeze its envelope and observe the acceptance at
@@ -26615,7 +27119,7 @@ export class AgentFramework {
       this.hookOrchestrator,
       this.featureSetManager,
       inferenceRouting ?? null,
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
     );
 
     // Checkpoint manager (Step 8), built and loaded at the top
@@ -26626,7 +27130,7 @@ export class AgentFramework {
       this.mcplServerRegistry,
       this.featureSetManager,
       (event) => this.pushEvent(event),
-      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (event) => this.emitTrace(event),
       {
         store: this.store,
         handleCoalescedIncoming: (serverId, message, event) =>
@@ -29402,6 +29906,7 @@ export class AgentFramework {
         serverId: connection.id,
         code: null,
         signal: null,
+        reason: null,
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
@@ -29426,15 +29931,22 @@ export class AgentFramework {
     });
   }
 
-  /** An MCP tool call's trace: a result the server marked an error (or one
-   *  the reading takes as one, such as malformed content) is tool:failed, as
-   *  on the other tool paths; anything else is tool:completed. */
-  private traceMcpToolOutcome(serverId: string, tool: string, callId: string, result: ToolResult, durationMs: number): void {
+  /** A tool call's outcome trace: a result marked an error (for an MCP tool,
+   *  one the server marked, or one the reading takes as one, such as
+   *  malformed content) is tool:failed, with its error text; anything else is
+   *  tool:completed. */
+  private traceToolOutcome(module: string, agentName: string, call: ToolCall, result: ToolResult, durationMs: number, tool: string = call.name): void {
     if (result.isError) {
-      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool, callId, durationMs, error: result.error ?? 'tool returned an error' });
+      this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module, tool, callId: call.id, durationMs, error: result.error || 'tool returned an error' });
     } else {
-      this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool, callId, durationMs });
+      this.emitTrace({ type: 'tool:completed', ...this.callTraced(agentName, call), module, tool, callId: call.id, durationMs });
     }
+  }
+
+  /** Who made a tool call, and in which turn (ToolCall.callerTurnId), for its
+   *  trace events (TurnTraced): a call no agent made names none. */
+  private callTraced(agentName: string | undefined, call: ToolCall): { agentName?: string; turnId: number | undefined } {
+    return { ...(agentName !== undefined ? { agentName } : {}), turnId: call.callerTurnId };
   }
 
   /**
@@ -29801,7 +30313,7 @@ export class AgentFramework {
     const config = this.mcplServerConfigs.get(serverId);
     if (!isToolAllowed(toolName, config)) {
       const result = this.refusedResult(agentName, call.id, mcplToolDeniedText(serverId, call.name));
-      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
+      this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
@@ -29813,7 +30325,7 @@ export class AgentFramework {
       return;
     }
 
-    this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: `mcpl:${serverId}`, tool: toolName, callId: call.id, input: call.input });
     const startTime = Date.now();
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     // The turn that sends: a send's engaged channel is recorded on it, even
@@ -29834,7 +30346,7 @@ export class AgentFramework {
       // configuration the call was dispatched under.
       const recorded = dispatchRedactor;
       const err = { message: recorded(raw.message), stack: raw.stack === undefined ? undefined : recorded(raw.stack) };
-      this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
+      this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
       // RFC-007: transport error, closed connection or timeout — no result.
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       // A request that couldn't be written is a failure, not a refusal: the
@@ -29946,7 +30458,7 @@ export class AgentFramework {
       modern.callTool(toolName, args)
         .then((result) => reading(result, false))
         .then((result) => {
-          this.traceMcpToolOutcome(serverId, toolName, call.id, result, Date.now() - startTime);
+          this.traceToolOutcome(`mcpl:${serverId}`, agentName, call, result, Date.now() - startTime, toolName);
           this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: `mcpl:${serverId}`, result });
         })
         .catch(failDispatch);
@@ -30042,7 +30554,7 @@ export class AgentFramework {
       .then(({ result, toolResult: answer }) => {
         let toolResult = answer;
         const durationMs = Date.now() - startTime;
-        this.traceMcpToolOutcome(serverId, toolName, call.id, toolResult, durationMs);
+        this.traceToolOutcome(`mcpl:${serverId}`, agentName, call, toolResult, durationMs, toolName);
 
         // Record checkpoint from stateful tool response (Step 8).
         // Explicit response attribution is authoritative. Otherwise use the
@@ -30308,7 +30820,7 @@ export class AgentFramework {
         // RFC-007: the guard refuses before the tool runs — no lifecycle events.
         const result = this.refusedResult(agentName, call.id, error);
         this.emitTrace({
-          type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
+          type: 'tool:failed', ...this.callTraced(agentName, call), module: 'channels', tool: call.name, callId: call.id,
           error: `conversation agent ${agentName}: ${error}`,
         });
         this.pushEvent({
@@ -30385,7 +30897,7 @@ export class AgentFramework {
       }
     }
 
-    this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
     // The turn that called: a channel_open's result records its trigger
     // channel there, however late it arrives, and moves its locus while the
@@ -30412,11 +30924,7 @@ export class AgentFramework {
         const destination = published.outcome?.status === 'delivered' ? published.outcome.destination : undefined;
         if (publisher && destination) publisher.notePublished(destinationKey(destination), readThrough);
         const durationMs = Date.now() - startTime;
-        this.emitTrace({
-          type: result.isError ? 'tool:failed' : 'tool:completed',
-          module: 'channels', tool: call.name, callId: call.id, durationMs,
-          ...(result.isError ? { error: result.error } : {}),
-        });
+        this.traceToolOutcome('channels', agentName, call, result, durationMs);
         // A successful channel_open plants the agent's feet in the opened
         // channel. The agent's own deliberate open is the strongest "my next
         // words go here" signal in the system — stronger than any injection —
@@ -30482,7 +30990,7 @@ export class AgentFramework {
       })
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
-        this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
+        this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module: 'channels', tool: call.name, callId: call.id, error: err.message });
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',
@@ -30502,7 +31010,7 @@ export class AgentFramework {
    * error and nothing is written.
    */
   private dispatchWakeRuleToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, input: call.input });
     // What wake_add_rule's input held that does nothing, checkToolInput's notes and
     // then the gate's on a rule it saved: a refusal names it too, so the call that
     // follows doesn't count on it.
@@ -30511,11 +31019,7 @@ export class AgentFramework {
       // Where notes follow an error that doesn't end in a stop, it gets one, so each reads as a sentence of its own.
       const said = given.error && !/[.!?]$/.test(given.error) ? `${given.error}.` : given.error;
       const result = given.isError && ignored.length > 0 ? { ...given, error: [said, ...ignored].join(' ') } : given;
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('gate', agentName, call, result, 0);
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
@@ -30846,16 +31350,16 @@ export class AgentFramework {
       const error = call.name === 'sleep'
         ? `Nothing was set: a sleep quiets the whole agent, not one ${one}.${comeBack}`
         : `Nothing was changed: a sleep is the agent's, so this ${one} can't end one.`;
-      this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: `${agentName}: ${error}` });
+      this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, error: `${agentName}: ${error}` });
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result: this.refusedResult(agentName, call.id, error) });
       return;
     }
-    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, input: call.input });
     const gate = this.eventGate!;
     const input = (call.input ?? {}) as { seconds?: number; announce?: boolean; message?: string };
 
     const finish = (result: ToolResult) => {
-      this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
+      this.emitTrace({ type: 'tool:completed', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
@@ -30975,7 +31479,7 @@ export class AgentFramework {
   /** RFC-005 on-demand dereference: [ref id] → workspace file, via the
    *  origin-bound, ceiling-bounded, digest-verified host fetcher. */
   private dispatchFetchReferenceToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
     void (async () => {
       const args = (call.input ?? {}) as Record<string, unknown>;
@@ -30999,12 +31503,7 @@ export class AgentFramework {
           : { success: false, isError: true,
               error: `fetch_reference couldn't fetch "${refId}": ${outcome.error}. ${outcome.remedy}` };
       }
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace', tool: call.name, callId: call.id,
-        durationMs: Date.now() - startTime,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', agentName, call, result, Date.now() - startTime);
       this.pushEvent({
         type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace',
         result: { ...result, isError: result.isError ?? false },
@@ -31013,16 +31512,9 @@ export class AgentFramework {
   }
 
   private dispatchReadImageToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', agentName, call, result, 0);
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     void (async (): Promise<void> => {
@@ -31158,16 +31650,9 @@ export class AgentFramework {
    * authenticate bytes from another surface.
    */
   private dispatchSaveImageToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {
-      this.emitTrace({
-        type: result.isError ? 'tool:failed' : 'tool:completed',
-        module: 'workspace',
-        tool: call.name,
-        callId: call.id,
-        durationMs: 0,
-        ...(result.isError ? { error: result.error } : {}),
-      });
+      this.traceToolOutcome('workspace', agentName, call, result, 0);
       this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     type Candidate =
@@ -31640,7 +32125,7 @@ export class AgentFramework {
   }
 
   private dispatchUtilsToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'utils', callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'framework', tool: 'utils', callId: call.id, input: call.input });
     const startedAt = Date.now();
     void this.handleUtilsToolCall(agentName, call)
       .catch((err): ToolResult => ({
@@ -31650,9 +32135,9 @@ export class AgentFramework {
       }))
       .then((result) => {
         if (result.success) {
-          this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'utils', callId: call.id, durationMs: Date.now() - startedAt });
+          this.emitTrace({ type: 'tool:completed', ...this.callTraced(agentName, call), module: 'framework', tool: 'utils', callId: call.id, durationMs: Date.now() - startedAt });
         } else {
-          this.emitTrace({ type: 'tool:failed', module: 'framework', tool: 'utils', callId: call.id, error: result.error ?? 'unknown error' });
+          this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module: 'framework', tool: 'utils', callId: call.id, error: result.error ?? 'unknown error' });
         }
         this.pushEvent({
           type: 'tool-result',
@@ -31668,6 +32153,7 @@ export class AgentFramework {
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({
       type: 'tool:started',
+      ...this.callTraced(agentName, call),
       module: 'agent',
       tool: call.name,
       callId: call.id,
@@ -31820,14 +32306,7 @@ export class AgentFramework {
         isError: true,
       };
     }
-    this.emitTrace({
-      type: result.isError ? 'tool:failed' : 'tool:completed',
-      module: 'agent',
-      tool: call.name,
-      callId: call.id,
-      durationMs: 0,
-      ...(result.isError ? { error: result.error } : {}),
-    });
+    this.traceToolOutcome('agent', agentName, call, result, 0);
     this.pushEvent({
       type: 'tool-result',
       callId: call.id,
@@ -31861,14 +32340,14 @@ export class AgentFramework {
   }
 
   private dispatchEventTagsToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, input: call.input });
     let result: import('./types/events.js').ToolResult;
     try {
       result = { success: true, data: this.buildEventTagsResult() };
-      this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
+      this.emitTrace({ type: 'tool:completed', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
-      this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+      this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, error: err.message });
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
@@ -31876,13 +32355,13 @@ export class AgentFramework {
   }
 
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {
-    this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
+    this.emitTrace({ type: 'tool:started', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
 
     this.eventGate!.handleToolCall()
       .then((result) => {
         const durationMs = Date.now() - startTime;
-        this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs });
+        this.emitTrace({ type: 'tool:completed', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, durationMs });
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
@@ -31894,7 +32373,7 @@ export class AgentFramework {
       })
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
-        this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+        this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module: 'gate', tool: call.name, callId: call.id, error: err.message });
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',

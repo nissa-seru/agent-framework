@@ -331,7 +331,7 @@ export interface CoalescerHost<E> {
   /** Agents that read this occurrence's delivery target (may spawn a fork). */
   audience(occurrence: CoalescedOccurrence<E>): Promise<string[]>;
   render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
-  audit(record: Record<string, unknown>): void;
+  audit(record: { kind: string; [key: string]: unknown }): void;
   /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
   save(snapshot: () => CoalescingSnapshot): void;
   /** Persist the snapshot NOW (a render is about to start: that boundary must

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
+import { AddressedMessages } from '../src/addressed-messages.js';
 
 // Focused merge regression: the unit harness opens no store/provider/network; the final characterization uses a temporary store.
 function harness() {
@@ -18,6 +19,8 @@ function harness() {
   const outcomes: any[] = [];
   f.primaryAgentName = 'a';
   f.stillUnknownSaid = new Set();
+  // Fleet telemetry's record, which a drain keeps current, as the constructor seeds it.
+  f.addressedMessages = new AddressedMessages();
   f.deliveryAgent = () => agent;
   f.storedCountOf = () => count;
   f.storedCopiesOf = () => readback;
@@ -116,6 +119,84 @@ test('confirmed readback copy takes precedence over a malformed refusal', () => 
   assert.equal(h.outcomes[0].count, 1);
 });
 
+test("fleet telemetry: a dropped malformed write is withdrawn from the addressed record, and a written one is found by its stored id", () => {
+  const h = harness(); const traces: any[] = [];
+  h.f.emitTrace = (e: any) => traces.push(e);
+  const a = h.msg('a', 1), b = h.msg('b', 2);
+  h.f.addressedMessages.add('a', 'a', 'a', false);
+  h.f.addressedMessages.add('a', 'b', 'a', false);
+  h.f.writeDrainedInOrder([a, b], 'test', (m: any) => { if (m === a) throw malformed(); return 'b-stored'; });
+  assert.deepEqual(traces.filter((e) => e.type === 'message:withdrawn').map((e) => [e.messageId, e.agentName, e.reason]), [['a', 'a', 'dropped']]);
+  assert.deepEqual(h.f.addressedMessages.entriesOf('a'), [['b-stored', { name: 'b', storedIn: 'a', stored: true }]]);
+});
+
+
+test("fleet telemetry: a held write found landed after its write threw is found by its stored id", () => {
+  const h = harness();
+  const a = Object.assign(h.msg('a', 1), { landing: 'unknown' });
+  h.f.deferredMessages = [a];
+  h.f.unackedDeferredWrites = [];
+  h.f.noteStored = () => {};
+  h.f.addressedMessages.add('a', 'a', 'a', false);
+  h.setLookup([{ id: 'stored-a', participant: 'user', content: a.content }]);
+  h.f.settleUnknownLandings(() => true);
+  assert.deepEqual(h.f.unackedDeferredWrites, [a], 'premise: settled as found');
+  assert.deepEqual(h.f.addressedMessages.entriesOf('a'), [['stored-a', { name: 'a', storedIn: 'a', stored: true }]]);
+});
+
+test("fleet telemetry: a held write settled by a later shard's row is found by its body's first shard's id", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-settle-shard-'));
+  const strategy = Object.assign(new PassthroughStrategy(), {
+    chunkIngressMessage: () => ({
+      bodyGroupId: 'settle-group',
+      shards: [
+        { shardIndex: 0, content: [{ type: 'text' as const, text: 'first shard' }] },
+        { shardIndex: 1, content: [{ type: 'text' as const, text: 'second shard' }] },
+      ],
+    }),
+  });
+  const cm = await ContextManager.open({ path: join(dir, 'store'), strategy });
+  try {
+    const head = cm.addMessage('user', [{ type: 'text', text: 'a long message' }], { deferredWriteId: 'a' } as never);
+    const second = cm.getMessageWindow(0, cm.getMessageCount()).messages.find((m) => m.id !== head)!;
+    assert.equal(second.bodyGroupId, 'settle-group', 'premise: a later shard of the body');
+    const h = harness();
+    const agent = { name: 'a', getContextManager: () => cm };
+    h.f.deliveryAgent = () => agent;
+    h.f.noteStored = () => {};
+    const a = Object.assign(h.msg('a', 1), { landing: 'unknown' });
+    h.f.deferredMessages = [a];
+    h.f.unackedDeferredWrites = [];
+    h.f.addressedMessages.add('a', 'a', 'a', false);
+    // A module names the second shard's row.
+    h.f.settleByCopy(agent, cm.getMessage(second.id));
+    assert.deepEqual(h.f.unackedDeferredWrites, [a], 'premise: settled as found');
+    assert.deepEqual(h.f.addressedMessages.entriesOf('a').map(([id]: [string]) => id), [head]);
+    // Where the store can't be scanned for the body, the read goes on, and
+    // the entry keeps its deferred id.
+    const b = Object.assign(h.msg('b', 2), { landing: 'unknown' });
+    const bHead = cm.addMessage('user', [{ type: 'text', text: 'another long message' }], { deferredWriteId: 'b' } as never);
+    const bSecond = cm.getMessageWindow(0, cm.getMessageCount()).messages.find((m) => m.bodyGroupId && m.id !== bHead && m.id !== head && m.id !== second.id)!;
+    h.f.deferredMessages = [b];
+    h.f.addressedMessages.add('a', 'b', 'a', false);
+    const row = cm.getMessage(bSecond.id);
+    const scanning = cm as unknown as { getMessageWindow: (...args: unknown[]) => unknown };
+    const getMessageWindow = scanning.getMessageWindow;
+    scanning.getMessageWindow = () => { throw new Error('a damaged entry'); };
+    try {
+      h.f.settleByCopy(agent, row);
+    } finally {
+      scanning.getMessageWindow = getMessageWindow;
+    }
+    assert.deepEqual(h.f.unackedDeferredWrites, [a, b], 'premise: settled as found');
+    assert.ok(h.f.addressedMessages.entriesOf('a').some(([id, e]: [string, { stored: boolean }]) => id === 'b' && !e.stored), 'kept by its deferred id');
+    // Once its store can be searched, a compile's check finds it by the
+    // body's first shard, though it isn't acked yet.
+    h.f.agents = new Map([['a', agent]]);
+    h.f.withdrawGoneAddressed('a');
+    assert.ok(h.f.addressedMessages.entriesOf('a').some(([id, e]: [string, { stored: boolean }]) => id === bHead && e.stored), "found by its body's first shard");
+  } finally { cm.close(); rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('CM typed malformed refusal is pre-write for whole bodies and all ingress shards', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-malformed-prewrite-'));

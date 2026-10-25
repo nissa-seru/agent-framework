@@ -8,6 +8,7 @@
  * Spec reference: Section 11 (Server-Initiated Inference).
  */
 
+import type { EmittedTraceEvent } from '../types/trace.js';
 import type {
   Membrane,
   ContentBlock,
@@ -181,7 +182,7 @@ export class InferenceRouter {
   private hookOrchestrator: HookOrchestrator;
   private featureSetManager: FeatureSetManager;
   private routingPolicy: InferenceRoutingPolicy | null;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: EmittedTraceEvent) => void;
   /** The refusals for want of a model that have been logged: one line per
    *  server with no policy, and per server and feature set with one, so a
    *  server that keeps asking doesn't flood the operator's log. */
@@ -192,7 +193,7 @@ export class InferenceRouter {
     hookOrchestrator: HookOrchestrator,
     featureSetManager: FeatureSetManager,
     routingPolicy: InferenceRoutingPolicy | null,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: EmittedTraceEvent) => void,
   ) {
     this.membrane = membrane;
     this.hookOrchestrator = hookOrchestrator;

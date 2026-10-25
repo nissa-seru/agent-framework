@@ -423,6 +423,24 @@ describe('a stream counts its usage once, however it ends', () => {
         traces.push(event);
         if (event.type === 'inference:stream_restarted') countedAtRestart.push(framework.getSessionUsage().inferenceCount);
       });
+      // While the round's results are stored, the worker's routing is
+      // replaced, as by a newer turn; it's put back at the restart, which
+      // names the round's own turn.
+      const fw = framework as unknown as {
+        buildStoredToolResultContent(...args: unknown[]): Promise<unknown>;
+        turnRouting: Map<string, { turnId?: number }>;
+      };
+      const build = fw.buildStoredToolResultContent;
+      let original: { turnId?: number } | undefined;
+      fw.buildStoredToolResultContent = async (...args: unknown[]) => {
+        const built = await build.apply(fw, args);
+        original = fw.turnRouting.get('worker');
+        if (original) fw.turnRouting.set('worker', { ...original, turnId: 999 });
+        return built;
+      };
+      framework.onTrace((event) => {
+        if (event.type === 'inference:stream_restarted' && original) fw.turnRouting.set('worker', original);
+      });
       framework.start();
       const tornDown = streamsDriven(framework);
       try {
@@ -435,10 +453,19 @@ describe('a stream counts its usage once, however it ends', () => {
         // The cancelled stream's teardown has run, so whatever it would log is in.
         await tornDown();
 
+        assert.ok(original, 'premise: the routing was replaced');
         assert.equal(membrane.calls.length, 2, 'the restart opened a second stream');
         assert.equal((traces.find((e) => e.type === 'inference:stream_restarted') as { reason?: string })?.reason, reason);
         assert.deepEqual(countedAtRestart, [1], 'the cancelled stream is counted where the restart is decided');
         assert.equal(traces.filter((e) => e.type === 'inference:completed').length, 1, 'only the turn\'s end completes');
+        // The restart continues the logical turn: both streams' starts, the
+        // restart and the turn's end name one turn.
+        const turnIds = traces
+          .filter((e) => ['inference:started', 'inference:stream_restarted', 'inference:completed'].includes(e.type))
+          .map((e) => (e as { turnId?: number }).turnId);
+        assert.equal(turnIds.length, 4);
+        assert.equal(typeof turnIds[0], 'number');
+        assert.deepEqual(new Set(turnIds), new Set([turnIds[0]]), `one turn's id: ${JSON.stringify(turnIds)}`);
         assert.equal(traces.filter((e) => e.type === 'usage:updated').length, 2);
         const snapshot = framework.getSessionUsage();
         assert.equal(snapshot.inferenceCount, 2);

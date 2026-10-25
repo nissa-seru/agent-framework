@@ -10,6 +10,7 @@ import type { BigIntStats, Stats } from 'node:fs';
 import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
 import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
+import type { OpsAlertKind } from '../../types/trace.js';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
 import type {
@@ -1716,7 +1717,7 @@ export class WorkspaceModule implements Module {
       `and follow the answer. Meanwhile it takes no writes. ${intents}${which}: ${held.slice(0, 10).join(', ')}` +
       `${held.length > 10 ? `, and ${held.length - 10} more` : ''}.`;
     console.warn(`[workspace] ${message}`);
-    this.ctx?.notifyOps?.('workspace-mount-not-direct', 'framework', message, { held: Object.fromEntries(mounts.map(([name, paths]) => [name, paths.length])) });
+    this.ctx?.notifyOps?.('workspace-mount-not-direct' satisfies OpsAlertKind, 'framework', message, { held: Object.fromEntries(mounts.map(([name, paths]) => [name, paths.length])) });
   }
 
   private async initialScan(mountName: string): Promise<void> {

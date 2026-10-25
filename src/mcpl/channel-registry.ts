@@ -13,6 +13,8 @@
  * - Build channel context for beforeInference params
  */
 
+import { type TriggerVerdict, verdictParts } from '../gate/types.js';
+import type { EmittedTraceEvent } from '../types/trace.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { convertBlock } from './convert-block.js';
 import type { JsStore } from '@animalabs/chronicle';
@@ -447,6 +449,11 @@ interface McplChannelIncomingEvent {
    *  when picking a turn's frozen speech locus. */
   tags?: string[];
   triggerInference?: boolean;
+  /** Set by the host's gate when it holds the message's wake rather than
+   *  waking its agent now (triggerInference false): `debounce`, in the
+   *  batch its policy is collecting, or `sleep`, where the gate's sleep
+   *  suppressed the wake. */
+  wakeLater?: 'debounce' | 'sleep';
   targetAgents?: string[];
   /** Host acceptance time (epoch ms), stamped where the message is admitted. */
   acceptedAt?: number;
@@ -965,8 +972,10 @@ interface ChannelRegistryOptions {
   ) => Promise<ChannelIncomingMessageResult & { firstView?: true }>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
-  /** Callback to determine whether an incoming message should trigger inference. */
-  shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+  /** Callback to determine whether an incoming message should trigger
+   *  inference: a host's filter answers true or false, and the framework's
+   *  gate can also answer that the wake comes later (TriggerVerdict). */
+  shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => TriggerVerdict;
   /**
    * Called when a text-only turn's speech was not delivered to its
    * conversational locus (`failed`), or may not have been (`unknown`), for
@@ -1115,14 +1124,14 @@ export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
   private pushEventFn: (event: ProcessEvent) => void;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: EmittedTraceEvent) => void;
   private sendTypingFn?: (
     serverId: string,
     channelId: string,
     metadata?: Record<string, unknown>,
     op?: 'start' | 'stop',
   ) => void;
-  private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+  private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => TriggerVerdict;
   private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
@@ -1516,7 +1525,7 @@ export class ChannelRegistry {
     serverRegistry: McplServerRegistry,
     featureSetManager: FeatureSetManager,
     pushEventFn: (event: ProcessEvent) => void,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: EmittedTraceEvent) => void,
     options?: ChannelRegistryOptions & {
       sendTypingFn?: (
         serverId: string,
@@ -1957,6 +1966,7 @@ export class ChannelRegistry {
 
       // Determine whether to trigger inference
       let triggerInference = true;
+      let wakeLater: 'debounce' | 'sleep' | undefined;
       if (this.shouldTriggerInference) {
         // The text the agent's context gets, as the push lane's filter reads
         // it: the converted text blocks, a placeholder or reference stub
@@ -1965,7 +1975,7 @@ export class ChannelRegistry {
           .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
           .map((b) => b.text)
           .join('\n');
-        triggerInference = this.shouldTriggerInference(
+        const verdict = this.shouldTriggerInference(
           textContent,
           {
             ...message.metadata,
@@ -1978,6 +1988,7 @@ export class ChannelRegistry {
             ...(message.tags ? { tags: message.tags } : {}),
           },
         );
+        ({ trigger: triggerInference, later: wakeLater } = verdictParts(verdict));
       }
 
       // Build the incoming event
@@ -1993,6 +2004,7 @@ export class ChannelRegistry {
         metadata: message.metadata,
         ...(message.tags ? { tags: message.tags } : {}),
         triggerInference,
+        ...(wakeLater ? { wakeLater } : {}),
         acceptedAt: Date.now(),
       };
 

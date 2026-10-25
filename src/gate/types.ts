@@ -191,6 +191,20 @@ export interface GateOptions {
 // Runtime types (internal to EventGate, exported for tests/tools)
 // ---------------------------------------------------------------------------
 
+/**
+ * A trigger filter's verdict on an inbound message or push: `true` to wake
+ * its agent now, `false` for no wake, or, from the host's gate, a wake it
+ * holds: `debounce`, in the batch its policy is collecting, or
+ * `sleep`, where the gate's sleep suppressed the wake (GateDecision.heldBy).
+ */
+export type TriggerVerdict = boolean | { trigger: false; later: 'debounce' | 'sleep' };
+
+/** A verdict's two parts, as the MCPL lanes carry them on their events:
+ *  whether the wake comes now, and how the gate holds it if it does. */
+export function verdictParts(verdict: TriggerVerdict): { trigger: boolean; later?: 'debounce' | 'sleep' } {
+  return typeof verdict === 'object' && verdict !== null ? { trigger: verdict.trigger, later: verdict.later } : { trigger: verdict };
+}
+
 /** The result of evaluating an event against the gate. */
 export interface GateDecision {
   /** Whether to trigger inference. */
@@ -204,6 +218,15 @@ export interface GateDecision {
    * did not fire, so evaluation continued past them. Absent when none did.
    */
   observed?: string[];
+  /** Set when the gate's sleep suppressed the event's wake and holds it:
+   *  unless the rule that matches it in the policy table, read without side
+   *  effects (EventGate.probe), is a `defer` or a `skip`, which give none. A
+   *  rate limit or a sample that matches is held whatever its state, which
+   *  the sleep doesn't spend (one marked passthrough is peeked, as probe
+   *  does, to tell whether the rule after it matches); and every event is
+   *  held while gate.js would decide, which the sleep asks about no event. The sleep's end wakes the agent that
+   *  slept, or, when it names none, every agent but the subconscious. */
+  heldBy?: 'sleep';
 }
 
 /**

@@ -90,23 +90,38 @@ export function removeStoredMessages(cm: Removals, first: StoredLike, last: Stor
  * Remove one stored message by its id, with the rest of its body when it's
  * in one: a module or a coalescer removes a message it added by the id
  * `addMessage` returned, which for a long message stored in shards is its
- * first shard's.
+ * first shard's. Returns the id of what it removed as its body goes by
+ * (bodyHeadId), whichever shard's id it was given.
  */
-export function removeStoredMessage(cm: ContextManager, id: MessageId): void {
+export function removeStoredMessage(cm: ContextManager, id: MessageId): MessageId {
   const message = cm.getMessage(id) as StoredLike | null;
   if (!message?.bodyGroupId) {
     cm.removeMessage(id);
-    return;
+    return id;
   }
   // Found in blob-free windows: a full read of the branch would inflate every
   // attachment on it, once for each message a sweep removes.
   const index = locateMessageIndex(cm, String(id));
   if (index < 0) {
     cm.removeMessage(id);
-    return;
+    return id;
   }
   const run = bodyGroupRun(cm, index);
   cm.removeMessages(run.fromId as MessageId, run.toId as MessageId);
+  return run.fromId as MessageId;
+}
+
+/**
+ * The id a stored body goes by, given any of its shards' ids: its first
+ * shard's, the id `addMessage` returned and a compile's provenance names it
+ * by (context-manager's RawBodySource.messageId). The id itself for a
+ * message outside any body, or one the store's branch doesn't hold.
+ */
+export function bodyHeadId(cm: ContextManager, id: MessageId): MessageId {
+  const message = cm.getMessage(id) as StoredLike | null;
+  if (!message?.bodyGroupId) return id;
+  const index = locateMessageIndex(cm, String(id));
+  return index < 0 ? id : (bodyGroupRun(cm, index).fromId as MessageId);
 }
 
 /** removeStoredMessages for an interval known by its ids. */

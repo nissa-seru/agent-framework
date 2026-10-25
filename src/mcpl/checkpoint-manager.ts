@@ -12,6 +12,7 @@
  * Spec reference: Section 8 (State Management).
  */
 
+import type { EmittedTraceEvent } from '../types/trace.js';
 import type { JsStore } from '@animalabs/chronicle';
 import { ensureStateRegistered } from '../module-registry.js';
 import { boundedErrorMessage as thrownText } from '../error-message.js';
@@ -198,12 +199,12 @@ export function applyJsonPatch(doc: unknown, ops: JsonPatchOperation[]): unknown
 
 export class CheckpointManager {
   private store: JsStore;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
+  private emitTraceFn: (event: EmittedTraceEvent) => void;
   private trees = new Map<string, FeatureSetState>();
 
   constructor(
     store: JsStore,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
+    emitTraceFn: (event: EmittedTraceEvent) => void,
   ) {
     this.store = store;
     this.emitTraceFn = emitTraceFn;

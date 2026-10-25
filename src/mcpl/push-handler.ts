@@ -7,6 +7,8 @@
  * Spec reference: Section 9 (Push Events).
  */
 
+import { type TriggerVerdict, verdictParts } from '../gate/types.js';
+import type { EmittedTraceEvent } from '../types/trace.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { convertBlock } from './convert-block.js';
 
@@ -45,6 +47,11 @@ export interface McplPushEvent {
   timestamp: string;
   inferenceId: string;
   triggerInference?: boolean;
+  /** Set by the host's gate when it holds the message's wake rather than
+   *  waking its agent now (triggerInference false): `debounce`, in the
+   *  batch its policy is collecting, or `sleep`, where the gate's sleep
+   *  suppressed the wake. */
+  wakeLater?: 'debounce' | 'sleep';
   targetAgents?: string[];
   /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
   coalescingSubject?: string;
@@ -111,8 +118,8 @@ interface Responder {
 export class PushHandler {
   private featureSetManager: FeatureSetManager;
   private pushEventFn: (event: McplPushEvent) => void;
-  private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
-  private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+  private emitTraceFn: (event: EmittedTraceEvent) => void;
+  private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => TriggerVerdict;
   private dedup = new DedupSet(1000);
   /** Holds back repeats of the line for a channel-scoped push refused because
    *  its channel isn't declared (-32023) or may not be used (-32017). */
@@ -121,8 +128,8 @@ export class PushHandler {
   constructor(
     featureSetManager: FeatureSetManager,
     pushEventFn: (event: McplPushEvent) => void,
-    emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
-    shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
+    emitTraceFn: (event: EmittedTraceEvent) => void,
+    shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => TriggerVerdict,
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
     /** An ordinary (uncoalesced) push was just admitted, before it is queued
      *  or acknowledged: return its source envelope, frozen now
@@ -224,6 +231,7 @@ export class PushHandler {
 
     // 4. Check shouldTriggerInference callback
     let triggerInference = true;
+    let wakeLater: 'debounce' | 'sleep' | undefined;
     if (this.shouldTriggerInference) {
       const textContent = content
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
@@ -240,7 +248,8 @@ export class PushHandler {
         eventType: 'mcpl:push-event',
         ...(params.tags ? { tags: params.tags } : {}),
       };
-      triggerInference = this.shouldTriggerInference(textContent, metadata);
+      const verdict = this.shouldTriggerInference(textContent, metadata);
+      ({ trigger: triggerInference, later: wakeLater } = verdictParts(verdict));
     }
 
     // 5. Generate inferenceId
@@ -258,6 +267,7 @@ export class PushHandler {
       timestamp: params.timestamp,
       inferenceId,
       triggerInference,
+      ...(wakeLater ? { wakeLater } : {}),
       acceptedAt: Date.now(),
     };
     if (coalesced) {

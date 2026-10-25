@@ -11,6 +11,7 @@
  * inference tokens, not whether the agent should know about the event.
  */
 
+import type { EmittedTraceEvent } from '../types/trace.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
@@ -26,6 +27,7 @@ import type {
   GatePolicyMatch,
   GateBehavior,
   GateDecision,
+  TriggerVerdict,
   GateEntryRef,
   WakeLine,
   GateEventInfo,
@@ -213,15 +215,6 @@ interface PolicyStats {
 }
 
 // ---------------------------------------------------------------------------
-// Trace event shape (subset — avoids importing the full TraceEvent union)
-// ---------------------------------------------------------------------------
-
-interface TraceEventLike {
-  type: string;
-  [key: string]: unknown;
-}
-
-// ---------------------------------------------------------------------------
 // Glob matching (simple * wildcards)
 // ---------------------------------------------------------------------------
 
@@ -310,6 +303,16 @@ function entryRef(event: PendingEvent): GateEntryRef {
     ...(event.messageId !== undefined ? { messageId: event.messageId } : {}),
     ...(event.eventId !== undefined ? { eventId: event.eventId } : {}),
   };
+}
+
+/** A gate decision as a TriggerVerdict: a wake now, a wake the gate holds
+ *  (in a debounce batch, or under its sleep), or none (a `defer`, a rate
+ *  limit's denial, a sample's miss). */
+export function triggerVerdict(decision: GateDecision): TriggerVerdict {
+  if (decision.trigger) return true;
+  if (decision.heldBy === 'sleep') return { trigger: false, later: 'sleep' };
+  if (typeof decision.behavior === 'object' && 'debounce' in decision.behavior) return { trigger: false, later: 'debounce' };
+  return false;
 }
 
 /**
@@ -1907,7 +1910,7 @@ export class EventGate {
   private lastPrivilegedCheck = 0;
 
   // Dependency-injected callbacks
-  private emitTrace: (event: TraceEventLike) => void;
+  private emitTrace: (event: EmittedTraceEvent) => void;
   private addMessageFn: (
     participant: string,
     content: Array<{ type: 'text'; text: string }>,
@@ -1930,7 +1933,7 @@ export class EventGate {
     configPath: string;
     initialConfig?: GateConfig;
     privilegedUsersPath?: string;
-    emitTrace: (event: TraceEventLike) => void;
+    emitTrace: (event: EmittedTraceEvent) => void;
     addMessage: (
       participant: string,
       content: Array<{ type: 'text'; text: string }>,
@@ -2868,7 +2871,7 @@ export class EventGate {
           behavior: 'skip',
           timestamp: this.now(),
         });
-        return { trigger: false, policyName: 'asleep', behavior: 'skip' };
+        return { trigger: false, policyName: 'asleep', behavior: 'skip', ...(this.sleepHoldsWake(info) ? { heldBy: 'sleep' as const } : {}) };
       }
       // Privileged author — fall through to normal policy evaluation.
     }
@@ -3142,6 +3145,26 @@ export class EventGate {
   }
 
   /**
+   * Whether the sleep, suppressing `info`'s wake, holds one
+   * (GateDecision.heldBy): unless the rule that matches it is a `defer` or a
+   * `skip`, the default's included, which give no wake. The policy table is
+   * read as `probe` reads it, with no side effect, since the sleep spends
+   * nothing: a rate limit or a sample that matches is held whatever its
+   * state, since the sleep, spending none of it, can't tell which of several
+   * events it would admit. One marked passthrough is read as `probe` reads
+   * it, its state peeked, which decides whether the rule after it matches.
+   * While gate.js would decide
+   * (GateScript.decides), every suppressed wake is held: the sleep asks it
+   * about no event, and it may keep state, so what it would answer isn't
+   * known.
+   */
+  private sleepHoldsWake(info: GateEventInfo): boolean {
+    if (this.gateScript.decides()) return true;
+    const { behavior } = this.probe(info);
+    return behavior !== 'defer' && behavior !== 'skip';
+  }
+
+  /**
    * Evaluate an event against the declarative policy table WITHOUT side
    * effects: no counters advance, no debounce batches form, no stats or
    * traces are recorded, and sleep suppression is ignored (a probe asks
@@ -3285,11 +3308,25 @@ export class EventGate {
   // =========================================================================
 
   /**
-   * Returns a callback compatible with McplServerConfig.shouldTriggerInference.
-   * Used by the framework to wire the gate into PushHandler and ChannelRegistry.
+   * Returns a callback compatible with McplServerConfig.shouldTriggerInference:
+   * true only for a wake now. For a host's own wiring; the framework wires
+   * the gate into PushHandler and ChannelRegistry through
+   * triggerVerdictCallback, which also says when the gate holds a wake.
    */
   asShouldTriggerCallback(): (content: string, metadata: Record<string, unknown>) => boolean {
-    return (content: string, metadata: Record<string, unknown>): boolean => {
+    const verdictOf = this.triggerVerdictCallback();
+    return (content: string, metadata: Record<string, unknown>): boolean => verdictOf(content, metadata) === true;
+  }
+
+  /**
+   * The gate's verdict on an inbound message or push, as the framework wires
+   * it into PushHandler and ChannelRegistry: `true` to wake its agent now,
+   * and, where it doesn't, whether its wake waits in a debounce batch or the
+   * gate's sleep suppressed it (TriggerVerdict).
+   * @internal The framework's wiring; asShouldTriggerCallback is the host's.
+   */
+  triggerVerdictCallback(): (content: string, metadata: Record<string, unknown>) => TriggerVerdict {
+    return (content: string, metadata: Record<string, unknown>): TriggerVerdict => {
       const decision = this.evaluate({
         content,
         eventType: (metadata.eventType as string) ?? 'unknown',
@@ -3298,7 +3335,7 @@ export class EventGate {
         metadata,
         tags: Array.isArray(metadata.tags) ? (metadata.tags as string[]) : undefined,
       });
-      return decision.trigger;
+      return triggerVerdict(decision);
     };
   }
 
@@ -3638,6 +3675,7 @@ export class EventGate {
       matchedPolicy: 'asleep',
       trigger: false,
       behavior: 'skip',
+      until: this.sleepUntil,
       timestamp: this.now(),
     });
     return { until: this.sleepUntil };
@@ -3748,13 +3786,25 @@ export class EventGate {
     return { inMs: ms, armed: true };
   }
 
-  /** End sleep immediately. Returns true if the agent was asleep. */
+  /** End sleep immediately. Returns true if the agent was asleep. A sleep
+   *  it ends is traced as ended early (`sleep:cleared`), as the timer's end
+   *  is (`sleep:expired`). */
   clearSleep(): boolean {
     const wasAsleep = this.sleepUntil > this.now();
     this.sleepUntil = 0;
     this.sleepNote = undefined;
     this.sleepAgent = undefined;
     if (this.sleepTimer) { clearTimeout(this.sleepTimer); this.sleepTimer = null; }
+    if (wasAsleep) {
+      this.emitTrace({
+        type: 'gate:decision',
+        eventType: 'sleep:cleared',
+        matchedPolicy: 'asleep',
+        trigger: false,
+        behavior: 'skip',
+        timestamp: this.now(),
+      });
+    }
     return wasAsleep;
   }
 

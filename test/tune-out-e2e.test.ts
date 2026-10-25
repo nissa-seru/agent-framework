@@ -56,6 +56,7 @@ describe('tune-out end to end', () => {
   let framework: AgentFramework;
   let statusPath: string;
   let commandPath: string;
+  const traces: Array<{ type: string; messageId?: string; deferredId?: string; source?: string; agentName?: string }> = [];
 
   before(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'tune-out-e2e-'));
@@ -81,6 +82,7 @@ describe('tune-out end to end', () => {
       }],
       modules: [],
     });
+    framework.onTrace((e) => traces.push(e as (typeof traces)[number]));
     await framework.start();
     await waitFor(
       () => (internals(framework).channelRegistry?.listChannelsRaw().length ?? 0) > 0,
@@ -215,6 +217,16 @@ describe('tune-out end to end', () => {
       !renderedTexts.some((t) => t.includes('release chatter one') && !t.includes('<tuned-out-backlog')),
       'raw stamped originals stay view-excluded permanently',
     );
+
+    // Fleet telemetry: each notice the coordinator writes for a wake is
+    // traced as it's stored or held, and addressed to the agent woken for it.
+    const addressedTo = (source: string): string[] => {
+      const named = traces.filter((e) => e.type === 'message:added' && e.source === source).map((e) => e.messageId || e.deferredId);
+      return traces.filter((e) => e.type === 'message:addressed' && named.includes(e.messageId)).map((e) => e.agentName!);
+    };
+    assert.deepEqual(addressedTo('tune-out-wake'), ['Subconscious'], 'the wake notice');
+    assert.deepEqual(addressedTo('tune-out-cancel'), ['scout'], 'the dump, to the resident');
+    assert.deepEqual(addressedTo('tune-out-cancel-report'), ['Subconscious'], 'the cancel report');
   });
 
   it("a conversation is bound to a channel only on its own server, not another server's channel with the same id", () => {

@@ -15,6 +15,7 @@
  * lifecycle facts (the [Gate: …] precedent).
  */
 
+import type { EmittedTraceEvent } from '../types/trace.js';
 import { randomUUID } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
@@ -78,16 +79,36 @@ function thrownReason(error: unknown): string {
   }
 }
 
+/** Where the framework put a message the coordinator wrote: the agent whose
+ *  window it went to, and its stored id, or, held for that agent's live
+ *  turn, the id it waits under. */
+export interface TuneOutWrite {
+  agent?: string;
+  messageId?: string;
+  deferredId?: string;
+}
+
+/** A placement for addMessage to fill, kept in `writes`: the writes a wake
+ *  is for. */
+function placed(writes: TuneOutWrite[]): TuneOutWrite {
+  const placement: TuneOutWrite = {};
+  writes.push(placement);
+  return placement;
+}
+
 export interface TuneOutFrameworkHooks {
-  /** Deliver a message into an agent's window (per-agent seam). */
+  /** Deliver a message into an agent's window (per-agent seam), saying
+   *  where it went in `placement`. */
   addMessage: (
     participant: string,
     content: ContentBlock[],
     metadata?: Record<string, unknown>,
     forAgent?: string,
+    placement?: TuneOutWrite,
   ) => string;
-  /** Queue an inference request for an agent. */
-  requestInference: (agentName: string, reason: string, source: string) => void;
+  /** Queue an inference request for an agent, for the messages `forWrites`
+   *  places (addMessage's placements), which the wake is written for. */
+  requestInference: (agentName: string, reason: string, source: string, forWrites?: readonly TuneOutWrite[]) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
   /** The primary resident's registry name. */
@@ -118,7 +139,7 @@ export interface TuneOutFrameworkHooks {
   isPrivilegedAuthor: (authorId: string | null | undefined) => boolean;
   /** speak_in_channel master switch (recipe-side, canary-gated). */
   allowChannelSpeech: () => boolean;
-  emitTrace: (event: { type: string; [key: string]: unknown }) => void;
+  emitTrace: (event: EmittedTraceEvent) => void;
 }
 
 export class TuneOutCoordinator {
@@ -440,11 +461,15 @@ export class TuneOutCoordinator {
         m.content.some((b) => b.type !== 'text') || (newestCut && m === shown[0])),
     ];
 
-    // Host-framed system artifacts — never voiced as anyone.
+    // Host-framed system artifacts — never voiced as anyone. The resident's
+    // wake below is for the dump and the subconscious's note.
+    const forResident: TuneOutWrite[] = [];
     this.hooks.addMessage(
       'user',
       [{ type: 'text', text: render(lines, truncated) }],
       { system: true, kind: 'tune-out-cancel', channelId, epochId },
+      undefined,
+      placed(forResident),
     );
     // The subconscious's own words, under its own name, verbatim.
     const subName = this.hooks.subconsciousName();
@@ -455,11 +480,13 @@ export class TuneOutCoordinator {
         // With its server: a conversational row whose channel the framework
         // reads (repinChannel), where another server's channel can share the id.
         { kind: 'subconscious-note', channelId, serverId, epochId },
+        undefined,
+        placed(forResident),
       );
     }
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', forResident);
     }
     // The subconscious gets one cancel turn of its own: the issue's cancel
     // shape is dump + a report from the subconscious, and when the dump left
@@ -478,11 +505,13 @@ export class TuneOutCoordinator {
       const heldNote = heldForReport.length > 0
         ? ` Still held at the cancel, so your view may not have them yet: the ${heldForReport.length} message${heldForReport.length === 1 ? '' : 's'} after this one.`
         : '';
+      const forSubconscious: TuneOutWrite[] = [];
       this.hooks.addMessage(
         'user',
         [{ type: 'text', text: `[Tune-out cancelled: ${this.shown(serverId, channelId)} — ${reason}.${truncNote}${heldNote}]` }],
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
+        placed(forSubconscious),
       );
       // Each held message is a row of its own, so a per-message cap cuts each
       // one on its own, its author's label included, not the batch's newest.
@@ -492,9 +521,10 @@ export class TuneOutCoordinator {
           [{ type: 'text', text: `${authorOf(m)}:` }, ...m.content],
           { system: true, kind: 'tune-out-cancel-held', channelId },
           subName,
+          placed(forSubconscious),
         );
       }
-      this.hooks.requestInference(subName, `tune-out cancelled: ${name}`, 'tune-out');
+      this.hooks.requestInference(subName, `tune-out cancelled: ${name}`, 'tune-out', forSubconscious);
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
@@ -666,13 +696,15 @@ export class TuneOutCoordinator {
     const notice = trigger === 'wake'
       ? `[Tune-out wake: ${shown} — ${count} addressed message${count === 1 ? '' : 's'}]`
       : `[Tune-out cadence: ${shown} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
+    const forNotice: TuneOutWrite[] = [];
     this.hooks.addMessage(
       'user',
       [{ type: 'text', text: notice }],
       { system: true, kind: `tune-out-${trigger}`, channelId },
       subName,
+      placed(forNotice),
     );
-    this.hooks.requestInference(subName, `tune-out ${trigger}: ${shown}`, 'tune-out');
+    this.hooks.requestInference(subName, `tune-out ${trigger}: ${shown}`, 'tune-out', forNotice);
     // Counted from here only once the turn has been asked for, so a turn that
     // throws leaves its messages for the next period's turn.
     this.divertedSinceInvocation.set(key, 0);

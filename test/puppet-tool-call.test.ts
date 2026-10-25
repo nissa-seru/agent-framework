@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
+import { AddressedMessages } from '../src/addressed-messages.js';
 
 /**
  * Framework.puppetToolCall — admin puppet: execute one tool AS an agent and
@@ -53,6 +54,8 @@ function puppetHarness(opts?: {
   fw.unackedDeferredWrites = [];
   fw.deferredSeq = 0;
   fw.deferredScanFrom = new Map();
+  // Fleet telemetry's record, which a drain keeps current, as the constructor seeds it.
+  fw.addressedMessages = new AddressedMessages();
   fw.pendingAssistantBlocks = new Map();
   // Window releases a quiesce postponed, which every by-name flush checks
   // (drainDeferredFor): none here, as the constructor starts it.

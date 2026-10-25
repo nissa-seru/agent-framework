@@ -349,6 +349,11 @@ export interface McplPushEvent {
   timestamp: string;
   inferenceId: string;
   triggerInference?: boolean;
+  /** Set by the host's gate when it holds the message's wake rather than
+   *  waking its agent now (triggerInference false): `debounce`, in the
+   *  batch its policy is collecting, or `sleep`, where the gate's sleep
+   *  suppressed the wake. */
+  wakeLater?: 'debounce' | 'sleep';
   targetAgents?: string[];
   /** Host acceptance time (epoch ms), stamped where the push is admitted. */
   acceptedAt?: number;
@@ -369,6 +374,11 @@ export interface McplChannelIncomingEvent {
   timestamp: string;
   metadata?: Record<string, unknown>;
   triggerInference?: boolean;
+  /** Set by the host's gate when it holds the message's wake rather than
+   *  waking its agent now (triggerInference false): `debounce`, in the
+   *  batch its policy is collecting, or `sleep`, where the gate's sleep
+   *  suppressed the wake. */
+  wakeLater?: 'debounce' | 'sleep';
   targetAgents?: string[];
   /** Host acceptance time (epoch ms), stamped where the message is admitted. */
   acceptedAt?: number;

@@ -48,6 +48,10 @@ export interface ActivationRequestOptions {
    *  pass it (its errorPolicy is their retry layer); a direct caller of
    *  startStream keeps membrane's retries. */
   membraneRetries?: boolean;
+  /** The request's id: given to membrane as the call's `requestId` option,
+   *  and named by the framework's inference log and its `inference:request`
+   *  trace. */
+  requestId?: string;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -101,6 +105,19 @@ export interface StartStreamResult {
    *  far in sent order, with this request's head (context-manager's `noteRequestSent`). Present only where the
    *  model binds its thinking and the context manager keeps a record it can be told of. */
   noteRequestSent?: (rows: readonly SentRow[]) => boolean;
+  /** The stored bodies this request carries, by the id each is stored
+   *  under, as its compile's provenance names them (raw bodies, whole or in
+   *  part, not a summary's), in the compiled messages the request keeps.
+   *  Absent where the compile reported no provenance. */
+  carried?: () => string[];
+  /** The stored bodies its compile read raw that this request doesn't
+   *  carry, since it drops every message carrying them: one left with
+   *  nothing once its empty text is stripped. Absent where `carried` is. */
+  dropped?: () => string[];
+  /** The ids of the summaries this request carries, as its compile's
+   *  provenance names them (`ContextManager.getSummary` reads each). Absent
+   *  where `carried` is. */
+  summaries?: () => string[];
 }
 import type {
   ContextManager,
@@ -143,6 +160,33 @@ function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, inje
   const own = messages[messages.length - 1 - injectionTail];
   return own !== undefined && own.participant === agentName
     && messages.slice(messages.length - injectionTail).every((m) => m.participant.startsWith('system_context:'));
+}
+
+/** What a compile's provenance says each compiled message is a copy of
+ *  (context-manager's CompileProvenance), read structurally: the raw bodies
+ *  and the summaries are what carriedBodies reads. */
+interface CompileProvenanceLike {
+  messages: ReadonlyArray<{ kind: string; bodies?: ReadonlyArray<{ messageId: string }>; summaries?: ReadonlyArray<{ id: string }> }>;
+}
+
+/** What a request carries of a compile's sources, by whether the request
+ *  keeps the compiled message (`kept`, indexes into the compile's messages,
+ *  which its provenance parallels): the stored bodies it carries raw, by
+ *  their ids, in compiled order (`carried`, a body carried in part listed as
+ *  one carried whole: `complete` isn't read); those carried only by
+ *  messages the request drops (`dropped`); and the ids of the summaries it
+ *  carries (`summaries`). */
+export function carriedBodies(provenance: CompileProvenanceLike, kept: ReadonlySet<number>): { carried: string[]; dropped: string[]; summaries: string[] } {
+  const carried: string[] = [];
+  const dropped: string[] = [];
+  const summaries: string[] = [];
+  provenance.messages.forEach((source, i) => {
+    if (source.kind === 'summary' && kept.has(i)) for (const summary of source.summaries ?? []) summaries.push(summary.id);
+    if (source.kind !== 'raw') return;
+    for (const body of source.bodies ?? []) (kept.has(i) ? carried : dropped).push(body.messageId);
+  });
+  const inKept = new Set(carried);
+  return { carried, dropped: dropped.filter((id) => !inKept.has(id)), summaries };
 }
 
 /** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
@@ -1722,7 +1766,7 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions }> {
+  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt; compiled: CompiledForRequest; binding: BindingCompileOptions; carried?: () => string[]; dropped?: () => string[]; summaries?: () => string[] }> {
     // Unstored, so they leave for the request here (text-as-stored.ts), the
     // layout hash below included.
     injections = injectionsAsStored(injections);
@@ -1822,9 +1866,13 @@ export class Agent {
     // compression path.)
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
-    messages = messages
-      .map((m) => ({ ...m, content: m.content.filter(carriedBlock) }))
-      .filter((m) => m.content.length > 0);
+    const sanitized = messages.map((m) => ({ ...m, content: m.content.filter(carriedBlock) }));
+    // The compiled messages kept, by their place in the compile (origin), so
+    // what the request carries is read from the compile's provenance for
+    // those alone (carriedBodies); a stand-in has none.
+    const kept = sanitized.flatMap((m, i) => (m.content.length > 0 ? [i] : []));
+    messages = kept.map((i) => sanitized[i]!);
+    const keptSet = new Set(kept.flatMap((i) => { const from = origin[i]; return from == null ? [] : [from]; }));
     // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
     messages = withoutTokenEstimates(messages);
 
@@ -1882,7 +1930,16 @@ export class Agent {
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
-    return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
+    const provenance = (compiled as typeof compiled & { provenance?: CompileProvenanceLike }).provenance;
+    let bodies: ReturnType<typeof carriedBodies> | undefined;
+    const read = (): ReturnType<typeof carriedBodies> => (bodies ??= carriedBodies(provenance!, keptSet));
+    return {
+      request,
+      ...(continuePrompt ? { continuePrompt } : {}),
+      compiled,
+      binding,
+      ...(provenance ? { carried: () => read().carried, dropped: () => read().dropped, summaries: () => read().summaries } : {}),
+    };
   }
 
   /**
@@ -2068,7 +2125,7 @@ export class Agent {
     // Compiled only once each withheld stub's annotation has finished,
     // including one that began during the compile, and after a stub edit that
     // failed has been retried (see afterAnnotations).
-    const { request, continuePrompt, compiled, binding } = await this.toolResultGuard.afterAnnotations(
+    const { request, continuePrompt, compiled, binding, carried, dropped, summaries } = await this.toolResultGuard.afterAnnotations(
       () => this.assembleActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
@@ -2106,6 +2163,7 @@ export class Agent {
       // since membrane 0.7 its own schedules, ten minutes at a 529, would
       // otherwise run inside each of the caller's attempts, out of its sight.
       ...(options.membraneRetries === false ? { retry: false } : {}),
+      ...(options.requestId !== undefined ? { requestId: options.requestId } : {}),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
@@ -2129,6 +2187,9 @@ export class Agent {
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
       ...this.requestNotes(binding, compiled),
       ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
+      ...(carried ? { carried } : {}),
+      ...(dropped ? { dropped } : {}),
+      ...(summaries ? { summaries } : {}),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),

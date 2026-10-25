@@ -48,6 +48,9 @@ export class GateScript {
   private lastCheck = 0;
   private active = false;
   private ready = false;
+  /** gate.js loaded with a decision function: one that failed to import, or
+   *  exports none, answers null to every event, so the policies decide. */
+  private loaded = false;
   private lastError: string | null = null;
   private runs = 0;
   private errors = 0;
@@ -88,14 +91,32 @@ export class GateScript {
       const w = new Worker(WORKER_PATH, {
         workerData: { scriptPath: this.scriptPath, sab: this.sab },
       });
+      // A load reported by a worker replaced speaks for nothing now: one
+      // stop() is terminating can still deliver a message it posted before.
+      // (Node delivers a worker's messages before its exit, so none comes
+      // after it.)
       w.on('message', (m: { type?: string; error?: string | null }) => {
+        if (this.worker !== w) return;
         if (m?.type === 'ready') {
           this.ready = true; // load finished (with or without a load error)
-          if (m.error) this.lastError = m.error;
+          // The worker posts error null on a load that found its function,
+          // and the error's message, a string, empty for an empty Error, on
+          // one that failed.
+          this.loaded = m.error == null;
+          if (m.error != null) this.lastError = m.error || 'gate.js failed to load, with an empty error message';
         }
       });
       w.on('error', (e) => {
         this.lastError = e.message;
+      });
+      // A worker that has died decides nothing, so decides answers no. One
+      // that had loaded stays ready, so the next event evaluate posts finds
+      // it unanswering and respawns it at the timeout, as for a wedged one;
+      // one that died before its load never was, and waits for gate.js to
+      // change, as evaluate does. stop() has already let go of a worker it
+      // terminates.
+      w.on('exit', () => {
+        if (this.worker === w) this.loaded = false;
       });
       w.unref(); // never keep the process alive on the gate script's account
       this.worker = w;
@@ -114,6 +135,18 @@ export class GateScript {
     }
     this.active = false;
     this.ready = false;
+  }
+
+  /**
+   * Whether gate.js would decide an event now: present, and loaded with a
+   * decision function in a worker still running. A script still starting,
+   * one whose load failed, and one whose worker died fall through to the
+   * policies. It reloads gate.js as evaluate does (throttled), which imports
+   * a changed script in a new worker, and evaluates no event.
+   */
+  decides(): boolean {
+    this.reloadIfChanged();
+    return this.active && !!this.worker && this.ready && this.loaded;
   }
 
   /**

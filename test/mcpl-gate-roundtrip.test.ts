@@ -8,7 +8,7 @@ import { EventGate } from '../src/gate/event-gate.js';
 import { ChannelRegistry, destinationKey } from '../src/mcpl/channel-registry.js';
 import { PushHandler } from '../src/mcpl/push-handler.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
-import type { GateConfig } from '../src/gate/types.js';
+import type { GateConfig, TriggerVerdict } from '../src/gate/types.js';
 import type { ChannelsIncomingParams } from '../src/mcpl/types.js';
 import type { ProcessEvent } from '../src/types/index.js';
 
@@ -22,8 +22,8 @@ afterEach(() => {
   if (existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true, force: true });
 });
 
-function makeGate(config: GateConfig) {
-  const configPath = join(TMP_DIR, 'gate.json');
+function makeGate(config: GateConfig, file = 'gate.json') {
+  const configPath = join(TMP_DIR, file);
   writeFileSync(configPath, JSON.stringify(config));
   return new EventGate({
     configPath,
@@ -34,7 +34,7 @@ function makeGate(config: GateConfig) {
   });
 }
 
-function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unknown>) => boolean) {
+function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unknown>) => TriggerVerdict) {
   const pushed: ProcessEvent[] = [];
   const registry = new ChannelRegistry(
     // No server connection: the host directs no channel lifecycle here, so
@@ -186,6 +186,52 @@ describe('ChannelRegistry + EventGate roundtrip', () => {
     assert.strictEqual(pushed.length, 1);
     const event = pushed[0] as { type: string; triggerInference?: boolean };
     assert.strictEqual(event.triggerInference, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A gate's later wake rides the inbound event to the framework
+// ---------------------------------------------------------------------------
+
+describe("the gate's later wake on the inbound event", () => {
+  // Each its own gate.json, since a gate's evaluation reads its file again
+  // once its text has changed (reloadIfChanged).
+  const gates = () => {
+    const now = makeGate({ default: 'always', policies: [] }, 'now.json');
+    const batching = makeGate({ default: 'always', policies: [{ name: 'batch', match: {}, behavior: { debounce: 60_000 } }] }, 'batching.json');
+    const sleeping = makeGate({ default: 'always', policies: [] }, 'sleeping.json');
+    sleeping.setSleep(600);
+    return { now, batching, sleeping };
+  };
+  type Fields = { triggerInference?: boolean; wakeLater?: string };
+  const fieldsOf = (event: Fields) => [event.triggerInference, event.wakeLater, 'wakeLater' in event];
+
+  it('the channel registry carries a debounce batch or a sleep as wakeLater, and nothing for a wake now', () => {
+    const all = gates();
+    const seen = Object.entries(all).map(([name, gate]) => {
+      const { registry, pushed } = makeRegistry(gate.triggerVerdictCallback());
+      registry.handleIncoming('zulip', incomingParams('zulip:tracker-miner-f', 'hello'));
+      assert.strictEqual(pushed.length, 1, name);
+      return fieldsOf(pushed[0] as Fields);
+    });
+    assert.deepStrictEqual(seen, [[true, undefined, false], [false, 'debounce', true], [false, 'sleep', true]]);
+    for (const gate of Object.values(all)) gate.dispose();
+  });
+
+  it('the push handler carries a debounce batch or a sleep as wakeLater, and nothing for a wake now', async () => {
+    const all = gates();
+    const seen: unknown[] = [];
+    for (const gate of Object.values(all)) {
+      const pushed: Fields[] = [];
+      const handler = new PushHandler({ validateInbound() {} } as unknown as FeatureSetManager, (event) => { pushed.push(event); }, () => {}, gate.triggerVerdictCallback());
+      await handler.handlePushEvent('feed', {
+        featureSet: 'fs', eventId: 'push-1', timestamp: '2026-10-24T00:00:00Z',
+        payload: { content: [{ type: 'text', text: 'hello' }] }, origin: { source: 'feed' },
+      } as never, { respond: () => {}, respondError: () => {} } as never);
+      seen.push(fieldsOf(pushed[0]!));
+    }
+    assert.deepStrictEqual(seen, [[true, undefined, false], [false, 'debounce', true], [false, 'sleep', true]]);
+    for (const gate of Object.values(all)) gate.dispose();
   });
 });
 

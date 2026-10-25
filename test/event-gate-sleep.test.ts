@@ -62,7 +62,7 @@ function makeGate(now?: () => number) {
     now,
     configPath: join(TMP_DIR, 'gate.json'),
     initialConfig: { policies: [], default: 'always' },
-    emitTrace: (e) => { if (typeof e.eventType === 'string') traces.push(e.eventType); },
+    emitTrace: (e) => { if ('eventType' in e && typeof e.eventType === 'string') traces.push(e.eventType); },
     addMessage: () => '',
     requestInference: (a, r, s) => inferenceRequests.push({ agentName: a, reason: r, source: s }),
     getAgentNames: () => ['agent'],
