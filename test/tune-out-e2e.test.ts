@@ -218,8 +218,6 @@ describe('tune-out end to end', () => {
       'raw stamped originals stay view-excluded permanently',
     );
 
-    // Fleet telemetry: each notice the coordinator writes for a wake is
-    // traced as it's stored or held, and addressed to the agent woken for it.
     const addressedTo = (source: string): string[] => {
       const named = traces.filter((e) => e.type === 'message:added' && e.source === source).map((e) => e.messageId || e.deferredId);
       return traces.filter((e) => e.type === 'message:addressed' && named.includes(e.messageId)).map((e) => e.agentName!);

@@ -54,7 +54,6 @@ function puppetHarness(opts?: {
   fw.unackedDeferredWrites = [];
   fw.deferredSeq = 0;
   fw.deferredScanFrom = new Map();
-  // Fleet telemetry's record, which a drain keeps current, as the constructor seeds it.
   fw.addressedMessages = new AddressedMessages();
   fw.pendingAssistantBlocks = new Map();
   // Window releases a quiesce postponed, which every by-name flush checks

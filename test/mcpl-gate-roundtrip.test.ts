@@ -189,13 +189,7 @@ describe('ChannelRegistry + EventGate roundtrip', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// A gate's later wake rides the inbound event to the framework
-// ---------------------------------------------------------------------------
-
 describe("the gate's later wake on the inbound event", () => {
-  // Each its own gate.json, since a gate's evaluation reads its file again
-  // once its text has changed (reloadIfChanged).
   const gates = () => {
     const now = makeGate({ default: 'always', policies: [] }, 'now.json');
     const batching = makeGate({ default: 'always', policies: [{ name: 'batch', match: {}, behavior: { debounce: 60_000 } }] }, 'batching.json');

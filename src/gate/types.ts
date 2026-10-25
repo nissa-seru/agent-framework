@@ -199,8 +199,6 @@ export interface GateOptions {
  */
 export type TriggerVerdict = boolean | { trigger: false; later: 'debounce' | 'sleep' };
 
-/** A verdict's two parts, as the MCPL lanes carry them on their events:
- *  whether the wake comes now, and how the gate holds it if it does. */
 export function verdictParts(verdict: TriggerVerdict): { trigger: boolean; later?: 'debounce' | 'sleep' } {
   return typeof verdict === 'object' && verdict !== null ? { trigger: verdict.trigger, later: verdict.later } : { trigger: verdict };
 }
@@ -219,13 +217,9 @@ export interface GateDecision {
    */
   observed?: string[];
   /** Set when the gate's sleep suppressed the event's wake and holds it:
-   *  unless the rule that matches it in the policy table, read without side
-   *  effects (EventGate.probe), is a `defer` or a `skip`, which give none. A
-   *  rate limit or a sample that matches is held whatever its state, which
-   *  the sleep doesn't spend (one marked passthrough is peeked, as probe
-   *  does, to tell whether the rule after it matches); and every event is
-   *  held while gate.js would decide, which the sleep asks about no event. The sleep's end wakes the agent that
-   *  slept, or, when it names none, every agent but the subconscious. */
+   *  every event but one whose matching rule, as `EventGate.probe` reads it,
+   *  is a `defer` or a `skip`. While gate.js would decide, every event is
+   *  held. */
   heldBy?: 'sleep';
 }
 

@@ -162,20 +162,12 @@ function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, inje
     && messages.slice(messages.length - injectionTail).every((m) => m.participant.startsWith('system_context:'));
 }
 
-/** What a compile's provenance says each compiled message is a copy of
- *  (context-manager's CompileProvenance), read structurally: the raw bodies
- *  and the summaries are what carriedBodies reads. */
 interface CompileProvenanceLike {
   messages: ReadonlyArray<{ kind: string; bodies?: ReadonlyArray<{ messageId: string }>; summaries?: ReadonlyArray<{ id: string }> }>;
 }
 
-/** What a request carries of a compile's sources, by whether the request
- *  keeps the compiled message (`kept`, indexes into the compile's messages,
- *  which its provenance parallels): the stored bodies it carries raw, by
- *  their ids, in compiled order (`carried`, a body carried in part listed as
- *  one carried whole: `complete` isn't read); those carried only by
- *  messages the request drops (`dropped`); and the ids of the summaries it
- *  carries (`summaries`). */
+/** `kept` indexes the compiled messages, which context-manager's
+ *  CompileProvenance.messages parallels index by index. */
 export function carriedBodies(provenance: CompileProvenanceLike, kept: ReadonlySet<number>): { carried: string[]; dropped: string[]; summaries: string[] } {
   const carried: string[] = [];
   const dropped: string[] = [];
@@ -1867,9 +1859,6 @@ export class Agent {
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
     const sanitized = messages.map((m) => ({ ...m, content: m.content.filter(carriedBlock) }));
-    // The compiled messages kept, by their place in the compile (origin), so
-    // what the request carries is read from the compile's provenance for
-    // those alone (carriedBodies); a stand-in has none.
     const kept = sanitized.flatMap((m, i) => (m.content.length > 0 ? [i] : []));
     messages = kept.map((i) => sanitized[i]!);
     const keptSet = new Set(kept.flatMap((i) => { const from = origin[i]; return from == null ? [] : [from]; }));

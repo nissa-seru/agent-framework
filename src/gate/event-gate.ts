@@ -305,9 +305,6 @@ function entryRef(event: PendingEvent): GateEntryRef {
   };
 }
 
-/** A gate decision as a TriggerVerdict: a wake now, a wake the gate holds
- *  (in a debounce batch, or under its sleep), or none (a `defer`, a rate
- *  limit's denial, a sample's miss). */
 export function triggerVerdict(decision: GateDecision): TriggerVerdict {
   if (decision.trigger) return true;
   if (decision.heldBy === 'sleep') return { trigger: false, later: 'sleep' };
@@ -3144,20 +3141,6 @@ export class EventGate {
     return false;
   }
 
-  /**
-   * Whether the sleep, suppressing `info`'s wake, holds one
-   * (GateDecision.heldBy): unless the rule that matches it is a `defer` or a
-   * `skip`, the default's included, which give no wake. The policy table is
-   * read as `probe` reads it, with no side effect, since the sleep spends
-   * nothing: a rate limit or a sample that matches is held whatever its
-   * state, since the sleep, spending none of it, can't tell which of several
-   * events it would admit. One marked passthrough is read as `probe` reads
-   * it, its state peeked, which decides whether the rule after it matches.
-   * While gate.js would decide
-   * (GateScript.decides), every suppressed wake is held: the sleep asks it
-   * about no event, and it may keep state, so what it would answer isn't
-   * known.
-   */
   private sleepHoldsWake(info: GateEventInfo): boolean {
     if (this.gateScript.decides()) return true;
     const { behavior } = this.probe(info);

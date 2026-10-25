@@ -612,7 +612,7 @@ export type TraceEvent =
       type: 'gate:decision';
       /** The event's type, or one of the gate's own, such as `sleep:set` and a
        *  sleep's end: `sleep:expired` at its time, or `sleep:cleared` when
-       *  `wake` ends it early. */
+       *  `clearSleep` ends it early (the `wake` tool, or a host's call). */
       eventType: string;
       serverId?: string;
       channelId?: string;
@@ -958,7 +958,6 @@ export type TraceEvent =
       error?: string;
     })
 
-  // MCPL channels (mcpl/channel-registry.ts)
   /** A server's channels/register: the ids it registered. */
   | (TraceEventBase & {
       type: 'mcpl:channels-register';
@@ -1037,7 +1036,6 @@ export type TraceEvent =
       error: string;
     })
 
-  // MCPL state and checkpoints (mcpl/checkpoint-manager.ts)
   | (TraceEventBase & {
       type: 'mcpl:state_registered';
       serverId: string;
@@ -1061,7 +1059,6 @@ export type TraceEvent =
       checkpoint: string;
     })
 
-  // Server-initiated inference (mcpl/inference-router.ts)
   | (TraceEventBase & {
       type: 'mcpl:inference_start';
       serverId: string;
@@ -1147,7 +1144,6 @@ export type TraceEvent =
       since?: number;
     })
 
-  // Tune-out (tune-out/coordinator.ts, issue #77)
   | (TraceEventBase & {
       type: 'tune-out:entered';
       serverId: string;
@@ -1222,33 +1218,23 @@ export type TraceEventListener = (event: TraceEvent) => void;
 
 /**
  * A trace event as its emitter hands it to the framework, which stamps
- * `timestamp` on every event it delivers. The framework emits through a
- * method, and its components (the gate, the MCPL channel registry, push
- * handler, checkpoints, inference router and feature sets, the tune-out
- * coordinator) through hooks, that take this type, so an event the union
- * doesn't declare, a field written in the event that its entry doesn't
- * declare, or a turn's event without its turn, doesn't compile. A field a
- * spread brings in, or another value carries, isn't checked against the
- * entry.
+ * `timestamp` on every event it delivers: an event the union doesn't
+ * declare, a field written in the event that its entry doesn't declare, or a
+ * turn's event without its turn, doesn't compile. A field a spread brings
+ * in, or another value carries, isn't checked against the entry.
  */
 export type EmittedTraceEvent = TraceEvent extends infer E
   ? E extends TraceEventBase ? AgentNamed<TurnNamed<Unstamped<E>>> : never
   : never;
 
-/** A `message:added` as its emitter gives it: it names the agent whose
- *  window holds the message, `agentName: undefined` where none does (a write
- *  whose target agent is gone), so a site that forgets to doesn't compile. */
 type AgentNamed<E> = E extends { type: 'message:added' } ? E & { agentName: string | undefined } : E;
 
-/** An event of a turn's (TurnTraced) as its emitter gives it: it names the
- *  turn, `turnId: undefined` where there is none, so a site that forgets to
- *  doesn't compile. An entry with an index signature (`mcpl:coalescing`)
- *  isn't a turn's. */
+// `'turnId' extends keyof E` holds for an entry with an index signature
+// (`mcpl:coalescing`) too, so those are left as they are.
 type TurnNamed<E> = string extends keyof E ? E : 'turnId' extends keyof E ? E & { turnId: number | undefined } : E;
 
-/** `E` with `timestamp` optional. A key remapping rather than `Omit`, which
- *  would drop the declared fields of an entry with an index signature
- *  (`mcpl:coalescing`). */
+// A key remapping rather than `Omit`, which would drop the declared fields of
+// an entry with an index signature (`mcpl:coalescing`).
 type Unstamped<E> = { [K in keyof E as K extends 'timestamp' ? never : K]: E[K] } & { timestamp?: number };
 
 /**
@@ -1289,10 +1275,7 @@ export const TRACE_EVENT_TYPES = [
   'prose:draft-resent', 'prose:drafts-dismissed',
 ] as const satisfies readonly TraceEvent['type'][];
 
-/** A type the union has and the list doesn't, if any: `never` while they agree. */
 type UnlistedTraceEventType = Exclude<TraceEvent['type'], (typeof TRACE_EVENT_TYPES)[number]>;
-/** Fails to compile, naming the type, when the union gains one the list lacks
- *  (the list's `satisfies` catches the other direction). */
 const everyTraceEventTypeListed: [UnlistedTraceEventType] extends [never] ? true : UnlistedTraceEventType = true;
 void everyTraceEventTypeListed;
 

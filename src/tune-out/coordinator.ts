@@ -79,17 +79,12 @@ function thrownReason(error: unknown): string {
   }
 }
 
-/** Where the framework put a message the coordinator wrote: the agent whose
- *  window it went to, and its stored id, or, held for that agent's live
- *  turn, the id it waits under. */
 export interface TuneOutWrite {
   agent?: string;
   messageId?: string;
   deferredId?: string;
 }
 
-/** A placement for addMessage to fill, kept in `writes`: the writes a wake
- *  is for. */
 function placed(writes: TuneOutWrite[]): TuneOutWrite {
   const placement: TuneOutWrite = {};
   writes.push(placement);
@@ -97,8 +92,7 @@ function placed(writes: TuneOutWrite[]): TuneOutWrite {
 }
 
 export interface TuneOutFrameworkHooks {
-  /** Deliver a message into an agent's window (per-agent seam), saying
-   *  where it went in `placement`. */
+  /** Deliver a message into an agent's window (per-agent seam). */
   addMessage: (
     participant: string,
     content: ContentBlock[],
@@ -106,8 +100,7 @@ export interface TuneOutFrameworkHooks {
     forAgent?: string,
     placement?: TuneOutWrite,
   ) => string;
-  /** Queue an inference request for an agent, for the messages `forWrites`
-   *  places (addMessage's placements), which the wake is written for. */
+  /** Queue an inference request for an agent. */
   requestInference: (agentName: string, reason: string, source: string, forWrites?: readonly TuneOutWrite[]) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
@@ -461,8 +454,7 @@ export class TuneOutCoordinator {
         m.content.some((b) => b.type !== 'text') || (newestCut && m === shown[0])),
     ];
 
-    // Host-framed system artifacts — never voiced as anyone. The resident's
-    // wake below is for the dump and the subconscious's note.
+    // Host-framed system artifacts — never voiced as anyone.
     const forResident: TuneOutWrite[] = [];
     this.hooks.addMessage(
       'user',

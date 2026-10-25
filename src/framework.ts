@@ -1315,8 +1315,6 @@ function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined):
   if (channel && !routing.wasIn.some((c) => sameChannel(c, channel))) routing.wasIn.push(channel);
 }
 
-/** A `message:added` trace's fields for where addMessage put a message: the
- *  agent whose window holds it, and a write deferred at arrival's queue id. */
 function addedFields(placement: { agent?: string; deferredId?: string }): { agentName: string | undefined; deferredId?: string } {
   return {
     agentName: placement.agent || undefined,
@@ -2113,7 +2111,6 @@ interface LocalProviderGate {
   idleWaiters: Array<() => void>;
   deferredAuxiliary: number;
 }
-/** What an ops alert's raiser can add beside its kind, agent and message. */
 interface OpsAlertOptions {
   data?: Record<string, unknown>;
   skipLog?: boolean;
@@ -3017,11 +3014,7 @@ export class AgentFramework {
    * it; disposal drops it, and stop() clears every agent's.
    */
   private openLogical: Map<string, TurnRouting> = new Map();
-  /** Each context manager's summaries on the branch it's on, by id, to the
-   *  stored messages they cover (summaryCovers). */
   private readonly summaryCoverage = new WeakMap<ContextManager, { branch: string; covers: Map<string, ReadonlySet<string>> }>();
-  /** Fleet telemetry's addressed messages not yet delivered (noteAddressed,
-   *  deliverAddressed). In memory: a restart loses it. */
   private readonly addressedMessages = new AddressedMessages();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
@@ -3859,7 +3852,6 @@ export class AgentFramework {
           return id;
         },
         requestInference: (agentName, reason, source, provenance, after) => {
-          // A notice the gate wrote with its own wake (a self-wake's).
           if (after) framework.noteAddressed(agentName, after);
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
@@ -4068,7 +4060,6 @@ export class AgentFramework {
             return id;
           },
           requestInference: (agentName, reason, source, forWrites) => {
-            // The coordinator's own notices, written for this wake.
             for (const write of forWrites ?? []) framework.noteAddressed(agentName, write);
             framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
           },
@@ -6007,9 +5998,6 @@ export class AgentFramework {
     // traces per abort. Only the non-streaming inference path has no stream
     // driver to report for it.
     if (result && !hadStream) {
-      // The agent's latest routing is this inference's turn only while it's
-      // live: one settled is an earlier turn's, and a direct Agent
-      // inference after it has none.
       const routing = this.turnRouting.get(agentName);
       this.emitTrace({ type: 'inference:aborted', turnId: routing && !this.settledTurns.has(routing) ? routing.turnId : undefined, agentName, reason, durationMs: result.durationMs });
     }
@@ -12610,8 +12598,6 @@ export class AgentFramework {
         // The call this result answers, as this round holds it: a new round
         // that reuses the call's id holds a new entry for it.
         const owed = agent.state.pending.get(event.callId);
-        // The batch's turn, read before the hook runs, since the hook can
-        // outlast it and a newer turn start meanwhile.
         const turnId = this.turnRouting.get(event.agentName)?.turnId;
         const failures = await this.moduleRegistry.notifyToolBatchComplete(event.agentName);
         for (const failure of failures) {
@@ -12647,8 +12633,6 @@ export class AgentFramework {
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
         if (currentState.status === 'ready') {
-          // The round's turn, read before the awaits below, which a newer
-          // turn can outlast: the events of this round name it.
           const roundTurnId = this.turnRouting.get(agent.name)?.turnId;
           // Effective inline cap: agent_settings override → durable config →
           // house default, clamped to the strategy bound (see resolver).
@@ -13157,9 +13141,9 @@ export class AgentFramework {
               agent.markContextShown();
               if (currentState.supportsInjectedMessages === true) agent.markContextConsumed();
             }
-            // Delivered here only where the stream declares it carries what
-            // it's given, as the consumed mark is; otherwise the next compile
-            // delivers them.
+            // A stream carries what it's given only where it declares
+            // supportsInjectedMessages (membrane); otherwise the next compile
+            // delivers it.
             const delivered = currentState.supportsInjectedMessages === true && heard.length > 0
               ? this.deliverAddressed(agent, () => heard.map((h) => h.id), false)
               : [];
@@ -13322,8 +13306,6 @@ export class AgentFramework {
     const eventChannel = (event as { metadata?: { channelId?: unknown } }).metadata?.channelId;
     const namesChannel = typeof eventChannel === 'string' && eventChannel !== '';
     let added: { agent?: string; deferredId?: string } | undefined;
-    // Where each added message landed, for the agents a wake below is asked
-    // of (noteAddressed).
     const placements: Array<{ agent?: string; messageId?: string; deferredId?: string }> = [];
     if (response.addMessages) {
       for (const [i, msg] of response.addMessages.entries()) {
@@ -13388,9 +13370,6 @@ export class AgentFramework {
         });
         const verdict = triggerVerdict(decision);
         if (verdict !== true) {
-          // A debounce batch's end wakes every agent but the subconscious
-          // (gateWakeAgents), whatever the request named; the sleep holds the
-          // wakes it suppressed.
           if (verdict !== false && verdict.later === 'debounce') noteAddressedFor(this.gateWakeAgents());
           else if (verdict !== false) noteAddressedFor(targetAgents.filter((n) => this.agents.get(n)?.canBeTriggeredBy(source)), 'sleep');
           return;
@@ -13621,9 +13600,6 @@ export class AgentFramework {
     const placement: CoalescingPlacement = { agent: '' };
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming', ...addedFields(placement) });
-    // Addressed: a diverted message to the subconscious, whose invocations
-    // (a mention's, or the cadence's) read it; any other the gate wakes for,
-    // now or later, to the agents that wake reaches (noteAddressedForWake).
     const untargeted = (): string[] => [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
     if (divert) {
       if (this.subconsciousAgentName) this.noteAddressed(this.subconsciousAgentName, placement);
@@ -13756,10 +13732,6 @@ export class AgentFramework {
     const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(channel);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming', agentName: agent.name });
-    // Addressed when the fork is woken for it: by the router now, or by the
-    // gate later, in a debounce batch, whose end wakes every agent but the
-    // subconscious, forks included (gateWakeAgents), or under its sleep,
-    // which holds the router's wake.
     if (trigger || event.wakeLater === 'debounce' || (decision.trigger && event.wakeLater === 'sleep')) {
       this.noteAddressed(agent.name, { agent: agent.name, messageId: id }, trigger || event.wakeLater !== 'sleep' ? undefined : 'sleep');
     }
@@ -14168,7 +14140,6 @@ export class AgentFramework {
         { channelId: binding.channelId, conversationClosure: true },
       );
       this.emitTrace({ type: 'message:added', messageId: closure, source: 'conversation:closure', agentName: binding.agentName });
-      // The framework's own notice with a wake of its own.
       this.noteAddressed(binding.agentName, { agent: binding.agentName, messageId: closure });
       this.pendingRequests.push({
         agentName: binding.agentName,
@@ -14987,9 +14958,6 @@ export class AgentFramework {
         ...frozenSource(push.inboundSource),
       };
       const placement = await this.handleMcplChannelIncoming(event);
-      // The request being assembled carries it, so the wake it asked, now or
-      // held, is answered there (unless a tune-out diverted it, which
-      // noteAddressed leaves to the subconscious).
       if (assemblingFor && (push.triggerInference || push.wakeLater) && placement) this.noteAddressed(assemblingFor, placement);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
@@ -15001,25 +14969,18 @@ export class AgentFramework {
       ...(materialized ? { content: materialized.map((block) => convertBlock(block, 'attachment on push event', occ.serverId)) } : {}),
       coalescingSubject,
       // §5.2: the materialized occurrence is consumed by the request being
-      // assembled; the wake that started it is not repeated, now or held.
+      // assembled; the wake that started it is not repeated.
       ...(assemblingFor ? { assemblingFor, triggerInference: false, wakeLater: undefined } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
       ...firstViewMark,
       ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
-    // The request being assembled carries it, so the wake it asked, now or
-    // held, is answered there, as on a channel.
     if (assemblingFor && (occ.event.event.triggerInference || occ.event.event.wakeLater) && placement) this.noteAddressed(assemblingFor, placement);
     await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
     return placement;
   }
 
-  /** Whether a tune-out diverted the message out of the residents' view:
-   *  its row's (or held write's, queued or stored and not yet acked)
-   *  `tuneOut` stamp, read as their view filter reads it (truthy). `placement` is where it
-   *  is now (landedPlacement). A row that can't be read reads as not
-   *  diverted. */
   private divertedPlacement(placement: { agent?: string; messageId?: string; deferredId?: string }): boolean {
     if (placement.deferredId !== undefined) {
       return [...this.deferredMessages, ...this.unackedDeferredWrites]
@@ -15053,10 +15014,6 @@ export class AgentFramework {
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
     for (const agentName of await this.coalescedAudience(occ)) {
-      // A render placed in the agent's deferred queue is a held write this
-      // wake is for, unless a request already carried it and was answered
-      // across the awaits before this: the scheduler drops that wake
-      // (deferredWriteDone, asked as it asks it), so none is for it.
       if (readsDeferredWrite !== undefined) {
         const agent = this.agents.get(agentName);
         const to = channelId === undefined || allAmbient ? undefined : { serverId: occ.serverId, channelId };
@@ -15202,8 +15159,6 @@ export class AgentFramework {
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {
-      // A sharded body is withdrawn by its first shard's id, which its entry
-      // goes by, whichever shard the placement found.
       const removed = removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
       this.withdrawAddressedEverywhere(removed, 'removed');
@@ -15721,7 +15676,6 @@ export class AgentFramework {
         console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the wake's channel where it carries one not marked ambient, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
-          // No compile follows to withdraw what's gone (a removed write's).
           this.withdrawGoneAddressed(agentName);
           this.endPendingPrimary(agentName);
           continue;
@@ -16433,8 +16387,6 @@ export class AgentFramework {
    * `turn` is the turn the call was made in (callingTurnOf), none for a
    * call made outside the agent's current turn: a resend's destination names
    * its own channels (ownChannels) by their ids, and its sends engage it.
-   * `callTurnId` is the call's own turn (ToolCall.callerTurnId), which its
-   * prose events name, as its tool events do (callTraced).
    */
   private async handleDraftsTool(agentName: string, rawInput: unknown, turn?: TurnRouting, callId?: string, callTurnId?: number): Promise<ToolResult> {
     const input = (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) ? rawInput : {}) as Record<string, unknown>;
@@ -17922,7 +17874,6 @@ export class AgentFramework {
       id = landed[0]!.id;
     }
     this.emitTrace({ type: 'message:added', messageId: id, source: 'auto-continue', agentName: agent.name });
-    // The framework's own notice, for the wake now starting.
     this.noteAddressed(agent.name, { agent: agent.name, messageId: id });
     console.error(`[continue] ${agent.name}: continuation ${count} of ${max} starts`);
     return true;
@@ -19620,9 +19571,7 @@ export class AgentFramework {
       // it would store while the window is held.
       injections = this.storeInjections(agent, injections);
 
-      // The request's one id: named by the stream's inference-log entry and
-      // by inference:request, and given to membrane as the call's requestId
-      // option, which membrane 0.7.1 doesn't record.
+      // membrane 0.7.1 declares the call's requestId option and doesn't read it.
       const requestId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const {
         stream,
@@ -19737,8 +19686,7 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-      // The stream sends its request when driveStream first reads it: what
-      // it carries for the first time reaches the agent's provider input now.
+      // membrane's yielding stream sends its request when driveStream first reads it.
       const delivered = carried ? this.deliverAddressed(agent, carried, true, dropped, summaries) : [];
       this.emitTrace({
         type: 'inference:request', turnId: routing.turnId, agentName: agent.name, requestId,
@@ -19912,7 +19860,6 @@ export class AgentFramework {
     agent: Agent,
     stream: YieldingStream,
     requestSnapshot: InferenceToolSnapshot,
-    /** The request's id (beginAgentTurn): its inference-log entries'. */
     requestId: string,
     trigger?: InferenceRequest,
     attempt = 0,
@@ -22442,7 +22389,6 @@ export class AgentFramework {
     // and isn't noted as the resident's speech (callingTurnOf). A module
     // holds no drafts.
     if (call.name === 'drafts' && this.channelRegistry && origin.kind === 'agent') {
-      // Its prose events name the turn the call carries, as its tool events do.
       return this.draftsToolResult(origin.agentName, call.input, undefined, undefined, call.callerTurnId);
     }
 
@@ -24076,8 +24022,8 @@ export class AgentFramework {
    */
   private dispatchToolCall(agentName: string, call: ToolCall, turnId?: number): void {
     // Enrich call with caller identity so modules can resolve the calling agent,
-    // and with the turn it was made in, a refusal's trace included. Here both
-    // are the framework's to set: a turn id the call arrives with never survives.
+    // and with the turn it was made in. Here both are the framework's to set:
+    // a turn id the call arrives with never survives.
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (turnId !== undefined) enrichedCall.callerTurnId = turnId;
     else delete enrichedCall.callerTurnId;
@@ -24660,27 +24606,11 @@ export class AgentFramework {
         : this.agents.values().next().value;
   }
 
-  /**
-   * Fleet telemetry: a message stored in `placement.agent`'s store, or held
-   * for it, with a wake asked of `agentName` for it, is addressed to that
-   * agent when its window holds the message (readsStoreOf). It goes into the
-   * record (AddressedMessages) and is said (`message:addressed`) once while
-   * it's recorded, named by the id its arrival named: its stored id, or its
-   * deferred id while held. Past the record's bound it's said, `untracked`,
-   * each time its wake is asked. A write held while the host is quiesced is held by the quiesce;
-   * `held` names a sleep's hold. Nothing is recorded for a placement that
-   * names no message (a silent heartbeat's), for a held write that has gone
-   * (landedPlacement), or for a tune-out's diverted message to any agent but
-   * the subconscious, whose window alone holds it (every other agent's view
-   * filter leaves it out), whatever path asked its wake.
-   */
   private noteAddressed(
     agentName: string,
     given: { agent?: string; messageId?: string; deferredId?: string },
     held?: 'sleep',
   ): void {
-    // Named by the id its arrival named, and found by the id it's stored
-    // under now, a held write's whose drain ran before this note included.
     const name = given.deferredId ?? given.messageId;
     const placement = this.landedPlacement(given);
     if (placement.gone) return;
@@ -24698,35 +24628,14 @@ export class AgentFramework {
     });
   }
 
-  /**
-   * Whether `reader`'s window holds what is stored in `storedIn`'s store:
-   * its own, and, where that store is the residents' shared slot, every
-   * agent that reads the slot, the ordinary residents and the subconscious
-   * through its merged view (sharedSlotAgents). A fork's or a run's store is
-   * its own. It answers for stores, not messages: an ordinary resident's
-   * view also leaves out a tune-out's diverted messages, which noteAddressed
-   * addresses to the subconscious alone. An agent no longer registered has
-   * no window.
-   */
   private readsStoreOf(reader: string, storedIn: string): boolean {
     const agent = this.agents.get(reader);
-    // An agent no longer registered reads nothing: a late note for a fork
-    // disposed meanwhile records nothing its disposal could withdraw.
     if (!agent) return false;
     if (reader === storedIn) return true;
     const store = this.agents.get(storedIn);
     return !!store && this.isOrdinaryResident(store) && this.sharedSlotAgents.has(agent);
   }
 
-  /**
-   * A held placement whose write a drain has stored since, by its stored id
-   * (its body's first shard's): a note made after an await can come after
-   * the drain's one re-key (writeDrainedInOrder). A write still queued, its
-   * landing known, isn't stored, so it isn't searched for; one whose landing
-   * is unknown may be, so it is. One found nowhere keeps its deferred id
-   * while it's queued or stored and not yet acked, and is `gone` otherwise,
-   * as one a drain dropped is; one whose store can't be searched keeps it.
-   */
   private landedPlacement(placement: { agent?: string; messageId?: string; deferredId?: string }): { agent?: string; messageId?: string; deferredId?: string; gone?: true } {
     const writeId = placement.deferredId;
     if (writeId === undefined || !placement.agent) return placement;
@@ -24744,10 +24653,6 @@ export class AgentFramework {
     return queued || this.unackedDeferredWrites.some((m) => m.id === writeId) ? placement : { ...placement, gone: true };
   }
 
-  /** An MCPL event's message, whose wake the gate asked now or holds,
-   *  addressed to each agent that wake reaches: a debounce batch's end, the
-   *  agents gateWakeAgents names; a wake now, or one the sleep holds, the
-   *  agents the event names, or, naming none, its lane's (`untargeted`). */
   private noteAddressedForWake(
     event: { targetAgents?: string[]; wakeLater?: 'debounce' | 'sleep' },
     placement: { agent?: string; messageId?: string; deferredId?: string },
@@ -24757,46 +24662,25 @@ export class AgentFramework {
     for (const agentName of woken) this.noteAddressed(agentName, placement, event.wakeLater === 'sleep' ? 'sleep' : undefined);
   }
 
-  /** The agents a wake the gate gives every agent reaches (its debounce
-   *  batch's end, a sleep's end that names no agent): every agent but the
-   *  subconscious, conversation forks included. */
   private gateWakeAgents(): string[] {
     return [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
   }
 
-  /** An addressed message that won't reach its agent leaves the record, and
-   *  its `message:withdrawn` says why. */
   private withdrawAddressed(agentName: string, id: string, reason: 'removed' | 'agent-gone' | 'branch-moved' | 'dropped'): void {
     const name = this.addressedMessages.withdraw(agentName, id);
     if (name !== undefined) this.emitTrace({ type: 'message:withdrawn', messageId: name, agentName, reason });
   }
 
-  /** Every addressed message waiting for an agent that has gone leaves the
-   *  record (`agent-gone`). */
   private withdrawAddressedFor(agentName: string): void {
     for (const name of this.addressedMessages.dropAgent(agentName)) {
       this.emitTrace({ type: 'message:withdrawn', messageId: name, agentName, reason: 'agent-gone' });
     }
   }
 
-  /** Every addressed message found by `id`, whatever agent it's addressed
-   *  to, leaves the record for `reason`. */
   private withdrawAddressedEverywhere(id: string, reason: 'removed' | 'dropped'): void {
     for (const agentName of this.addressedMessages.agentsWith(id)) this.withdrawAddressed(agentName, id, reason);
   }
 
-  /**
-   * The addressed messages a request of `agent`'s carries for the first
-   * time, taken out of the record: each by its name, and in which form. A
-   * stored body the request carries (`carried`) is `whole`, and one only a
-   * summary it carries covers (`summaries`, resolved by summaryCovers) is
-   * `summary`: the first form stands, since the entry leaves the record
-   * here. A compile's request (`compiled`) also withdraws each waiting one
-   * that no request can carry any more: a stored one its window no longer
-   * holds (`branch-moved`, as after an undo or a rollback), a held one
-   * neither queued nor stored, and one the request drops (`dropped`,
-   * StartStreamResult.dropped), which every request will.
-   */
   private deliverAddressed(
     agent: Agent,
     carried: () => Iterable<string>,
@@ -24805,18 +24689,12 @@ export class AgentFramework {
     summaries?: () => Iterable<string>,
   ): AddressedDelivery[] {
     if (!this.addressedMessages.has(agent.name)) return [];
-    // Before matching, so a held entry whose write was stored without its
-    // re-key is delivered by the request that carries it; withdrawals come
-    // after, so a message the request carries is delivered, not withdrawn.
     const gone = compiled ? this.rekeyLandedAddressed(agent.name) : [];
     const delivered: AddressedDelivery[] = this.addressedMessages.deliver(agent.name, carried()).map((messageId) => ({ messageId, form: 'whole' }));
-    // Only while entries are left: a summary's sources are read for nothing else.
     const summaryIds = this.addressedMessages.has(agent.name) ? [...(summaries?.() ?? [])] : [];
     if (summaryIds.length > 0) {
       const cm = agent.getContextManager();
       const covers = summaryIds.map((id) => this.summaryCovers(cm, id));
-      // Each waiting message looked up in what the summaries cover, rather
-      // than every covered id copied: the waiting ones are bounded.
       const covered = this.addressedMessages.entriesOf(agent.name).map(([id]) => id).filter((id) => covers.some((c) => c.has(id)));
       for (const messageId of this.addressedMessages.deliver(agent.name, covered)) delivered.push({ messageId, form: 'summary' });
     }
@@ -24825,19 +24703,6 @@ export class AgentFramework {
     return delivered;
   }
 
-  /**
-   * Withdraw each of `agentName`'s waiting messages that no request can
-   * carry any more: a stored one its window no longer holds
-   * (`branch-moved`, as after an undo, a rollback or a removal), and a held
-   * one that has gone (`dropped`), found where it is now as a late note
-   * finds it (landedPlacement): one stored without its re-key (its note
-   * came after the drain, or its settle couldn't find its body's first
-   * shard, or its landing was unknown) is re-keyed instead
-   * (rekeyLandedAddressed; `gone`, when a compile has just run it). A
-   * compile checks after it matches what the request carries, and so does
-   * the scheduler where it drops an agent's
-   * wakes and starts no turn, since no compile follows then.
-   */
   private withdrawGoneAddressed(agentName: string, gone: readonly string[] = this.rekeyLandedAddressed(agentName)): void {
     for (const id of gone) this.withdrawAddressed(agentName, id, 'dropped');
     for (const [id, entry] of this.addressedMessages.entriesOf(agentName)) {
@@ -24848,18 +24713,12 @@ export class AgentFramework {
       try {
         inWindow = window.getContextManager().getMessage(id as MessageId) != null;
       } catch {
-        // A store that can't be read says nothing about the message.
         inWindow = true;
       }
       if (!inWindow) this.withdrawAddressed(agentName, id, 'branch-moved');
     }
   }
 
-  /** Re-key each of `agentName`'s held entries whose write has been stored
-   *  since by its stored id, found as a late note finds it
-   *  (landedPlacement); returns the ids of those that have gone. A compile
-   *  runs it before it matches what the request carries, so a request that
-   *  carries one delivers it. */
   private rekeyLandedAddressed(agentName: string): string[] {
     const gone: string[] = [];
     if (!this.addressedMessages.has(agentName)) return gone;
@@ -24872,19 +24731,6 @@ export class AgentFramework {
     return gone;
   }
 
-  /**
-   * The stored messages a summary of `cm`'s covers, by id: an L1's sources
-   * are messages, and a higher level's are summaries, read level by level
-   * (SummaryEntry.sourceIds). Memoized per context manager and branch,
-   * since a summary doesn't change once written, while its id is its own
-   * store's (a fork's `L1-3` isn't the residents') and its branch's: after
-   * an undo or a branch switch the strategy mints ids again from that
-   * branch's counter. Where the branch can't be read, each call starts
-   * afresh. A
-   * strategy that keeps no summary archive answers `getSummary` with null,
-   * so its summaries cover nothing here; a lookup that throws covers nothing
-   * this time, and neither it nor a summary above it is memoized.
-   */
   private summaryCovers(cm: ContextManager, id: string): ReadonlySet<string> {
     let branch: string | undefined;
     try {
@@ -24902,8 +24748,6 @@ export class AgentFramework {
     return this.summaryWalk(cm, id, memo.covers).covered;
   }
 
-  /** summaryCovers' walk, over one branch's memo: what a summary covers, and
-   *  whether every lookup it took answered. */
   private summaryWalk(cm: ContextManager, id: string, memo: Map<string, ReadonlySet<string>>): { covered: ReadonlySet<string>; whole: boolean } {
     const known = memo.get(id);
     if (known) return { covered: known, whole: true };
@@ -24913,8 +24757,6 @@ export class AgentFramework {
     } catch {
       return { covered: new Set(), whole: false };
     }
-    // Set before its sources are read, so a summary that names itself
-    // among them ends the walk.
     const covered = new Set<string>();
     memo.set(id, covered);
     let whole = true;
@@ -24926,8 +24768,6 @@ export class AgentFramework {
         for (const messageId of below.covered) covered.add(messageId);
       }
     }
-    // A lookup below that threw leaves this one unmemoized too, so it's read
-    // again next time rather than kept short.
     if (!whole) memo.delete(id);
     return { covered, whole };
   }
@@ -25202,8 +25042,6 @@ export class AgentFramework {
         this.logDeferredWriteError(msg, where, error, landed === undefined ? 'unknown' : undefined);
       }
     }
-    // A held write that was stored is found by its stored id from now on
-    // (AddressedMessages); one deferred again keeps its deferred id.
     for (const [msg, { id }] of written) if (id) this.addressedMessages.stored(msg.id, id);
     return written;
   }
@@ -26108,10 +25946,6 @@ export class AgentFramework {
   ): void {
     this.deferredMessages = this.deferredMessages.filter((m) => m !== msg);
     this.unackedDeferredWrites.push(msg);
-    // Found by its stored id from now on, as a drained write is
-    // (writeDrainedInOrder): a sharded body's first shard's (`head`), which
-    // a compile's provenance names it by. Without one (null), it's found
-    // later.
     if (head !== null) this.addressedMessages.stored(msg.id, head);
     this.noteStored(agent, msg.metadata, stored);
     this.logDeferredWriteError(msg, `held writes for ${agent.name}`, undefined, { ...landed, foundLater: true });
@@ -26133,10 +25967,6 @@ export class AgentFramework {
     const target = msg ? this.deliveryAgent(msg.forAgent) : undefined;
     if (!msg || !target || !(target === reader || (this.isOrdinaryResident(reader) && this.isOrdinaryResident(target)))) return;
     const sharded = row.bodyGroupId !== undefined;
-    // The row can be any of the body's shards. Where the store can't be
-    // scanned for its body, the module's read of the row goes on, and the
-    // entry keeps its deferred id, for a compile's search to find by the
-    // body's first shard (withdrawGoneAddressed).
     let head: MessageId | null = row.id;
     if (sharded) {
       try {
@@ -26260,8 +26090,6 @@ export class AgentFramework {
       return;
     }
     const landed = writeId !== undefined ? this.landedRow(agent.getContextManager(), writeId) : null;
-    // By its body's first shard's id, which the record keeps it by, whichever
-    // shard's id the module named.
     const removed = removeStoredMessage(agent.getContextManager(), landed?.id ?? id);
     this.withdrawAddressedEverywhere(removed, 'removed');
   }
@@ -26620,7 +26448,6 @@ export class AgentFramework {
       } });
   }
 
-  /** An alert of the framework's own, whose kind is one of OPS_ALERT_KINDS. */
   private opsAlert(kind: OpsAlertKind, agentName: string, rawMessage: string, opts?: OpsAlertOptions): void {
     this.raiseOpsAlert(kind, agentName, rawMessage, opts);
   }
@@ -26632,9 +26459,7 @@ export class AgentFramework {
    * (3) if CONNECTOME_OPS_WEBHOOK is set, a Discord post throttled to one per
    *     (agent, kind) per cooldown window — a persistent failure re-posts
    *     every ~15 min instead of flooding the channel on every occurrence.
-   * See connectome docs/observability.md. The framework's own alerts come
-   * through opsAlert, a host's and a module's through notifyOps and
-   * notifyOpsAlert.
+   * See connectome docs/observability.md.
    */
   private raiseOpsAlert(
     kind: string,
@@ -29931,10 +29756,6 @@ export class AgentFramework {
     });
   }
 
-  /** A tool call's outcome trace: a result marked an error (for an MCP tool,
-   *  one the server marked, or one the reading takes as one, such as
-   *  malformed content) is tool:failed, with its error text; anything else is
-   *  tool:completed. */
   private traceToolOutcome(module: string, agentName: string, call: ToolCall, result: ToolResult, durationMs: number, tool: string = call.name): void {
     if (result.isError) {
       this.emitTrace({ type: 'tool:failed', ...this.callTraced(agentName, call), module, tool, callId: call.id, durationMs, error: result.error || 'tool returned an error' });
@@ -29943,8 +29764,6 @@ export class AgentFramework {
     }
   }
 
-  /** Who made a tool call, and in which turn (ToolCall.callerTurnId), for its
-   *  trace events (TurnTraced): a call no agent made names none. */
   private callTraced(agentName: string | undefined, call: ToolCall): { agentName?: string; turnId: number | undefined } {
     return { ...(agentName !== undefined ? { agentName } : {}), turnId: call.callerTurnId };
   }

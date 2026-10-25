@@ -33,7 +33,6 @@ const textOf = (content: ContentBlock[]): string =>
 function cancelWith(opts: { backlogCap: number; source: string; stored: Row[]; held: Row[]; note?: string }) {
   const added: Added[] = [];
   const inferences: string[] = [];
-  // The rows each wake is for, by the ids their placements were given.
   const wakeFor = new Map<string, string[]>();
   const registry = {
     // Each channel's id is unique here, so it's shown by its id.

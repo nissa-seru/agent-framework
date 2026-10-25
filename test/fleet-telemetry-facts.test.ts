@@ -1,12 +1,3 @@
-/**
- * The facts agent-framework gives a host's fleet telemetry, on its trace:
- * the trace and ops-alert vocabularies as data; the logical turn each of a
- * turn's events belongs to; each addressed message's storage, its first
- * delivery into its agent's provider input, or its withdrawal; the holds a
- * message waits under; and each request a turn sends, with the id it gives
- * membrane as the call's option and its inference-log entry names.
- */
-
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
@@ -77,18 +68,13 @@ async function until(done: () => boolean, label: string, timeoutMs = 5000): Prom
   }
 }
 
-/** A tool round held open while `during` writes something, until that write
- *  is deferred behind the busy agent, and then `deferred` runs. Module events
- *  with text make messages and ask for inference. */
 class HoldModule implements Module {
   readonly name = 'hold';
   framework: AgentFramework | null = null;
   during: (() => unknown) | null = null;
   deferred: (() => void | Promise<void>) | null = null;
-  /** The inference its responses request, and how many messages each adds. */
   wake: true | string[] = true;
   adds = 1;
-  /** Run as a tool batch completes, before the turn goes on. */
   batchHook: (() => Promise<void>) | null = null;
 
   async onToolBatchComplete(): Promise<void> {
@@ -128,8 +114,6 @@ class HoldModule implements Module {
   }
 }
 
-/** Each turn its own responses; `injects` is what each stream declares about
- *  carrying injected messages. Records each call's options. */
 function scheduleTurns(membrane: MockMembrane, turns: NormalizedResponse[][], injects: 'declared' | 'undeclared' | 'declared false' = 'declared') {
   const streams: MockYieldingStream[] = [];
   const options: unknown[] = [];
@@ -173,16 +157,12 @@ const pushMessage = (eventId: string, body: string, extra: Record<string, unknow
   ...extra,
 }) as unknown as ProcessEvent;
 
-/** A request's first deliveries, each `whole`. */
 const whole = (...ids: string[]) => ids.map((messageId) => ({ messageId, form: 'whole' }));
 type Delivery = { messageId: string; form: string };
 
-/** The types whose union entry names a turn (TurnTraced): an entry with a
- *  `turnId` key, an open record's index signature aside. */
 type TurnTracedType = TraceEvent extends infer E
   ? E extends { type: infer T } ? (string extends keyof E ? never : 'turnId' extends keyof E ? T : never) : never
   : never;
-/** Those types as data, checked against the union both ways. */
 const TURN_TRACED_TYPES = [
   'inference:started', 'inference:completed', 'inference:aborted', 'inference:failed', 'inference:exhausted',
   'inference:tokens', 'inference:content_block', 'inference:tool_calls_yielded', 'inference:usage',
@@ -193,7 +173,6 @@ const TURN_TRACED_TYPES = [
 const everyTurnTracedTypeListed: [Exclude<TurnTracedType, (typeof TURN_TRACED_TYPES)[number]>] extends [never] ? true : false = true;
 void everyTurnTracedTypeListed;
 
-/** The trace events of `type`, as `T`. */
 function ofType<T = Record<string, unknown>>(traces: TraceEvent[], type: string): T[] {
   return traces.filter((e) => e.type === type) as unknown as T[];
 }
@@ -228,9 +207,6 @@ describe('fleet telemetry facts', () => {
     return framework;
   }
 
-  // ---------------------------------------------------------------------------
-  // Vocabularies
-
   it('TRACE_EVENT_TYPES lists each trace type once, the ones components emit among them', () => {
     assert.equal(new Set(TRACE_EVENT_TYPES).size, TRACE_EVENT_TYPES.length);
     for (const type of ['tune-out:entered', 'gate:policy-added', 'mcpl:channels-register', 'mcpl:push_event', 'inference:request', 'message:addressed']) {
@@ -244,9 +220,6 @@ describe('fleet telemetry facts', () => {
       assert.ok((OPS_ALERT_KINDS as readonly string[]).includes(kind), kind);
     }
   });
-
-  // ---------------------------------------------------------------------------
-  // The logical turn
 
   it("every event of a turn names the turn, and its tool events their agent; the next turn's id is larger", async () => {
     scheduleTurns(membrane, [
@@ -265,8 +238,6 @@ describe('fleet telemetry facts', () => {
     assert.equal(typeof first, 'number');
     assert.ok(second! > first!, `the next turn's id is larger: ${first}, ${second}`);
     const firstTurn = traces.slice(0, traces.findIndex((e) => e === (started[1] as unknown)));
-    // Every event of a type that names a turn (TurnTraced), so one without
-    // its turnId fails.
     const ofTurn = firstTurn.filter((e) => (TURN_TRACED_TYPES as readonly string[]).includes(e.type));
     for (const type of ['inference:started', 'inference:request', 'inference:content_block', 'inference:stream_resumed', 'inference:completed', 'tool:started', 'tool:completed']) {
       assert.ok(ofTurn.some((e) => e.type === type), `the turn emitted ${type}`);
@@ -287,7 +258,6 @@ describe('fleet telemetry facts', () => {
     await framework.runUntilIdle();
     const latest = ofType<{ turnId: number }>(traces, 'inference:started')[0]!.turnId;
 
-    // A call made in turn 1000, such as a script's that outlived its turn.
     internals(framework).dispatchToolCall('assistant', toolCall('late-1', 'hold--wait'), 1000);
     await framework.runUntilIdle();
     await until(() => traces.some((e) => e.type === 'tool:completed'), 'the late call to finish');
@@ -306,8 +276,6 @@ describe('fleet telemetry facts', () => {
       scheduleTurns(membrane, [[createMockResponse([text('checking'), call('c1', tool)], 'tool_use'), createMockResponse([text('done')])]]);
       const framework = await createFramework();
       const fw = internals(framework) as Internals & { buildStoredToolResultContent(...args: unknown[]): Promise<unknown> };
-      // While the round's results are stored, the agent's routing is
-      // replaced, as by a newer turn; it's put back at the round's event.
       const build = fw.buildStoredToolResultContent;
       let original: unknown;
       fw.buildStoredToolResultContent = async (...args: unknown[]) => {
@@ -407,7 +375,6 @@ describe('fleet telemetry facts', () => {
     };
     const hold = (words: string) => fw.proseDrafts.hold('assistant', [{ text: words }], 'no-destination').held[0]!.id;
     const room = { serverId: 'chat', channelId: 'room' };
-    // Only what each action here reads of the registry.
     const registry = fw.channelRegistry;
     fw.channelRegistry = {
       resolveProseTarget: () => room,
@@ -421,7 +388,6 @@ describe('fleet telemetry facts', () => {
     try {
       const dismissedId = hold('words never sent');
       await dispatched('d-1', { action: 'dismiss', draftIds: [dismissedId] }, 42, 'prose:drafts-dismissed');
-      // A dismissal whose record throws after reaching the journal.
       const failedId = hold('a dismissal that throws');
       const dismiss = (fw.proseDrafts as unknown as { dismiss: (...args: unknown[]) => unknown }).dismiss;
       (fw.proseDrafts as unknown as { dismiss: () => never }).dismiss = () => { throw new Error('the journal write failed'); };
@@ -435,7 +401,6 @@ describe('fleet telemetry facts', () => {
       }
       const resentId = hold('words to send again');
       await dispatched('d-3', { action: 'resend', draftIds: [resentId], destination: '#room' }, 44, 'prose:draft-resent');
-      // Called as its agent (a puppet's call), with the turn the call carries.
       const puppetedId = hold('a puppet dismisses this');
       await framework.executeToolCall({ id: 'd-4', name: 'drafts', input: { action: 'dismiss', draftIds: [puppetedId] }, callerAgentName: 'assistant', callerTurnId: 45 } as ToolCall);
       assert.deepEqual(ofType(traces, 'prose:drafts-dismissed').map((e) => [e.draftIds, e.turnId]),
@@ -446,9 +411,6 @@ describe('fleet telemetry facts', () => {
     }
     await framework.stop();
   });
-
-  // ---------------------------------------------------------------------------
-  // A turn's requests
 
   it("inference:request names the requestId the call gives membrane, which the inference log's entry has too, and a turn's completion its stop reason", async () => {
     const { options } = scheduleTurns(membrane, [[createMockResponse([text('hello')])]]);
@@ -485,9 +447,6 @@ describe('fleet telemetry facts', () => {
     assert.equal('stopReason' in completed[0]!, false);
     await framework.stop();
   });
-
-  // ---------------------------------------------------------------------------
-  // Addressed messages
 
   it('a message woken for at once is addressed to the agent whose window holds it, and delivered by the request its turn sends', async () => {
     scheduleTurns(membrane, [[createMockResponse([text('hi')])]]);
@@ -659,7 +618,6 @@ describe('fleet telemetry facts', () => {
       membrane: membrane.asMembrane(),
       agents: [
         { name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting: 'disabled' },
-        // Not woken by a module's events: a source it doesn't take.
         { name: 'helper', model: 'test-model', systemPrompt: 'You help.', proseRouting: 'disabled', triggerSources: ['elsewhere'] },
       ],
       modules: [module],
@@ -710,7 +668,6 @@ describe('fleet telemetry facts', () => {
 
   it("an addressed message a request carries only inside a summary ends its wait there, delivered in the summary's form", async () => {
     scheduleTurns(membrane, []);
-    // The compression's calls are answered with a summary of their own.
     membrane.complete = async () => createMockResponse([text('SUMMARY of the earlier talk')]);
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'summarized.chronicle'),
@@ -727,8 +684,6 @@ describe('fleet telemetry facts', () => {
     framework.onTrace((event) => traces.push(event));
     const fw = internals(framework);
     const filler = ' substantive'.repeat(18);
-    // Addressed while the agent sleeps, then pushed out of the recent window
-    // by the channel's traffic and compressed before the agent's next compile.
     framework.pushEvent(channelMessage('m-asleep', `are you there?${filler}`, { triggerInference: false, wakeLater: 'sleep' }));
     for (let i = 0; i < 12; i++) framework.pushEvent(channelMessage(`m-${i}`, `chatter ${i}${filler}`, { triggerInference: false, tags: ['chat:ambient'] }));
     await framework.runUntilIdle();
@@ -758,7 +713,6 @@ describe('fleet telemetry facts', () => {
       let lookups = 0;
       return {
         lookups: () => lookups,
-        // A branch switch, as after an undo: the strategy mints its ids again.
         switchTo: (to: { id: string; created: number }, now: Entries) => { branch = to; entries = now; },
         currentBranch: () => branch,
         getSummary: (id: string) => { lookups++; return entries[id] ?? null; },
@@ -777,7 +731,6 @@ describe('fleet telemetry facts', () => {
     assert.equal(residents.lookups(), before, 'read once per context manager and branch');
     residents.switchTo({ id: 'undone', created: 2 }, { 'L1-0': { sourceLevel: 0, sourceIds: ['m-7'] } });
     assert.deepEqual([...fw.summaryCovers(residents, 'L1-0')], ['m-7'], "another branch's L1-0 isn't the first branch's");
-    // A branch is its id and its creation time together.
     residents.switchTo({ id: 'undone', created: 3 }, { 'L1-0': { sourceLevel: 0, sourceIds: ['m-8'] } });
     assert.deepEqual([...fw.summaryCovers(residents, 'L1-0')], ['m-8'], 'a branch made again under the same id is another branch');
     assert.deepEqual([...fw.summaryCovers(archive({}), 'L1-0')], [], 'no archive covers nothing');
@@ -789,7 +742,6 @@ describe('fleet telemetry facts', () => {
     assert.deepEqual([...fw.summaryCovers(flaky, 'L1-0')], [], 'a lookup that throws covers nothing');
     broken = false;
     assert.deepEqual([...fw.summaryCovers(flaky, 'L1-0')], ['m-9'], 'and is read again later');
-    // A summary above one whose lookup threw isn't kept short either.
     let brokenBelow = true;
     const flakyBelow = {
       currentBranch: () => ({ id: 'main', created: 1 }),
@@ -802,8 +754,6 @@ describe('fleet telemetry facts', () => {
     assert.deepEqual([...fw.summaryCovers(flakyBelow, 'L2-0')], [], 'its source threw');
     brokenBelow = false;
     assert.deepEqual([...fw.summaryCovers(flakyBelow, 'L2-0')], ['m-10'], 'read again once its source answers');
-    // Nor one whose first source threw and whose last answered, nor one two
-    // levels above a lookup that threw.
     let brokenFirst = true;
     const flakySiblings = {
       currentBranch: () => ({ id: 'main', created: 1 }),
@@ -819,7 +769,6 @@ describe('fleet telemetry facts', () => {
     assert.deepEqual([...fw.summaryCovers(flakySiblings, 'L3-0')].sort(), ['m-11', 'm-12'], 'read again, two levels up, once it answers');
     const looped = archive({ 'L2-0': { sourceLevel: 1, sourceIds: ['L2-0', 'L1-1'] }, 'L1-1': { sourceLevel: 0, sourceIds: ['m-3'] } });
     assert.deepEqual([...fw.summaryCovers(looped, 'L2-0')], ['m-3'], 'a summary among its own sources ends the walk');
-    // A manager whose branch can't be read starts afresh each call, and its walk still ends.
     let unbranched = 0;
     const noBranch = {
       currentBranch: () => { throw new Error('no branch'); },
@@ -847,8 +796,6 @@ describe('fleet telemetry facts', () => {
     assert.deepEqual(fw.deliverAddressed(agent, () => ['m-3'], false, undefined, () => ['L1-0']), [...whole('m-3'), { messageId: 'm-2', form: 'summary' }]);
     assert.equal(lookups, 1);
     assert.deepEqual(fw.addressedMessages.entriesOf('assistant').map(([id]) => id), ['m-4'], 'one no summary covers still waits');
-    // Each waiting message is looked up in what a summary covers; the
-    // coverage, as long as the history it summarizes, isn't copied.
     const summaryCovers = fw.summaryCovers;
     fw.summaryCovers = () => ({ has: (id: string) => id === 'm-4', [Symbol.iterator]: () => { throw new Error('the coverage was copied'); } }) as unknown as ReadonlySet<string>;
     try {
@@ -911,8 +858,6 @@ describe('fleet telemetry facts', () => {
     framework.pushEvent(channelMessage('m-t', 'tuned out'));
     await framework.runUntilIdle();
     assert.deepEqual(ofType(traces, 'message:addressed').map((e) => e.agentName), ['Subconscious']);
-    // A debounce batch's end wakes every agent but the subconscious, so a
-    // message the batch holds isn't addressed to it, though it reads the slot.
     fw.tuneOutCoordinator = { onIncoming: () => null, stop: () => {} };
     framework.pushEvent(channelMessage('m-b', 'batched', { triggerInference: false, wakeLater: 'debounce' }));
     await framework.runUntilIdle();
@@ -929,7 +874,6 @@ describe('fleet telemetry facts', () => {
     scheduleTurns(membrane, [[createMockResponse([text('hi')])]]);
     const framework = await createFramework({ gate: { policies: [], default: 'always' } });
     const fw = internals(framework);
-    // A turn first, so the bounce has the turn's routing to read.
     framework.pushEvent(go());
     await framework.runUntilIdle();
     const before = ofType(traces, 'message:addressed').length;
@@ -978,12 +922,10 @@ describe('fleet telemetry facts', () => {
     const gone = cm.addMessage('user', [text('gone from the branch')]);
     fw.noteAddressed('assistant', { agent: 'assistant', messageId: removed });
     fw.noteAddressed('assistant', { agent: 'assistant', messageId: gone });
-    // Held, then dropped from the queue unstored.
     fw.deferredMessages.push({ id: 'never-stored' });
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'never-stored' });
     fw.deferredMessages.length = 0;
     assert.equal(fw.removePlacement({ agent: 'assistant', messageId: removed }), true);
-    // Taken from the store behind the record's back, as an undo would.
     removeStoredMessage(cm as unknown as ContextManager, gone as MessageId);
     framework.pushEvent(go());
     await framework.runUntilIdle();
@@ -1044,9 +986,6 @@ describe('fleet telemetry facts', () => {
     const [removed, kept] = held();
     assert.deepEqual(ofType(traces, 'message:addressed').filter((e) => e.messageId === kept).map((e) => e.agentName), ['assistant', 'helper'], 'premise: addressed to both');
     assert.deepEqual(ofType(traces, 'message:withdrawn').map((e) => [e.messageId, e.agentName, e.reason]), [[removed, 'assistant', 'removed'], [removed, 'helper', 'removed']]);
-    // The assistant's boundary stores it and delivers it there. The helper's
-    // turns for both ran while they were held behind the assistant's turn, so
-    // for the helper it's still waiting, by its stored id.
     const resumed = ofType<{ agentName: string; delivered?: Delivery[] }>(traces, 'inference:stream_resumed').filter((e) => e.agentName === 'assistant');
     assert.deepEqual(resumed.flatMap((e) => e.delivered ?? []), whole(kept!));
     const waiting = internals(framework).addressedMessages.entriesOf('helper');
@@ -1097,7 +1036,6 @@ describe('fleet telemetry facts', () => {
     const head = cm.addMessage('user', [text('LONG')]);
     const second = cm.getMessageWindow(0, cm.getMessageCount()).messages.find((m) => m.id !== head)!;
     assert.equal(second.bodyGroupId, 'long-body', 'premise: a later shard of the body');
-    // A held sharded write a drain stored before its wake's note is found by its first shard.
     const heldHead = cm.addMessage('user', [text('LONG')], { deferredWriteId: 'w-long' } as never);
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-long' });
     assert.deepEqual(fw.addressedMessages.entriesOf('assistant').map(([id, e]) => [id, e.name]), [[heldHead, 'w-long']]);
@@ -1105,12 +1043,9 @@ describe('fleet telemetry facts', () => {
     fw.noteAddressed('assistant', { agent: 'assistant', messageId: head });
     fw.removeMessage(second.id);
     assert.equal(cm.getMessage(head), null, 'premise: the whole body is removed');
-    // A held write that landed, recorded by its stored id as a drain leaves it.
     const landed = cm.addMessage('user', [text('landed')], { deferredWriteId: 'w-landed' } as never);
     fw.addressedMessages.add('assistant', landed, 'assistant', true);
     fw.removeMessage(heldHandle('w-landed'));
-    // The coalescer's removal of a drained sharded write, which it finds by
-    // its newest shard above the consumed watermark: withdrawn by the first.
     const coalesced = cm.addMessage('user', [text('LONG')], { deferredWriteId: 'w-coalesced' } as never);
     fw.addressedMessages.add('assistant', coalesced, 'assistant', true, 'w-coalesced');
     const reader = fw.agents.get('assistant')! as unknown as { getConsumedWatermark(): unknown };
@@ -1125,25 +1060,19 @@ describe('fleet telemetry facts', () => {
     const framework = await createFramework();
     const fw = internals(framework) as Internals & { landedRow(cm: unknown, writeId: string): unknown };
     const cm = fw.agents.get('assistant')!.getContextManager() as unknown as { addMessage(p: string, c: ContentBlock[], m?: unknown): string };
-    // Stored by a drain before the note, so the drain's re-key found nothing to re-key.
     const stored = cm.addMessage('user', [text('stored meanwhile')], { deferredWriteId: 'w-stored' });
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-stored' });
-    // Neither queued, stored, nor stored and not yet acked: gone, as a dropped write is.
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-nowhere' });
-    // Queued, its landing unknown, and stored after all: found by its stored id.
     const maybe = cm.addMessage('user', [text('landed though unknown')], { deferredWriteId: 'w-unknown' });
     fw.deferredMessages.push({ id: 'w-unknown', landing: 'unknown' } as { id: string });
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-unknown' });
     fw.deferredMessages.length = 0;
-    // Queued, its landing unknown, and found nowhere: it keeps its deferred id.
     fw.deferredMessages.push({ id: 'w-doubtful', landing: 'unknown' } as { id: string });
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-doubtful' });
     fw.deferredMessages.length = 0;
-    // Stored and not yet acked, though no search finds it: it keeps its deferred id.
     fw.unackedDeferredWrites.push({ id: 'w-unacked' });
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-unacked' });
     fw.unackedDeferredWrites.length = 0;
-    // Still queued: no store is searched for it.
     const landedRow = fw.landedRow;
     let searches = 0;
     fw.landedRow = (...args) => { searches++; return landedRow.apply(fw, args); };
@@ -1151,7 +1080,6 @@ describe('fleet telemetry facts', () => {
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-queued' });
     fw.deferredMessages.length = 0;
     assert.equal(searches, 0, 'a queued write is not searched for');
-    // A store whose search throws.
     fw.landedRow = () => { throw new Error('the store is unreadable'); };
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-unsearchable' });
     fw.landedRow = landedRow;
@@ -1178,11 +1106,8 @@ describe('fleet telemetry facts', () => {
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-flushed' });
     const row = cm.addMessage('user', [text('diverted')], { tuneOut });
     fw.noteAddressed('assistant', { agent: 'assistant', messageId: row });
-    // A held write a drain stored meanwhile, noted by its deferred id: found
-    // stored first, then its row's stamp read.
     cm.addMessage('user', [text('diverted, then drained')], { tuneOut, deferredWriteId: 'w-drained' });
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-drained' });
-    // A held write not diverted, for contrast.
     fw.deferredMessages.push({ id: 'w-plain' });
     fw.noteAddressed('assistant', { agent: 'assistant', deferredId: 'w-plain' });
     assert.deepEqual(ofType(traces, 'message:addressed').map((e) => e.messageId), ['w-plain']);
@@ -1213,15 +1138,12 @@ describe('fleet telemetry facts', () => {
     await render('w-render');
     done = true;
     await render('w-answered');
-    // Asked with no channel for a render every notice of which was ambient,
-    // and for one off any channel, as the scheduler asks.
     done = false;
     await render('w-ambient', { allAmbient: true });
     await render('w-feed', { scope: { kind: 'featureSet', id: 'feed.items' } });
     assert.deepEqual(ofType(traces, 'message:addressed').map((e) => e.messageId), ['w-render', 'w-ambient', 'w-feed']);
     const channel = { serverId: 'feed', channelId: 'chat:room' };
     assert.deepEqual(asked, [['w-render', channel], ['w-answered', channel], ['w-ambient', undefined], ['w-feed', undefined]], "asked as the scheduler asks it");
-    // An audience member gone across the audience's await is asked nothing.
     const audience = fw.coalescedAudience;
     fw.coalescedAudience = async () => ['ghost'];
     try {
@@ -1244,7 +1166,6 @@ describe('fleet telemetry facts', () => {
     const agent = fw.agents.get('assistant')! as unknown as { abortInference(reason?: string): unknown; state: unknown };
     const routing = fw.turnRouting.get('assistant')! as unknown as { turnId: number };
     assert.ok(fw.settledTurns.has(routing), 'premise: the turn has settled');
-    // A direct inference with no stream, after the framework's turn ended.
     const abort = agent.abortInference;
     agent.abortInference = () => ({ durationMs: 1 });
     try {
@@ -1268,24 +1189,18 @@ describe('fleet telemetry facts', () => {
     fw.deliverAddressed(agent, () => [], true);
     assert.deepEqual(fw.addressedMessages.entriesOf('assistant'), [[stored, { name: 'w-landed', storedIn: 'assistant', stored: true }]]);
     fw.addressedMessages.withdraw('assistant', stored);
-    // Found by the compile whose request carries it, which delivers it.
     fw.addressedMessages.add('assistant', 'w-carried', 'assistant', false);
     const carried = cm.addMessage('user', [text('carried at once')], { deferredWriteId: 'w-carried' });
     assert.deepEqual(fw.deliverAddressed(agent, () => [carried], true), whole('w-carried'));
-    // Queued, its landing unknown, and stored after all: the same.
     fw.addressedMessages.add('assistant', 'w-maybe', 'assistant', false);
     const maybe = cm.addMessage('user', [text('landed though unknown')], { deferredWriteId: 'w-maybe' });
     fw.deferredMessages.push({ id: 'w-maybe', landing: 'unknown' } as { id: string });
     assert.deepEqual(fw.deliverAddressed(agent, () => [maybe], true), whole('w-maybe'));
     fw.deferredMessages.length = 0;
-    // One the request carries is delivered, though its window no longer
-    // holds it by the time the request is traced (an undo during the
-    // compile's awaits): delivery comes before withdrawal.
     const undone = cm.addMessage('user', [text('carried, then undone')]);
     fw.addressedMessages.add('assistant', undone, 'assistant', true);
     removeStoredMessage(cm as unknown as ContextManager, undone as MessageId);
     assert.deepEqual(fw.deliverAddressed(agent, () => [undone], true), whole(undone));
-    // Stored and not yet acked, though not found: it waits.
     fw.unackedDeferredWrites.push({ id: 'w-unacked' });
     fw.addressedMessages.add('assistant', 'w-unacked', 'assistant', false);
     fw.deliverAddressed(agent, () => [], true);
@@ -1322,7 +1237,6 @@ describe('fleet telemetry facts', () => {
     const undone = cm.addMessage('user', [text('undone before its turn')]);
     fw.noteAddressed('assistant', { agent: 'assistant', messageId: undone });
     cm.removeMessage(undone);
-    // A wake whose write is gone too starts no turn (deferredWriteDone).
     fw.pendingRequests.push({ agentName: 'assistant', reason: 'test', source: 'test', timestamp: Date.now(), readsDeferredWrite: 'w-gone' });
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 0, 'premise: no turn started');
@@ -1408,20 +1322,14 @@ describe('fleet telemetry facts', () => {
       event: { lane: 'push', event },
     });
     const channel = { kind: 'channel', id: 'chat:room' };
-    // On a channel: a wake asked now, and one the sleep held (the gate's
-    // verdict: no wake now, a wake later); and off any channel.
     await fw.deliverCoalesced(occurrence(pushMessage('e-1', 'on the channel'), channel), undefined, 'assistant');
     await fw.deliverCoalesced(occurrence(pushMessage('e-2', 'held by the sleep', { triggerInference: false, wakeLater: 'sleep' }), channel), undefined, 'assistant');
     await fw.deliverCoalesced(occurrence(pushMessage('e-3', 'off any channel'), { kind: 'featureSet', id: 'feed.items' }), undefined, 'assistant');
-    // Ones whose push asked no wake aren't, on a channel or off one.
     await fw.deliverCoalesced(occurrence(pushMessage('e-4', 'no wake', { triggerInference: false }), channel), undefined, 'assistant');
     await fw.deliverCoalesced(occurrence(pushMessage('e-5', 'no wake', { triggerInference: false }), { kind: 'featureSet', id: 'feed.items' }), undefined, 'assistant');
-    // Nor one a tune-out diverts out of the resident's view.
     fw.tuneOutCoordinator = { onIncoming: () => ({ epochId: 'e1' }), stop: () => {} };
     await fw.deliverCoalesced(occurrence(pushMessage('e-6', 'diverted'), channel), undefined, 'assistant');
     fw.tuneOutCoordinator = null;
-    // Off any channel, one the sleep held is answered there as on one: the
-    // wake it held isn't repeated.
     await fw.deliverCoalesced(occurrence(pushMessage('e-7', 'held off any channel', { triggerInference: false, wakeLater: 'sleep' }), { kind: 'featureSet', id: 'feed.items' }), undefined, 'assistant');
     const stored = ofType<{ messageId: string; source: string }>(traces, 'message:added')
       .filter((e) => e.source === 'mcpl:channel-incoming' || e.source === 'mcpl:push-event').map((e) => e.messageId);
@@ -1440,7 +1348,6 @@ describe('fleet telemetry facts', () => {
       name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'disabled',
     });
     contextManager.addMessage('user', [text('Run once.')]);
-    // Recorded behind the record's back, in a window the run's compile doesn't read.
     const elsewhere = [1, 2].map((n) => fw.agents.get('assistant')!.getContextManager().addMessage('user', [text(`for the worker ${n}`)]));
     for (const id of elsewhere) fw.addressedMessages.add('worker', id, 'assistant', true);
     await framework.runEphemeralToCompletion(agent, contextManager);
@@ -1453,7 +1360,6 @@ describe('fleet telemetry facts', () => {
     const framework = await createFramework();
     const fw = internals(framework);
     for (let i = 0; i <= AddressedMessages.LIMIT_PER_AGENT; i++) fw.noteAddressed('assistant', { agent: 'assistant', messageId: `m-${i}` });
-    // Asked again: nothing past the bound is remembered, so it's said again.
     fw.noteAddressed('assistant', { agent: 'assistant', messageId: `m-${AddressedMessages.LIMIT_PER_AGENT}` });
     const addressed = ofType<{ messageId: string; untracked?: true }>(traces, 'message:addressed');
     assert.equal(addressed.length, AddressedMessages.LIMIT_PER_AGENT + 2);
@@ -1521,9 +1427,6 @@ describe('fleet telemetry facts', () => {
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Holds
-
   it("a sleep's set names its end, and wake ending it early is traced", async () => {
     const framework = await createFramework({ gate: { policies: [], default: 'always' } });
     const fw = internals(framework);
@@ -1549,7 +1452,6 @@ describe("fleet telemetry facts on a channel's fork", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'telemetry-forks-'));
     membrane = new MockMembrane();
-    // Every turn a fork starts answers and ends.
     scheduleTurns(membrane, []);
     traces = [];
   });
@@ -1578,9 +1480,6 @@ describe("fleet telemetry facts on a channel's fork", () => {
     await framework.runUntilIdle();
     framework.pushEvent(mentioned('m-2', 'after the sleep', { triggerInference: false, wakeLater: 'sleep' }));
     framework.pushEvent(mentioned('m-3', 'in the batch', { triggerInference: false, wakeLater: 'debounce' }));
-    // Not mentioned, so the router wouldn't wake the fork; a batch's end
-    // wakes every agent but the subconscious, forks included, and the sleep holds
-    // only the router's wake.
     framework.pushEvent(channelMessage('m-4', 'chatter', { triggerInference: false, wakeLater: 'debounce' }));
     framework.pushEvent(channelMessage('m-5', 'chatter asleep', { triggerInference: false, wakeLater: 'sleep' }));
     framework.pushEvent(mentioned('m-6', 'vetoed', { triggerInference: false }));
@@ -1680,7 +1579,6 @@ describe("fleet telemetry facts on a channel's fork", () => {
     const fw = internals(framework);
     await fw.handleMcplChannelIncoming({ ...mentioned('m-1', 'first'), triggerInference: false });
     assert.ok(fw.agents.has(fork));
-    // Recorded behind the record's back, so nothing the fork compiles carries them.
     for (const id of ['for-the-fork-1', 'for-the-fork-2']) fw.addressedMessages.add(fork, id, fork, false);
     fw.disposeConversationAgent(fork);
     assert.deepEqual(ofType(traces, 'message:withdrawn').map((e) => [e.messageId, e.agentName, e.reason]),
@@ -1814,25 +1712,18 @@ describe("the gate's verdict on an inbound message", () => {
       skipByRule: asleep({ policies: [{ name: 'quiet', match: {}, behavior: 'skip' }], default: 'always' }),
       deferByRule: asleep({ policies: [{ name: 'later', match: {}, behavior: 'defer' }], default: 'always' }),
       limited: asleep({ policies: [limit], default: 'defer' }),
-      // Its one token spent before the sleep.
       spent: asleep({ policies: [limit], default: 'defer' }),
-      // A sampler that wouldn't fire for this message.
       sampled: asleep({ policies: [{ name: 'sample', match: {}, behavior: { passive_sample: { every: 3 } } }], default: 'defer' }),
-      // One with passthrough falls through to the rule after it: the default's defer, or a wake.
       sampledPastToDefer: asleep({ policies: [{ name: 'sample', match: {}, behavior: { passive_sample: { every: 3 } }, passthrough: true }], default: 'defer' }),
       sampledPastToWake: asleep({ policies: [
         { name: 'sample', match: {}, behavior: { passive_sample: { every: 3 } }, passthrough: true },
         { name: 'wake', match: {}, behavior: 'always' },
       ], default: 'defer' }),
-      // A passthrough limit with its token matches; spent, it falls through to the default's defer.
       limitedPast: asleep({ policies: [{ ...limit, passthrough: true }], default: 'defer' }),
       spentPast: asleep({ policies: [{ ...limit, passthrough: true }], default: 'defer' }),
       scripted: asleep({ policies: [], default: 'defer' }, `export default () => null;`),
-      // A gate.js that loads with no decision function falls through to the
-      // policies, as does one whose import fails with an empty message.
       broken: asleep({ policies: [], default: 'defer' }, `export const notAFunction = 1;`),
       silentlyBroken: asleep({ policies: [], default: 'defer' }, `throw new Error('');`),
-      // One whose worker dies after it first loaded.
       dying: asleep({ policies: [], default: 'defer' }, [
         `import { existsSync, writeFileSync } from 'node:fs';`,
         `const died = new URL('./died', import.meta.url);`,
@@ -1850,7 +1741,6 @@ describe("the gate's verdict on an inbound message", () => {
         assert.equal(verdict(g), true, 'premise: the token is taken awake');
         g.gate.setSleep(600);
       }
-      // Each asked twice: the sleep's check spends nothing, so its answer holds.
       for (let i = 0; i < 2; i++) {
         assert.equal(verdict(gates.deferByDefault), false);
         assert.equal(verdict(gates.skipByRule), false);
@@ -1863,7 +1753,6 @@ describe("the gate's verdict on an inbound message", () => {
         assert.deepEqual(verdict(gates.limitedPast), held);
         assert.equal(verdict(gates.spentPast), false, 'a spent passthrough limit falls through to the defer');
       }
-      // Awake, the limit still has its token, and the sampler its count.
       gates.limited.gate.clearSleep();
       assert.equal(verdict(gates.limited), true, "the sleep's checks spent no token");
       assert.equal(verdict(gates.limited), false);
@@ -1881,17 +1770,13 @@ describe("the gate's verdict on an inbound message", () => {
       assert.ok(gates.silentlyBroken.gate.getStatus().script.lastError, 'whose failure its status still reports');
       await until(() => gates.dying.gate.getStatus().script.lastError === 'later', 'the worker to die', 15_000);
       await until(() => verdict(gates.dying) === false, "the worker's exit to be seen", 5_000);
-      // Awake, the next event finds the dead worker unanswering and respawns
-      // it, as a wedged one, and the respawned gate.js decides again.
       gates.dying.gate.clearSleep();
       verdict(gates.dying);
       gates.dying.gate.setSleep(600);
       await until(() => JSON.stringify(verdict(gates.dying)) === JSON.stringify(held), 'the respawned gate.js to decide', 15_000);
-      // Past the reload's throttle, as the clock goes on during a sleep.
       for (const g of [gates.removed, gates.edited, gates.replaced]) assert.deepEqual(verdict(g), held, 'premise: held while its gate.js decides');
       type ScriptWorker = { threadId: number; once(event: 'exit', listener: () => void): void; listeners(event: 'exit'): Array<(code: number) => void> };
       const replacedWorker = (gates.replaced.gate as unknown as { gateScript: { worker?: ScriptWorker } }).gateScript.worker!;
-      // Its exit listeners, taken while it runs: Node drops them once it has exited.
       const replacedExit = replacedWorker.listeners('exit');
       const editedWorker = (gates.edited.gate as unknown as { gateScript: { worker?: ScriptWorker & { emit(event: 'message', m: unknown): void } } }).gateScript.worker!;
       rmSync(join(gates.removed.dir, 'gate.js'));
@@ -1900,18 +1785,14 @@ describe("the gate's verdict on an inbound message", () => {
       clock += 60_000;
       assert.equal(verdict(gates.removed), false, 'gate.js removed during the sleep no longer decides');
       assert.equal(verdict(gates.edited), false, 'nor does one edited during the sleep while it reloads');
-      // A load its old worker, still stopping, reports late speaks for nothing.
       editedWorker.emit('message', { type: 'ready', error: null });
       assert.equal(verdict(gates.edited), false, "nor after its old worker's late report of a load");
       await until(() => gates.edited.gate.getStatus().script.ready, 'the edited gate.js to load', 15_000);
       assert.equal(verdict(gates.edited), false, 'nor once it has loaded with no decision function');
-      // A gate.js replaced by one that decides holds again, its old worker's
-      // exit, which comes after, changing nothing.
       assert.equal(verdict(gates.replaced), false, 'premise: reloading');
       await until(() => gates.replaced.gate.getStatus().script.ready, 'the replaced gate.js to load', 15_000);
       if (replacedWorker.threadId !== -1) await new Promise<void>((resolve) => replacedWorker.once('exit', resolve));
       assert.deepEqual(verdict(gates.replaced), held, "its old worker's exit leaves the new one deciding");
-      // However late that exit is reported, after the new one has loaded.
       for (const listener of replacedExit) listener(1);
       assert.deepEqual(verdict(gates.replaced), held, "an exit of its old worker reported late leaves the new one deciding");
     } finally {

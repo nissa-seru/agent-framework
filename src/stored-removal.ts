@@ -90,8 +90,7 @@ export function removeStoredMessages(cm: Removals, first: StoredLike, last: Stor
  * Remove one stored message by its id, with the rest of its body when it's
  * in one: a module or a coalescer removes a message it added by the id
  * `addMessage` returned, which for a long message stored in shards is its
- * first shard's. Returns the id of what it removed as its body goes by
- * (bodyHeadId), whichever shard's id it was given.
+ * first shard's.
  */
 export function removeStoredMessage(cm: ContextManager, id: MessageId): MessageId {
   const message = cm.getMessage(id) as StoredLike | null;
@@ -111,12 +110,8 @@ export function removeStoredMessage(cm: ContextManager, id: MessageId): MessageI
   return run.fromId as MessageId;
 }
 
-/**
- * The id a stored body goes by, given any of its shards' ids: its first
- * shard's, the id `addMessage` returned and a compile's provenance names it
- * by (context-manager's RawBodySource.messageId). The id itself for a
- * message outside any body, or one the store's branch doesn't hold.
- */
+/** context-manager's RawBodySource.messageId names a stored body by its
+ *  first shard's id. */
 export function bodyHeadId(cm: ContextManager, id: MessageId): MessageId {
   const message = cm.getMessage(id) as StoredLike | null;
   if (!message?.bodyGroupId) return id;

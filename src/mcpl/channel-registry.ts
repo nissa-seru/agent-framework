@@ -449,10 +449,6 @@ interface McplChannelIncomingEvent {
    *  when picking a turn's frozen speech locus. */
   tags?: string[];
   triggerInference?: boolean;
-  /** Set by the host's gate when it holds the message's wake rather than
-   *  waking its agent now (triggerInference false): `debounce`, in the
-   *  batch its policy is collecting, or `sleep`, where the gate's sleep
-   *  suppressed the wake. */
   wakeLater?: 'debounce' | 'sleep';
   targetAgents?: string[];
   /** Host acceptance time (epoch ms), stamped where the message is admitted. */

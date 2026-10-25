@@ -19,7 +19,6 @@ function harness() {
   const outcomes: any[] = [];
   f.primaryAgentName = 'a';
   f.stillUnknownSaid = new Set();
-  // Fleet telemetry's record, which a drain keeps current, as the constructor seeds it.
   f.addressedMessages = new AddressedMessages();
   f.deliveryAgent = () => agent;
   f.storedCountOf = () => count;
@@ -168,12 +167,9 @@ test("fleet telemetry: a held write settled by a later shard's row is found by i
     h.f.deferredMessages = [a];
     h.f.unackedDeferredWrites = [];
     h.f.addressedMessages.add('a', 'a', 'a', false);
-    // A module names the second shard's row.
     h.f.settleByCopy(agent, cm.getMessage(second.id));
     assert.deepEqual(h.f.unackedDeferredWrites, [a], 'premise: settled as found');
     assert.deepEqual(h.f.addressedMessages.entriesOf('a').map(([id]: [string]) => id), [head]);
-    // Where the store can't be scanned for the body, the read goes on, and
-    // the entry keeps its deferred id.
     const b = Object.assign(h.msg('b', 2), { landing: 'unknown' });
     const bHead = cm.addMessage('user', [{ type: 'text', text: 'another long message' }], { deferredWriteId: 'b' } as never);
     const bSecond = cm.getMessageWindow(0, cm.getMessageCount()).messages.find((m) => m.bodyGroupId && m.id !== bHead && m.id !== head && m.id !== second.id)!;
@@ -190,8 +186,6 @@ test("fleet telemetry: a held write settled by a later shard's row is found by i
     }
     assert.deepEqual(h.f.unackedDeferredWrites, [a, b], 'premise: settled as found');
     assert.ok(h.f.addressedMessages.entriesOf('a').some(([id, e]: [string, { stored: boolean }]) => id === 'b' && !e.stored), 'kept by its deferred id');
-    // Once its store can be searched, a compile's check finds it by the
-    // body's first shard, though it isn't acked yet.
     h.f.agents = new Map([['a', agent]]);
     h.f.withdrawGoneAddressed('a');
     assert.ok(h.f.addressedMessages.entriesOf('a').some(([id, e]: [string, { stored: boolean }]) => id === bHead && e.stored), "found by its body's first shard");
