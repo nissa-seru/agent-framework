@@ -29788,7 +29788,9 @@ export class AgentFramework {
    * decision, before the notices the turn's start writes itself (the locus
    * notice among them), and before the agent's answer to the wake.
    *
-   * - A wake's one line whose event is still the newest entry is left out:
+   * - A line whose event the delivery agent has read and answered is left
+   *   out (wakeLineDone, as the wake's drop judges it).
+   * - A wake's one line left whose event is still the newest entry is left out:
    *   no message follows the wake's, so it is the wake's whole cause, and the
    *   start's token defers an arrival into the window past its request. (The
    *   start's own notices, written after this, aren't messages a reply could
@@ -29808,10 +29810,11 @@ export class AgentFramework {
    *   written only if another fresh start of the wake comes (a provider
    *   hold's release, a requeue): this start's request goes without them.
    *
-   * A line left out is traced. Each line is written once (placedWakeLines),
-   * across the wake's retries and holds, whichever copy of its trigger a
-   * start carries: every request for the wake carries the same line. A line
-   * left out, or whose write fails, stays undecided for a later fresh start.
+   * A line left out as the newest entry or for a held slot is traced. Each
+   * line is written once (placedWakeLines), across the wake's retries and
+   * holds, whichever copy of its trigger a start carries: every request for
+   * the wake carries the same line. A line left out, or whose write fails,
+   * stays undecided for a later fresh start.
    */
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
     const slot = this.deliveryAgent();

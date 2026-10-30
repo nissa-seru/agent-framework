@@ -155,46 +155,50 @@ describe('Conversation routing', () => {
     }
   });
 
-  it("a fork that read and answered an ambient message before its debounced batch fired isn't woken by the batch", async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
-    const framework = await AgentFramework.create({
-      storePath: join(tempDir, 'test.chronicle'),
-      membrane: membrane.asMembrane(),
-      agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
-      modules: [],
-      conversations: { templateAgent: 'trunk' },
-      gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'], tagsAny: ['chat:ambient'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
-    });
-    try {
-      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
-      await framework.runUntilIdle();
-      const fork = forkName('slack:D1', 1);
-      assert.ok(framework.getAgent(fork), 'premise: the DM spawned its fork');
-      framework.pushEvent({ ...incomingEvent({ channelId: 'slack:D1', text: 'just chatting', channelType: 'im' }), tags: ['chat:ambient'] } as unknown as ProcessEvent);
-      await framework.runUntilIdle();
-      const turns: string[] = [];
-      framework.onTrace((event) => { if (event.type === 'inference:started') turns.push(event.agentName); });
-      (membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
-        membrane.calls.push(request as never);
-        return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'noted' }])]);
-      };
-      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: fork, reason: 'test', source: 'test', timestamp: Date.now() });
-      await framework.runUntilIdle();
-      assert.deepEqual(turns, [fork], "premise: the fork's own turn read the message and was answered");
-      const gate = (framework as unknown as {
-        eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>; fireDebounce(name: string): void };
-      }).eventGate;
-      assert.equal(gate.debounceTimers.size, 1, 'premise: the ambient message is batched');
-      for (const [name, state] of gate.debounceTimers) {
-        clearTimeout(state.timer);
-        gate.fireDebounce(name);
+  for (const via of ['routing', 'deliverTo'] as const) {
+    it(`a fork that read and answered an ambient message delivered by ${via} before its debounced batch fired isn't woken by the batch`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+        modules: [],
+        conversations: { templateAgent: 'trunk' },
+        gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'], tagsAny: ['chat:ambient'] }, behavior: { debounce: 60_000 } }], default: 'always' } },
+      });
+      try {
+        framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+        await framework.runUntilIdle();
+        const fork = forkName('slack:D1', 1);
+        assert.ok(framework.getAgent(fork), 'premise: the DM spawned its fork');
+        const ambient = { ...incomingEvent({ channelId: 'slack:D1', text: 'just chatting', channelType: 'im' }), tags: ['chat:ambient'] };
+        if (via === 'routing') framework.pushEvent(ambient as unknown as ProcessEvent);
+        else await (framework as unknown as { handleMcplChannelIncoming(event: unknown): Promise<unknown> }).handleMcplChannelIncoming({ ...ambient, deliverTo: fork });
+        await framework.runUntilIdle();
+        const turns: string[] = [];
+        framework.onTrace((event) => { if (event.type === 'inference:started') turns.push(event.agentName); });
+        (membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+          membrane.calls.push(request as never);
+          return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'noted' }])]);
+        };
+        (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: fork, reason: 'test', source: 'test', timestamp: Date.now() });
+        await framework.runUntilIdle();
+        assert.deepEqual(turns, [fork], "premise: the fork's own turn read the message and was answered");
+        const gate = (framework as unknown as {
+          eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>; fireDebounce(name: string): void };
+        }).eventGate;
+        assert.equal(gate.debounceTimers.size, 1, 'premise: the ambient message is batched');
+        for (const [name, state] of gate.debounceTimers) {
+          clearTimeout(state.timer);
+          gate.fireDebounce(name);
+        }
+        await framework.runUntilIdle();
+        assert.ok(!turns.slice(1).includes(fork), "the fork's batched wake was dropped");
+      } finally {
+        await framework.stop();
       }
-      await framework.runUntilIdle();
-      assert.ok(!turns.slice(1).includes(fork), "the fork's batched wake was dropped");
-    } finally {
-      await framework.stop();
-    }
-  });
+    });
+  }
 
   it('DM message spawns a fork, routes the message there, and triggers inference', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));

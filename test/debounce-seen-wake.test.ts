@@ -62,6 +62,7 @@ function gateOf(f: Fixture) {
 }
 function fire(f: Fixture) {
   const gate = gateOf(f);
+  assert.ok(gate.debounceTimers.size + gate.inferenceDiagnostics().bufferedEvents > 0, 'premise: a batch is pending or held');
   for (const [name, state] of gate.debounceTimers) {
     clearTimeout(state.timer);
     gate.fireDebounce(name);
@@ -356,6 +357,25 @@ describe('debounced writes already read and answered', () => {
       } finally { release(); await f.close(); }
     });
   }
+
+  it("an unread channel edit batched with the message it replaced and a later message: the turn's line counts the edit and the later message", async () => {
+    const { f } = await setup(60_000);
+    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+      f.membrane.calls.push(request);
+      return new MockYieldingStream([say('read it')], true);
+    };
+    try {
+      await f.send('channels/incoming', { messages: [f.channel('c', 'original text', { initial: true }, 'work', 'edited')] });
+      const edit = await f.send('channels/incoming', { messages: [f.channel('e', 'newest text', {}, 'work', 'edited')] });
+      assert.equal(edit.result.results[0].coalesce.outcome, 'replaced', 'premise: the edit replaced the unread original');
+      await f.send('channels/incoming', { messages: [f.channel('l', 'later text', { initial: true }, 'work', 'later')] });
+      fire(f);
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 1, 'the unread edit and the later message keep the wake');
+      assert.deepEqual(JSON.stringify(f.membrane.calls[0]).match(/\[Gate: \d+ events? matched\]/g), ['[Gate: 2 events matched]'],
+        'one line, for the edit and the later message, not the removed original');
+    } finally { await f.close(); }
+  });
 
   it("a batched wake's turn that fails into a provider's stated wait after a tool round answered its event is retried, not dropped", async () => {
     const { f, module } = await setup(60_000);

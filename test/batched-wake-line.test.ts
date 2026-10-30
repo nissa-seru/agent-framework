@@ -246,28 +246,6 @@ describe('a batched wake writes its line only when it says something', () => {
     assert.equal(gateLines().filter((t) => t.includes('1 message in #general')).length, 1);
     assert.equal(gateLines().filter((t) => t.includes('1 message in #random')).length, 1);
   });
-
-  it('a wake whose lines name one message under two writes, the first since replaced: the line names the unread write, not none', async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello back' }]));
-    dm('are you there?');
-    await waitFor(() => membrane.calls.length >= 1, 'the first wake');
-    await framework.runUntilIdle();
-    const replaced = internals().addMessage('antra', [{ type: 'text', text: 'edited, unread' }], { serverId: 'discord', eventId: 'ev-edit', channelId: 'discord:dm:1' });
-    const newest = internals().addMessage('antra', [{ type: 'text', text: 'another, unread' }], { serverId: 'discord', eventId: 'ev-next', channelId: 'discord:dm:1' });
-    const line = (eventId: string, messageId: string) => ({
-      shown: 'a DM', at: Date.now(), policyNames: ['addressed'],
-      entry: { eventType: 'mcpl:push-event', serverId: 'discord', eventId },
-      after: { agent: 'scout', messageId },
-    });
-    const calls = membrane.calls.length;
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'again' }]));
-    internals().pendingRequests.push({
-      agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsWakeLines: true,
-      wakeLines: [line('ev-edit', 'a-row-since-replaced'), line('ev-edit', replaced), line('ev-next', newest)],
-    });
-    await waitFor(() => membrane.calls.length > calls, 'the wake');
-    assert.equal(gateLines().filter((t) => t.includes('2 messages in a DM')).length, 1, 'the replacement and the next message, both unread');
-  });
 });
 
 /**
