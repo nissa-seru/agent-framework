@@ -477,6 +477,7 @@ export interface Change {
   /** Where its new text starts in the updated text, and that index's 1-based line. */
   at: number;
   line: number;
+  end: number;
   /**
    * How many lines its new text spans, as a receipt shows them: a final line
    * end closes its last line rather than starting another.
@@ -919,7 +920,7 @@ export function planFile(
     length += start - from;
     const edit = kept[slot];
     if (!edit) {
-      kept[slot] = { first: { edit: spec.index, at: length, line, lines: added[slot]!.lines }, count: 1, otherLines: [], otherLineCount: 0 };
+      kept[slot] = { first: { edit: spec.index, at: length, line, end: length + spec.newText.length, lines: added[slot]!.lines }, count: 1, otherLines: [], otherLineCount: 0 };
     } else {
       edit.count++;
       // An edit's replacements ascend, so their lines never fall: a line

@@ -165,6 +165,10 @@ test('a receipt and a refusal cut a line between characters, never inside a surr
   const receipt = dataOf(await call('edit', { path: 'work/e.txt', oldString: 'target', newString: 'DONE' }));
   assert.doesNotMatch(receipt.changed as string, loneSurrogate);
   assert.match(receipt.changed as string, /^     1\t\[… 2920 chars before\] 😀/u);
+  await file('f.txt', `${'😀'.repeat(1500)}xtargety${'😀'.repeat(1500)}\n`);
+  const after = dataOf(await call('edit', { path: 'work/f.txt', oldString: 'target', newString: 'DONE' }));
+  assert.doesNotMatch(after.changed as string, loneSurrogate);
+  assert.match(after.changed as string, /DONEy(😀){39} \[… 2922 more chars\]$/u);
   // A thrown message past 500 code points keeps its first 500, whole
   // pairs, and says how long it was.
   const s = store as unknown as Record<string, (...args: unknown[]) => unknown>;
@@ -181,14 +185,14 @@ test('a receipt and a refusal cut a line between characters, never inside a surr
   }
 });
 
-test('a receipt shows a long line from shortly before the change on it, and its start where the change is there', async (t) => {
+test('a receipt shows a long line from shortly before the change on it to shortly after, and from its start where the change is there', async (t) => {
   const { call, file } = setup(t);
   await file('long.txt', `${'a'.repeat(2500)}target${'z'.repeat(10)}\nnext\n`);
   const late = dataOf(await call('edit', { path: 'work/long.txt', oldString: 'target', newString: 'DONE' }));
   assert.equal(late.changed, `     1\t[… 2420 chars before] ${'a'.repeat(80)}DONE${'z'.repeat(10)}\n     2\tnext`);
   await file('early.txt', `ab${'c'.repeat(2500)}\n`);
   const early = dataOf(await call('edit', { path: 'work/early.txt', oldString: 'ab', newString: 'AB' }));
-  assert.equal(early.changed, `     1\tAB${'c'.repeat(1998)} [… 502 more chars]`);
+  assert.equal(early.changed, `     1\tAB${'c'.repeat(80)} [… 2420 more chars]`);
   // Several edits' first changes on one long line: a stretch from shortly
   // before each, run together where they meet.
   await file('many.txt', `${'a'.repeat(3000)}one${'b'.repeat(100)}two${'c'.repeat(3000)}three${'d'.repeat(500)}\n`);
@@ -199,10 +203,92 @@ test('a receipt shows a long line from shortly before the change on it, and its 
       { path: 'work/many.txt', oldString: 'two', newString: '2' },
     ],
   }));
-  // Each stretch runs from 80 characters before its change for 2,000: the
-  // first two meet and run together, and the third is apart.
-  assert.equal(many.changed, `work/many.txt\n     1\t[… 2920 chars before] ${'a'.repeat(80)}1${'b'.repeat(100)}2${'c'.repeat(1919)}`
-    + ` [… 1001 chars] ${'c'.repeat(80)}3${'d'.repeat(500)}`);
+  assert.equal(many.changed, `work/many.txt\n     1\t[… 2920 chars before] ${'a'.repeat(80)}1${'b'.repeat(100)}2${'c'.repeat(80)}`
+    + ` [… 2840 chars] ${'c'.repeat(80)}3${'d'.repeat(80)} [… 420 more chars]`);
+});
+
+test("a receipt shows each line of a change's region near the change: 80 characters on each side of it, a line's last 80 before it and first 80 after", async (t) => {
+  const { call, file } = setup(t);
+  const lines = Array.from({ length: 20 }, () => 'a'.repeat(1000));
+  lines[9] = `${'b'.repeat(460)}MARK${'c'.repeat(536)}`;
+  await file('paragraphs.txt', `${lines.join('\n')}\n`);
+  const receipt = dataOf(await call('edit', { path: 'work/paragraphs.txt', oldString: 'MARK', newString: 'DONE' }));
+  assert.equal(receipt.changed, [
+    `     8\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `     9\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `    10\t[… 380 chars before] ${'b'.repeat(80)}DONE${'c'.repeat(80)} [… 456 more chars]`,
+    `    11\t${'a'.repeat(80)} [… 920 more chars]`,
+    `    12\t${'a'.repeat(80)} [… 920 more chars]`,
+  ].join('\n'));
+});
+
+test("edit_many's receipt shows each edit's region near its change, as edit's does", async (t) => {
+  const { call, file } = setup(t);
+  const lines = Array.from({ length: 20 }, () => 'a'.repeat(1000));
+  for (const n of [4, 10, 16]) lines[n - 1] = `${'b'.repeat(460)}MARK${n}${'c'.repeat(536 - String(n).length)}`;
+  await file('paragraphs.txt', `${lines.join('\n')}\n`);
+  const receipt = dataOf(await call('edit_many', {
+    edits: [4, 10, 16].map((n) => ({ path: 'work/paragraphs.txt', oldString: `MARK${n}`, newString: `DONE${n}` })),
+  }));
+  const region = (n: number) => [
+    `${String(n - 2).padStart(6)}\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `${String(n - 1).padStart(6)}\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `${String(n).padStart(6)}\t[… 380 chars before] ${'b'.repeat(80)}DONE${n}${'c'.repeat(80)} [… ${456 - String(n).length} more chars]`,
+    `${String(n + 1).padStart(6)}\t${'a'.repeat(80)} [… 920 more chars]`,
+    `${String(n + 2).padStart(6)}\t${'a'.repeat(80)} [… 920 more chars]`,
+  ].join('\n');
+  assert.equal(receipt.changed, `work/paragraphs.txt\n${[4, 10, 16].map(region).join('\n…\n')}`);
+});
+
+test('a line between two changes shows its 80 characters nearest each, and a deletion shows 80 on each side of where its text was', async (t) => {
+  const { call, file } = setup(t);
+  const lines = Array.from({ length: 20 }, () => 'a'.repeat(1000));
+  lines[9] = `${'b'.repeat(460)}ONE${'c'.repeat(537)}`;
+  lines[11] = `${'d'.repeat(460)}TWO${'e'.repeat(537)}`;
+  await file('between.txt', `${lines.join('\n')}\n`);
+  const receipt = dataOf(await call('edit_many', {
+    edits: [
+      { path: 'work/between.txt', oldString: 'ONE', newString: '1' },
+      { path: 'work/between.txt', oldString: 'TWO', newString: '' },
+    ],
+  }));
+  assert.equal(receipt.changed, [
+    'work/between.txt',
+    `     8\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `     9\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `    10\t[… 380 chars before] ${'b'.repeat(80)}1${'c'.repeat(80)} [… 377 chars] ${'c'.repeat(80)}`,
+    `    11\t${'a'.repeat(80)} [… 840 chars] ${'a'.repeat(80)}`,
+    `    12\t${'d'.repeat(80)} [… 300 chars] ${'d'.repeat(80)}${'e'.repeat(80)} [… 457 more chars]`,
+    `    13\t${'a'.repeat(80)} [… 920 more chars]`,
+    `    14\t${'a'.repeat(80)} [… 920 more chars]`,
+  ].join('\n'));
+});
+
+test("a replacement of several lines shows its first line from 80 before it, its lines between whole, and its last line to 80 after it", async (t) => {
+  const { call, file } = setup(t);
+  const lines = Array.from({ length: 20 }, () => 'a'.repeat(1000));
+  lines[9] = `${'b'.repeat(460)}MARK${'c'.repeat(536)}`;
+  await file('several.txt', `${lines.join('\n')}\n`);
+  const receipt = dataOf(await call('edit', { path: 'work/several.txt', oldString: 'MARK', newString: `ONE\n${'m'.repeat(300)}\nTWO` }));
+  assert.equal(receipt.changed, [
+    `     8\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `     9\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `    10\t[… 380 chars before] ${'b'.repeat(80)}ONE`,
+    `    11\t${'m'.repeat(300)}`,
+    `    12\tTWO${'c'.repeat(80)} [… 456 more chars]`,
+    `    13\t${'a'.repeat(80)} [… 920 more chars]`,
+    `    14\t${'a'.repeat(80)} [… 920 more chars]`,
+  ].join('\n'));
+});
+
+test("a part of a line is left out only where its marker is shorter than it, so a line with nothing worth cutting reads whole", async (t) => {
+  const { call, file } = setup(t);
+  await file('near.txt', `${'p'.repeat(95)}\n${'q'.repeat(85)}MARK${'r'.repeat(81)}\n${'s'.repeat(95)}\n`);
+  const whole = dataOf(await call('edit', { path: 'work/near.txt', oldString: 'MARK', newString: 'DONE' }));
+  assert.equal(whole.changed, `     1\t${'p'.repeat(95)}\n     2\t${'q'.repeat(85)}DONE${'r'.repeat(81)}\n     3\t${'s'.repeat(95)}`);
+  await file('past.txt', `${'p'.repeat(110)}\nMARK\n${'s'.repeat(110)}\n`);
+  const cut = dataOf(await call('edit', { path: 'work/past.txt', oldString: 'MARK', newString: 'DONE' }));
+  assert.equal(cut.changed, `     1\t[… 30 chars before] ${'p'.repeat(80)}\n     2\tDONE\n     3\t${'s'.repeat(80)} [… 30 more chars]`);
 });
 
 test("a receipt names the lines of an edit's other replacements, the first 20 and how many more", async (t) => {
@@ -1482,6 +1568,7 @@ test('a receipt names a region too long to show by its lines without building it
     length: text.length,
     indexOf: (search: string, from?: number) => text.indexOf(search, from),
     lastIndexOf: (search: string, from?: number) => text.lastIndexOf(search, from),
+    charCodeAt: (at: number) => text.charCodeAt(at),
     slice: (from: number, to?: number) => {
       const part = text.slice(from, to);
       sliced += part.length;

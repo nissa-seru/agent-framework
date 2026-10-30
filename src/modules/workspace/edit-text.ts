@@ -308,22 +308,27 @@ interface Region {
   end: number;
 }
 
+const CONTEXT_LINES = 2;
+
+function lineStartOf(text: string, at: number): number {
+  return at === 0 ? 0 : text.lastIndexOf('\n', at - 1) + 1;
+}
+
 /**
  * The region a receipt shows around a change: two lines before it, its new
  * text's lines, and two after, found by scanning for line ends around it,
  * never past the file's end.
  */
 function regionOf(updated: string, change: Change): Region {
-  const lineStart = (at: number) => (at === 0 ? 0 : updated.lastIndexOf('\n', at - 1) + 1);
-  let start = lineStart(change.at);
+  let start = lineStartOf(updated, change.at);
   let from = change.line;
-  for (let k = 0; k < 2 && start > 0; k++) {
-    start = lineStart(start - 1);
+  for (let k = 0; k < CONTEXT_LINES && start > 0; k++) {
+    start = lineStartOf(updated, start - 1);
     from--;
   }
-  let end = lineStart(change.at);
+  let end = lineStartOf(updated, change.at);
   let to = change.line - 1;
-  for (let k = 0; k < change.lines + 2 && end < updated.length; k++) {
+  for (let k = 0; k < change.lines + CONTEXT_LINES && end < updated.length; k++) {
     const newline = updated.indexOf('\n', end);
     end = newline === -1 ? updated.length : newline + 1;
     to++;
@@ -331,30 +336,55 @@ function regionOf(updated: string, change: Change): Region {
   return { from, to, start, end };
 }
 
-/** How much of a long line an excerpt shows before the change it's for. */
 const CHANGE_LEAD = 80;
 
-/**
- * A line too long to show whole, numbered, as a stretch for each change the
- * receipt shows that starts on it (an edit's first change), at the ascending
- * `columns`: from at most CHANGE_LEAD
- * characters before the change, for as much as read shows of a line.
- * Stretches that meet run together, and each stretch of the line left out is
- * marked with how many characters it holds.
- */
-function excerptLine(line: string, n: number, columns: number[]): string {
-  const stretches: Array<{ from: number; to: number }> = [];
-  for (const column of columns) {
-    // safeCut takes a cut at or before 0 as 0.
-    const from = safeCut(line, column - CHANGE_LEAD);
-    const to = safeCut(line, from + MAX_LINE_CHARS);
-    const last = stretches.at(-1);
-    if (last && from <= last.to) last.to = Math.max(last.to, to);
-    else stretches.push({ from, to });
+interface Span {
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+}
+
+function spanOf(updated: string, change: Change): Span {
+  const endAt = change.end > change.at && updated.charCodeAt(change.end - 1) === 10 ? change.end - 1 : change.end;
+  return {
+    startLine: change.line,
+    startCol: change.at - lineStartOf(updated, change.at),
+    endLine: change.line + change.lines - 1,
+    endCol: endAt - lineStartOf(updated, endAt),
+  };
+}
+
+function nearLine(line: string, n: number, spans: Span[]): string {
+  const parts: Array<{ from: number; to: number }> = [];
+  for (const span of spans) {
+    let from = 0;
+    let to = line.length;
+    if (n < span.startLine) from = line.length - CHANGE_LEAD;
+    else if (n > span.endLine) to = CHANGE_LEAD;
+    else {
+      if (n === span.startLine) from = span.startCol - CHANGE_LEAD;
+      if (n === span.endLine) to = span.endCol + CHANGE_LEAD;
+    }
+    from = safeCut(line, from);
+    parts.push({ from, to: safeCut(line, Math.min(to, from + MAX_LINE_CHARS)) });
   }
+  parts.sort((a, b) => a.from - b.from);
+  const kept: Array<{ from: number; to: number }> = [];
+  for (const part of parts) {
+    const last = kept.at(-1);
+    const gap = last ? part.from - last.to : 0;
+    if (last && gap <= ` [… ${gap} chars] `.length) last.to = Math.max(last.to, part.to);
+    else kept.push({ ...part });
+  }
+  const first = kept[0]!;
+  if (first.from <= `[… ${first.from} chars before] `.length) first.from = 0;
+  const last = kept.at(-1)!;
+  const rest = line.length - last.to;
+  if (rest <= ` [… ${rest} more chars]`.length) last.to = line.length;
   let text = '';
   let shownTo = 0;
-  for (const { from, to } of stretches) {
+  for (const { from, to } of kept) {
     if (from > shownTo) text += shownTo === 0 ? `[… ${from} chars before] ` : ` [… ${from - shownTo} chars] `;
     text += line.slice(from, to);
     shownTo = to;
@@ -370,6 +400,7 @@ function excerptLine(line: string, n: number, columns: number[]): string {
  */
 export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars: number): string[] {
   const firsts = plan.edits.map((edit) => edit.first).sort((a, b) => a.at - b.at);
+  const spans = firsts.map((first) => spanOf(plan.updated, first));
   const regions: Region[] = [];
   for (const change of firsts) {
     // An emptied file's region holds no line, and shows as nothing.
@@ -418,10 +449,10 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
       const newline = plan.updated.indexOf('\n', lineStart);
       const lineEnd = newline === -1 || newline >= region.end ? region.end : newline;
       const text = asStored(plan.updated.slice(lineStart, lineEnd), n, lineEnd === newline);
-      // A line too long to show whole shows its start, or, where edits' first
-      // changes start on it, a stretch from shortly before each.
-      const columns = text.length > MAX_LINE_CHARS ? firsts.filter((first) => first.line === n).map((first) => first.at - lineStart) : [];
-      const numberedText = columns.length ? excerptLine(text, n, columns) : numberedLine(text, n);
+      const near = spans.filter((span) => n >= span.startLine - CONTEXT_LINES && n <= span.endLine + CONTEXT_LINES);
+      const numberedText = !near.length || near.some((span) => n > span.startLine && n < span.endLine)
+        ? numberedLine(text, n)
+        : nearLine(text, n, near);
       cost += numberedText.length + (lines.length ? 1 : 0);
       if (cost > budget.left) fits = false;
       else lines.push(numberedText);
