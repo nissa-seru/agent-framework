@@ -3411,6 +3411,55 @@ export class ChannelRegistry {
     return found;
   }
 
+  /**
+   * The tune-out a cancel or a peek names where no registered channel
+   * answers to the name: one on record whose channel isn't registered now,
+   * as when its server removed the channel or went away. With a serverId,
+   * the exact pair; inside the calling turn, the turn's own channel with
+   * that id (ownChannelNamed); otherwise the one such tune-out whose channel
+   * id, or server-qualified name, is the name. A label isn't matched. A name
+   * several such tune-outs answer to is refused, saying how to name each
+   * alone in `field`, the tool's input that took the name. Undefined where
+   * no such tune-out answers: with a serverId, where that pair is registered
+   * or has none; without one, where a registered channel answers to the
+   * name.
+   */
+  unconnectedTuneOutNamed(
+    name: string,
+    serverId?: string,
+    own?: readonly ChannelRef[],
+    field = 'channelId',
+  ): { channel: ChannelRef } | { error: string } | undefined {
+    const unconnected = (ref: ChannelRef): boolean => !this.entryAt(ref) && this.getTuneOutState(ref.serverId, ref.channelId) !== null;
+    if (serverId) return unconnected({ serverId, channelId: name }) ? { channel: { serverId, channelId: name } } : undefined;
+    const mine = this.ownChannelNamed(name, own);
+    if (mine) return 'channel' in mine && unconnected(mine.channel) ? { channel: mine.channel } : undefined;
+    if (this.entriesNamed(name).length > 0) return undefined;
+    const named = this.unconnectedTuneOutsNamed(name);
+    if (named.length <= 1) return named[0] ? { channel: named[0] } : undefined;
+    const lines = named.map((t) => {
+      const qualified = qualifiedChannelName(t);
+      const picks = qualified !== name && this.entriesNamed(qualified).length === 0 && this.unconnectedTuneOutsNamed(qualified).length === 1;
+      return picks
+        ? `- ${channelOnServer(t)}: call again with ${field} ${quotedValue(qualified)}.`
+        : `- ${channelOnServer(t)}: call again with ${field} ${quotedValue(t.channelId)} and serverId ${quotedValue(t.serverId)}.`;
+    });
+    const count = named.length === 2 ? 'either of two channels' : `any of ${named.length} channels`;
+    return { error: `Channel ${JSON.stringify(name)} could mean the tune-out of ${count} that aren't connected now, so nothing ran:\n${lines.join('\n')}` };
+  }
+
+  private unconnectedTuneOutsNamed(name: string): ChannelRef[] {
+    return this.tuneOutsOnRecord()
+      .filter((t) => !this.entryAt(t) && (t.channelId === name || qualifiedChannelName(t) === name))
+      .map(({ serverId, channelId }) => ({ serverId, channelId }));
+  }
+
+  /** The latest label a channel id was seen with, on any server, from the
+   *  label history, which outlasts the channel's registration. */
+  lastSeenLabel(channelId: string): string | undefined {
+    return this.labelHistory.get(channelId);
+  }
+
   /** Registered channel entries (read-only iteration for the coordinator). */
   listChannelsRaw(): Array<{ serverId: string; descriptor: ChannelDescriptor }> {
     return [...this.channels.values()].map((e) => ({
@@ -4028,8 +4077,11 @@ export class ChannelRegistry {
    * the refusals show it (channelOnServer), which no input takes for a name.
    * A channel no longer registered is shown by its id, or by its qualified
    * name, only where no registered channel takes that name, as a channel
-   * tool reads it or a `>>` target does (by label or raw id too), so the
-   * name can't send anything to another channel; else by its id and server.
+   * tool reads it or a `>>` target does (by label or raw id too), and no
+   * other tune-out whose channel isn't registered does, as a tune-out's
+   * cancel reads it (unconnectedTuneOutNamed), so the name can't send
+   * anything to another channel or end another tune-out; else by its id and
+   * server.
    * A name that wouldn't show as itself (showsAsItself: one holding a line
    * break, a notice opening, a quote, a backslash or a lone surrogate, or
    * whitespace at its edges) is shown by its id and its server too, which
@@ -4043,7 +4095,8 @@ export class ChannelRegistry {
       return name !== undefined && showsAsItself(name) ? name : channelOnServer(ref);
     }
     for (const name of [ref.channelId, qualifiedChannelName(ref)]) {
-      if (showsAsItself(name) && this.entriesNamed(name).length === 0 && !('channelId' in this.resolveProseTarget(name))) return name;
+      if (showsAsItself(name) && this.entriesNamed(name).length === 0 && !('channelId' in this.resolveProseTarget(name))
+        && this.unconnectedTuneOutsNamed(name).every((t) => sameChannel(t, ref))) return name;
     }
     return channelOnServer(ref);
   }

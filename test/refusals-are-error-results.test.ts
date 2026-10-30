@@ -125,7 +125,7 @@ test("the resident's refusals reach the model as error results, and a tune-out i
   ]);
   assert.deepEqual(first!.get('unknown'), { content: 'unknown channel: disc:guild:none', isError: true });
   assert.deepEqual(first!.get('cancel'), {
-    content: 'Nothing was cancelled: no connected channel is tuned out now. A tune-out also ends by itself when its '
+    content: 'Nothing was cancelled: no channel is tuned out now. A tune-out also ends by itself when its '
       + 'duration runs out, or at the first wake past its wake budget, and its backlog goes to you then.',
     isError: true,
   });
@@ -159,7 +159,7 @@ test("the subconscious's refusals reach it as error results", async (t) => {
     isError: true,
   });
   assert.deepEqual(round!.get('cancel'), {
-    content: 'Nothing was cancelled: no connected channel is tuned out now. A tune-out also ends by itself when its '
+    content: 'Nothing was cancelled: no channel is tuned out now. A tune-out also ends by itself when its '
       + 'duration runs out, or at the first wake past its wake budget, and its backlog goes to the resident then.',
     isError: true,
   });

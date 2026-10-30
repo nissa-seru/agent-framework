@@ -116,7 +116,7 @@ describe('a tune-out\'s dump of what it held', () => {
       getStoredMessages: () => [], getDeferredMessages: () => [], emitTrace: () => {},
     } as never);
     const result = coordinator.cancel('disc', 'disc:g:z\u2028w', 'agent-tool', 'test') as { ok: boolean; error?: string };
-    assert.ok(!result.ok && result.error!.includes('no connected channel "disc:g:z\\u2028w" on server "disc" is tuned out'), JSON.stringify(result));
+    assert.ok(!result.ok && result.error!.includes('no channel "disc:g:z\\u2028w" on server "disc" is tuned out'), JSON.stringify(result));
     assert.ok(result.error!.includes('tuned out now: "disc:g:x\\u0085y" on server "disc".'), JSON.stringify(result));
   });
 

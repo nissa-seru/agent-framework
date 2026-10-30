@@ -9,7 +9,8 @@
 // test asserts the deterministic suppressed-mention reaction there. It keeps
 // its channel's lifecycle as a server does: channels/open and channels/close
 // are recorded there too, and while the host has the channel closed, a
-// commanded message isn't sent (recorded as withheld).
+// commanded message isn't sent (recorded as withheld). A `remove` line
+// removes the channel by channels/changed.
 import { appendFileSync } from 'node:fs';
 import { writtenLines } from './command-lines.mjs';
 import { createInterface } from 'node:readline';
@@ -35,6 +36,10 @@ function pollCommands() {
   for (const line of lines.slice(processedCommands)) {
     processedCommands++;
     const [kind, messageId, ...rest] = line.split(' ');
+    if (kind === 'remove') {
+      send({ jsonrpc: '2.0', id: nextId++, method: 'channels/changed', params: { removed: [CHANNEL_ID] } });
+      continue;
+    }
     const text = rest.join(' ');
     const tags = kind === 'addressed'
       ? ['chat:mention', 'chat:from-human']

@@ -36873,17 +36873,19 @@ export class AgentFramework {
       `failed: ${thrownText(err)}`;
     const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
     const allExcept = input.scope === 'all-except';
+    const heldNamed = (name: string, field: 'channelId' | 'peek'): ChannelRef | { error: string } => {
+      const registered = channelRegistry.resolveChannel(name, serverId, own);
+      if (!('error' in registered)) return registered;
+      const onRecord = channelRegistry.unconnectedTuneOutNamed(name, serverId, own, field);
+      if (!onRecord) return { error: this.unknownChannelWords(name, registered.error, own) };
+      return 'error' in onRecord ? onRecord : onRecord.channel;
+    };
 
     if (input.mode === 'check') {
-      // A peek's name means what the other modes' names mean: the one
-      // channel it picks, by its id or the server-qualified name the agent
-      // is shown where another server shares the id, or inside the turn one
-      // of the turn's own channels (resolveChannel), and its lines are that
-      // channel's, on its server.
       let peek: ChannelRef | undefined;
       if (typeof input.peek === 'string' && input.peek) {
-        const resolved = channelRegistry.resolveChannel(input.peek, serverId, own);
-        if ('error' in resolved) return { success: false, error: this.unknownChannelWords(input.peek, resolved.error, own), isError: true };
+        const resolved = heldNamed(input.peek, 'peek');
+        if ('error' in resolved) return { success: false, error: resolved.error, isError: true };
         peek = { serverId: resolved.serverId, channelId: resolved.channelId };
       }
       // Read as the other options are (readOptions): a numeric string is its
@@ -36901,6 +36903,14 @@ export class AgentFramework {
     }
 
     const channelId = String(input.channelId ?? '');
+    if (input.mode === 'cancel') {
+      const ending = heldNamed(channelId, 'channelId');
+      if ('error' in ending) return { success: false, error: ending.error, isError: true };
+      const r = coordinator.cancel(ending.serverId, ending.channelId, 'agent-tool', 'agent request');
+      return r.ok
+        ? { success: true, data: { cancelled: channelRegistry.nameShown(ending) } }
+        : { success: false, error: r.error, isError: true };
+    }
     const resolved = channelRegistry.resolveChannel(channelId, serverId, own);
     if ('error' in resolved) return { success: false, error: this.unknownChannelWords(channelId, resolved.error, own), isError: true };
     // The name the agent knows the channel by: its id, or where another
@@ -36908,12 +36918,6 @@ export class AgentFramework {
     // for the transport reads it again then, since a registration meanwhile
     // can change which name picks the channel.
     const shownNow = (): string => channelRegistry.nameShown(resolved);
-    if (input.mode === 'cancel') {
-      const r = coordinator.cancel(resolved.serverId, resolved.channelId, 'agent-tool', 'agent request');
-      return r.ok
-        ? { success: true, data: { cancelled: shownNow() } }
-        : { success: false, error: r.error, isError: true };
-    }
     if (allExcept) {
       const r = coordinator.enterAllExcept(resolved, {
         cadenceSeconds: input.cadenceSeconds,

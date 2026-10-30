@@ -203,7 +203,10 @@ export interface AllExceptState {
 /** `check`: what is held right now, without releasing anything. */
 export interface TuneOutCheck {
   allExcept: { epochId: string; except: { serverId: string; channelId: string }; expiresAtMs: number; wakeCount: number; held: Record<string, number> } | null;
-  channels: Array<{ serverId: string; channelId: string; epochId: string; held: number; expiresAtMs?: number }>;
+  /** Every channel tune-out on record. One whose channel isn't registered now is `connected: false`, with the latest
+   *  label its id was seen with on any server (lastSeenLabel), where the label history has one. A cancel or a peek
+   *  takes its channelId with its serverId. */
+  channels: Array<{ serverId: string; channelId: string; epochId: string; held: number; expiresAtMs?: number; connected?: false; lastSeenLabel?: string }>;
   /** Up to `peekLimit` newest held lines of the peeked channel, oldest first. */
   peek?: string[];
 }
@@ -553,6 +556,12 @@ export class TuneOutCoordinator {
       }
     }
     return active;
+  }
+
+  private everyTuneOut(): Array<{ serverId: string; channelId: string; params: TuneOutParams; connected: boolean }> {
+    const registered = new Set(this.channelRegistry.listChannelsRaw().map((e) => this.key(e.serverId, e.descriptor.id)));
+    return this.channelRegistry.tuneOutsOnRecord().map(({ serverId, channelId, params }) => (
+      { serverId, channelId, params, connected: registered.has(this.key(serverId, channelId)) }));
   }
 
   // ==========================================================================
@@ -1245,10 +1254,14 @@ export class TuneOutCoordinator {
     const countOf = (epochId: string) => [...stored, ...deferred].filter(
       (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
     ).length;
-    const channels = this.listActive().map(({ serverId, channelId, params }) => ({
-      serverId, channelId, epochId: params.epochId, held: countOf(params.epochId),
-      ...(params.expiresAtMs !== undefined ? { expiresAtMs: params.expiresAtMs } : {}),
-    }));
+    const channels: TuneOutCheck['channels'] = this.everyTuneOut().map(({ serverId, channelId, params, connected }) => {
+      const label = connected ? undefined : this.channelRegistry.lastSeenLabel(channelId);
+      return {
+        serverId, channelId, epochId: params.epochId, held: countOf(params.epochId),
+        ...(params.expiresAtMs !== undefined ? { expiresAtMs: params.expiresAtMs } : {}),
+        ...(connected ? {} : { connected: false as const, ...(label !== undefined ? { lastSeenLabel: label } : {}) }),
+      };
+    });
     const scope = this.getAllExcept();
     let allExcept: TuneOutCheck['allExcept'] = null;
     if (scope) {
@@ -1962,15 +1975,19 @@ export class TuneOutCoordinator {
         // turn's own channels means that channel (ownChannelFor); otherwise a
         // name several registered channels answer to picks none of them
         // (channelsNamed), whichever of them is tuned out, never taken to be
-        // the tuned-out one. A name that picks no channel, such a name or one
-        // of the turn's own channels that ownChannelFor refuses, is refused,
-        // unless the call names the all-except scope, which ends that hold
-        // below.
+        // the tuned-out one. A name that picks no channel and no tune-out on
+        // record (unconnectedTuneOutNamed) is refused, unless the call names
+        // the all-except scope, which ends that hold below.
         const mine = serverId ? undefined : this.channelRegistry.ownChannelFor(name, own);
-        const refusal = mine && 'error' in mine ? mine.error
+        let refusal = mine && 'error' in mine ? mine.error
           : serverId || mine ? undefined : this.channelRegistry.sharedNameRefusalFor(name);
-        const named = serverId ? [{ serverId, channelId: name }]
+        let named = serverId ? [{ serverId, channelId: name }]
           : mine && 'channel' in mine ? [mine.channel] : this.channelRegistry.channelsNamed(name);
+        const onRecord = serverId || (!refusal && named.length > 0) ? undefined : this.channelRegistry.unconnectedTuneOutNamed(name, undefined, own);
+        if (onRecord) {
+          refusal = 'error' in onRecord ? onRecord.error : undefined;
+          named = 'channel' in onRecord ? [onRecord.channel] : [];
+        }
         const channel = refusal ? undefined : named[0];
         if (!channel || !this.channelRegistry.getTuneOutState(channel.serverId, channel.channelId)) {
           // The reader keeps its latitude over the all-except hold too: a
@@ -2097,18 +2114,13 @@ export class TuneOutCoordinator {
    * or knows it by: which channels are, so the next call can name one, and
    * how a tune-out ends without one. `backlogTo`
    * names the resident as the message's reader knows it: "you" to the
-   * resident, "the resident" to the subconscious. It speaks of connected
-   * channels because listActive reads the registered ones: removing a server
-   * drops its channels and keeps their tune-outs, so a tune-out there is in
-   * neither this list nor the name's lookup (channelsNamed, which reads the
-   * registered channels too), and the text claims nothing about it.
+   * resident, "the resident" to the subconscious.
    */
   private notTunedOut(quoted: string, backlogTo: 'you' | 'the resident'): string {
-    const active = this.listActive().map((e) => this.quotedShown(e.serverId, e.channelId));
+    const active = this.everyTuneOut().map((e) => `${this.quotedShown(e.serverId, e.channelId)}${e.connected ? '' : ' (not connected now)'}`);
     const opening = active.length === 0
-      ? 'no connected channel is tuned out now.'
-      : `no connected channel ${quoted} is tuned out. Connected channels tuned out now: `
-        + `${active.join(', ')}.`;
+      ? 'no channel is tuned out now.'
+      : `no channel ${quoted} is tuned out. Channels tuned out now: ${active.join(', ')}.`;
     return `Nothing was cancelled: ${opening} A tune-out also ends by itself when its duration runs out, or at the `
       + `first wake past its wake budget, and its backlog goes to ${backlogTo} then.`;
   }
