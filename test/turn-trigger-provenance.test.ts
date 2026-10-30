@@ -95,11 +95,32 @@ describe('Turn trigger provenance', () => {
     );
     await i.processInferenceRequests();
     await framework.runUntilIdle();
-    assert.equal(captured.handed?.channelId, undefined, 'a gate wake sets no locus');
+    assert.equal(captured.handed?.channelId, undefined, 'a wake with telemetry alone sets no locus');
     assert.equal(captured.handed?.addressed, false);
     assert.equal(captured.handed?.counterparty, 'discord:user:7');
     assert.equal(captured.handed?.wakeChannelId, 'discord:g:room');
     assert.equal(captured.exposed?.counterparty, 'discord:user:7');
+    await framework.stop();
+  });
+
+  it('a turn merged from several batches with no single channel names every channel they came from, each once', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    const room = { serverId: 'discord', channelId: 'discord:g:room' };
+    const general = { serverId: 'discord', channelId: 'discord:g:general' };
+    const feed = { serverId: 'discord', channelId: 'discord:g:feed' };
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'timer', source: 'clock', timestamp: t },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1, wakeChannels: [room, general] },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 2, wakeChannels: [general, feed] },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.exposed?.channelId, undefined);
+    assert.deepEqual(captured.exposed?.wakeChannels, [room, general, feed]);
     await framework.stop();
   });
 

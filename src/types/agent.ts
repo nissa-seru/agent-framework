@@ -689,11 +689,20 @@ export interface InferenceRequest {
    * Set by the EventGate for batched wakes (composite channel id of the
    * chosen event when the event carried one; push-event raw ids are not
    * used). Routing keeps reading `channelId`, set from registered ids: by
-   * the direct channel paths, and by a gate wake only when its chosen event
+   * the direct channel paths, and by a gate wake when its chosen event
    * addressed the agent and the host resolved that event's registered
-   * channel (ambient-only batches leave it unset).
+   * channel, or when no message of its batch addressed the agent and the
+   * channels the host resolved for its messages are one (a `chat:system`
+   * notice is none of them).
    */
   wakeChannelId?: string;
+  /**
+   * Framework-set on a gate wake whose batch came from several channels and
+   * addressed the agent from none, so no single channel was chosen for its
+   * turn: those channels, each once. A turn with no locus names them when it
+   * tells the agent its reply had no channel to go to.
+   */
+  wakeChannels?: Array<{ serverId: string; channelId: string }>;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
   /** Batched-wake lines the gate handed to this wake rather than wrote

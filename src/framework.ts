@@ -1408,6 +1408,7 @@ interface TurnRouting {
    * wake, so a heartbeat can't start a loop of turns.
    */
   heartbeat?: true;
+  wakeChannels?: ChannelRef[];
   /**
    * Locus and hybrid mode: where the turn's unpinned plain prose lands.
    * Frozen when the turn opens (home channel for a fork, else the trigger
@@ -3548,6 +3549,14 @@ function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | und
   return byEntry.size > 0 ? [...byEntry.values()] : undefined;
 }
 
+function wakeChannelsOf(requests: readonly InferenceRequest[]): ChannelRef[] | undefined {
+  const channels: ChannelRef[] = [];
+  for (const channel of requests.flatMap((r) => r.wakeChannels ?? [])) {
+    if (!channels.some((c) => sameChannel(c, channel))) channels.push(channel);
+  }
+  return channels.length > 1 ? channels : undefined;
+}
+
 /** A batched-wake line's identity: its event's stored entry. */
 function wakeLineKey(line: WakeLine): string {
   const { eventType, serverId, channelId, messageId, eventId } = line.entry;
@@ -4866,8 +4875,7 @@ export class AgentFramework {
             // message's channel. Without it the turn froze on the
             // process-global most-recent-inbound channel, which an ambient
             // message elsewhere could retarget between the DM's arrival and
-            // the debounce firing (2026-09-30). Ambient-only batches set no
-            // locus and keep the legacy fallback.
+            // the debounce firing (2026-09-30).
             //
             // The wake is broadcast to every agent, conversation forks
             // included, and a fork speaks only in its home channel: the
@@ -4878,9 +4886,16 @@ export class AgentFramework {
               const route = provenance?.routeChannelId !== undefined
                 ? framework.channelNamed(provenance.routeChannelId, provenance.routeServerId)
                 : undefined;
-              return route && framework.mayTakeGateRoute(agentName, route)
-                ? { channelId: route.channelId, channelServerId: route.serverId, addressed: true }
-                : {};
+              if (route && framework.mayTakeGateRoute(agentName, route)) {
+                return {
+                  channelId: route.channelId, channelServerId: route.serverId,
+                  ...(provenance?.addressed ? { addressed: true } : {}),
+                };
+              }
+              const came = (provenance?.batchChannels ?? [])
+                .map((c) => framework.channelNamed(c.channelId, c.serverId))
+                .filter((c): c is ChannelRef => c !== undefined);
+              return came.length > 1 ? { wakeChannels: came } : {};
             })(),
           });
         },
@@ -19887,8 +19902,9 @@ export class AgentFramework {
       // can route without an author id): borrowing another request's author
       // would credit the turn to someone who did not address the agent.
       // Otherwise from the routing winner when it carries one; else from the
-      // most recent request that does (ambient gate wakes name a counterparty
-      // without setting a locus), ordered by the event's own time.
+      // most recent request that does (an ambient gate wake from several
+      // channels names a counterparty without setting a locus), ordered by
+      // the event's own time.
       let provReq: InferenceRequest | undefined = addressedReq
         ?? (channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined);
       if (!provReq) {
@@ -19935,6 +19951,7 @@ export class AgentFramework {
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
         channelServerId: channelReq?.channelServerId,
+        wakeChannels: channelReq ? undefined : wakeChannelsOf(requests),
         // Only the mark this batch decided, never one requests[0] carried.
         autoContinueRun: continuationMark,
         addressed: addressedReq !== undefined,
@@ -20969,7 +20986,13 @@ export class AgentFramework {
       this.holdHeartbeatProse(agent, [text], round);
       return null;
     }
-    return this.channelRegistry!.routeSpeech(agent.name, text, locus);
+    return this.channelRegistry!.routeSpeech(agent.name, text, locus, this.cameFrom(round.routing, locus));
+  }
+
+  private cameFrom(routing: TurnRouting, locus: ChannelRef | null): { cameFrom: string[] } | undefined {
+    return locus === null && routing.wakeChannels
+      ? { cameFrom: routing.wakeChannels.map((c) => this.channelShown(c)) }
+      : undefined;
   }
 
   /** The mark a framework wake takes from a heartbeat's turn with no locus
@@ -22791,7 +22814,7 @@ export class AgentFramework {
     }
     const target = sticky ?? locus;
     try {
-      const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
+      const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target, this.cameFrom(routing, target));
       this.recordProseDelivery(routing, outcome);
       if (outcome?.delivered) {
         routing.liveSpeech = true;
@@ -24049,6 +24072,8 @@ export class AgentFramework {
       // speech is held as a draft (TurnRouting.heartbeat).
       if (isHeartbeatWake(trigger)) routing.heartbeat = true;
       else delete routing.heartbeat;
+      if (trigger?.wakeChannels) routing.wakeChannels = trigger.wakeChannels;
+      else delete routing.wakeChannels;
       // Resolve the turn's outbound locus now: the home channel for forks,
       // else the trigger channel, else the global default, which an
       // ephemeral run never takes (takesGlobalFallback). Ambient mid-turn
@@ -32218,7 +32243,7 @@ export class AgentFramework {
         // or wasn't confirmed to. addMessage() alone does not request
         // inference, so this never wakes her (matching the
         // `discord-send-failed-skip` gate intent: context yes, wake no).
-        onRouteFailure: ({ conversationId, channelId, serverId, reason, textLen, outcome, detail }) => {
+        onRouteFailure: ({ conversationId, channelId, serverId, reason, textLen, outcome, detail, byDesign }) => {
           try {
             // The marker is `system: true`, so it is never conversational and
             // never influences routing. The channel is named by its label when
@@ -32248,7 +32273,7 @@ export class AgentFramework {
                 // have been posted (in part or whole). Never claim it wasn't.
                 ? `[${NOTICE_TAG.discordSendFailed}] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${suppliedValue(reason)}). It may or may not have been posted, so sending it again could post it twice. It is saved in your archive.`
                 : `[${NOTICE_TAG.discordSendFailed}] Your previous reply (${textLen} chars) could not be delivered to ${where} (${suppliedValue(reason)}). Nothing was posted; it is saved in your archive.`)
-              : `[${NOTICE_TAG.sendUndeliverable}] Your previous reply (${textLen} chars) had no channel to go to — ${suppliedValue(reason)}. This is a routing/configuration situation, not a channel failure. This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.`;
+              : `[${NOTICE_TAG.sendUndeliverable}] Your previous reply (${textLen} chars) had no channel to go to — ${suppliedValue(reason)}. This is a ${byDesign ? 'routing' : 'routing/configuration'} situation, not a channel failure. This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.`;
             // A registered speaker's notice is addressed to it (noticeTargetFor).
             this.addMessage(
               'user',
@@ -37182,7 +37207,7 @@ export class AgentFramework {
         console.error(`[sleep] ${agentName}: a heartbeat turn has no channel — sleep announcement not posted`);
       } else {
         const locus = callingTurn.locus ?? null;
-        registry.routeSpeech(agentName, announcement(locus), locus).then(noted).catch((err) => {
+        registry.routeSpeech(agentName, announcement(locus), locus, this.cameFrom(callingTurn, locus)).then(noted).catch((err) => {
           console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
         });
       }

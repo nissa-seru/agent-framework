@@ -20,6 +20,7 @@ import { canonical, duplicateName, lastRecipePath, noChanges, reconcileLine, rec
 import { closestNames, isNearMiss } from '../closest-names.js';
 import { MAX_TIMER_MS } from '../deadline-timer.js';
 import { safeSlice } from '../safe-slice.js';
+import { isSystemNotice } from '../mcpl/tags.js';
 
 import type { ToolDefinition } from '../types/events.js';
 import type {
@@ -137,6 +138,7 @@ interface PendingEvent {
    *  newer ambient chatter when a batched wake picks its provenance — the same
    *  rule the framework applies to the turn's speech locus. */
   addressed: boolean;
+  systemNotice?: true;
   /** The REGISTERED (composite) channel id the event arrived on, resolved by
    *  the host at enqueue time. Differs from `channelId` for push events,
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
@@ -170,23 +172,36 @@ export interface WakeProvenance {
    *  channel); the framework derives the composite id on the direct path. */
   channelId?: string;
   /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
-   *  channel id's first segment only when the event carried no server id). */
+   *  channel id's first segment only when the event carried no server id).
+   *  A `chat:system` notice is never the chosen event; a batch in which no
+   *  other event names a channel or an author names the author of its
+   *  newest notice that has one, and nothing else of it. */
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
-  /** Speech locus for the wake: the routable channel of the chosen event,
-   *  set ONLY when that event addressed the agent (mention / reply / DM) and
-   *  the host resolved its registered channel. A batched wake used to carry
-   *  no locus at all, so its reply fell back to the process-global
-   *  most-recent-inbound channel — which any ambient message elsewhere,
-   *  arriving a second after the DM that caused the wake, could retarget
-   *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
-   *  batches still set nothing and keep the legacy fallback. */
+  /** Speech locus for the wake: the routable channel of the chosen event when
+   *  that event addressed the agent (mention / reply / DM) and the host
+   *  resolved its registered channel; otherwise, with no event addressed
+   *  (notices aside), the one channel the batch's events came from, of those
+   *  the host resolved (a `chat:system` notice names none, and an event the
+   *  host couldn't place is passed over, as the direct path passes it over).
+   *  A batched wake used to carry no locus at all, so its reply fell back to
+   *  the process-global most-recent-inbound channel — which any ambient
+   *  message elsewhere, arriving a second after the DM that caused the wake,
+   *  could retarget (2026-09-30: a DM reply published into a guild channel).
+   *  An ambient batch from several channels sets none (batchChannels names
+   *  them). */
   routeChannelId?: string;
-  /** The server of `routeChannelId`'s channel, beside it whenever the chosen
-   *  event named its server: channel ids are unique only within one
-   *  server's connection (MCPL §14.2). */
+  /** The server of `routeChannelId`'s channel, beside it whenever the event
+   *  the route was taken from named its server: channel ids are unique only
+   *  within one server's connection (MCPL §14.2). */
   routeServerId?: string;
+  /** The batch's channels, each its registered id and server, in the order
+   *  they first appear, when no event addressed the agent and the batch's
+   *  events, notices aside in both, came from more than one channel the host
+   *  resolved: no route is chosen, and the turn's no-locus notice names
+   *  them. */
+  batchChannels?: Array<{ channelId: string; serverId?: string }>;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
@@ -302,35 +317,57 @@ function isMetadataTruthy(value: unknown): boolean {
  * addressed all come from that one event, so they can never disagree.
  */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
+  const said = events.filter((e) => !e.systemNotice);
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
-  for (const e of events) {
+  for (const e of said) {
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
     // skipping it would leave its wake on the most-recent-inbound fallback.
-    // An ambient one stays out: the route is never reported for it, so as
-    // the pick it would carry no telemetry at all and hide an earlier event
-    // that names its channel and author.
+    // An ambient one stays out: as the pick it would carry no telemetry at
+    // all and hide an earlier event that names its channel and author.
     if (!e.channelId && !e.authorId && !(e.addressed && e.routeChannelId)) continue;
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
   const pick = newestAddressed ?? newest;
-  if (!pick) return undefined;
+  const channels = said.some((e) => e.addressed) ? undefined : batchRoutes(said);
+  const route = pick?.addressed
+    ? (pick.routeChannelId ? { channelId: pick.routeChannelId, serverId: pick.serverId } : undefined)
+    : channels?.length === 1 ? channels[0] : undefined;
+  const several = channels !== undefined && channels.length > 1;
+  if (!pick && !route && !several) {
+    const notice = events.reduce<PendingEvent | undefined>(
+      (n, e) => (e.systemNotice && e.authorId && (!n || e.timestamp >= n.timestamp) ? e : n), undefined);
+    return notice ? { counterparty: counterpartyOf(notice) } : undefined;
+  }
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
-  const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
-  const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
+  const channelId = pick?.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
   return {
     ...(channelId ? { channelId } : {}),
-    ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
-    ...(pick.addressed ? { addressed: true } : {}),
-    ...(pick.addressed && pick.routeChannelId
-      ? { routeChannelId: pick.routeChannelId, ...(pick.serverId ? { routeServerId: pick.serverId } : {}) }
-      : {}),
-    at: pick.timestamp,
+    ...(pick?.authorId ? { counterparty: counterpartyOf(pick) } : {}),
+    ...(pick?.addressed ? { addressed: true } : {}),
+    ...(route ? { routeChannelId: route.channelId, ...(route.serverId ? { routeServerId: route.serverId } : {}) } : {}),
+    ...(several ? { batchChannels: channels } : {}),
+    at: pick?.timestamp ?? Math.max(...said.map((e) => e.timestamp)),
   };
+}
+
+function counterpartyOf(e: PendingEvent): string {
+  const ns = e.serverId || (e.channelId ? e.channelId.split(':')[0] : '') || 'channel';
+  return `${ns}:user:${e.authorId}`;
+}
+
+function batchRoutes(events: PendingEvent[]): Array<{ channelId: string; serverId?: string }> {
+  const routes: Array<{ channelId: string; serverId?: string }> = [];
+  for (const e of events) {
+    if (!e.routeChannelId) continue;
+    if (routes.some((r) => r.channelId === e.routeChannelId && r.serverId === e.serverId)) continue;
+    routes.push({ channelId: e.routeChannelId, ...(e.serverId ? { serverId: e.serverId } : {}) });
+  }
+  return routes;
 }
 
 /** A `[Gate: …]` line's reference to messages already in the window: how
@@ -3702,6 +3739,7 @@ export class EventGate {
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
+      ...(isSystemNotice(info.tags) ? { systemNotice: true as const } : {}),
       routeChannelId: this.routeChannelFor(info),
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
@@ -3877,13 +3915,13 @@ export class EventGate {
 
     // Provenance of the batched wake (who/where woke the agent): the newest
     // ADDRESSED event first, else the newest event naming a channel or an
-    // author; channel + author + addressed from that ONE event. When that
-    // event addressed the agent and its registered channel is known,
-    // `routeChannelId` names the turn's speech locus too — the reply goes
-    // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches set no locus. A batch whose line the
-    // gate left to the turn's start carries it too (`line`), one object
-    // shared by every agent the batch wakes, so it is written once.
+    // author, `chat:system` notices aside; channel + author + addressed from
+    // that ONE event. When that event addressed the agent and its registered
+    // channel is known, `routeChannelId` names the turn's speech locus too —
+    // the reply goes back to whoever addressed the agent, not to whichever
+    // channel last saw any traffic. A batch whose line the gate left to the
+    // turn's start carries it too (`line`), one object shared by every agent
+    // the batch wakes, so it is written once.
     const chosen = wakeProvenance(events);
     const provenance = line ? { ...chosen, line } : chosen;
     for (const agentName of this.getAgentNamesFn()) {

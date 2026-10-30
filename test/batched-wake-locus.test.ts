@@ -9,9 +9,12 @@
  *   - ambient AFTER the DM: the ambient channel became the fallback;
  *   - ambient BEFORE the DM: the DM never displaced it.
  * Now a batch containing an addressed message routes to that message's
- * registered channel. An ambient-only batch names no channel: under the
- * default `speech.locus: 'delivery'` the turn has no locus and its prose
- * stays private; under `'latest-inbound'` it keeps the legacy fallback.
+ * registered channel, and an ambient batch whose messages all came from one
+ * channel routes to that channel, as a direct ambient message's turn does.
+ * An ambient batch from several channels names none: under the default
+ * `speech.locus: 'delivery'` the turn has no locus, its prose stays private,
+ * and the resident is told which channels the batch came from; under
+ * `'latest-inbound'` it keeps the legacy fallback.
  *
  * The tests hold the gate's batch until both events are in it (holdBatches),
  * so they don't depend on the second reaching the gate inside the window.
@@ -42,7 +45,12 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
   throw new Error(`timed out waiting for: ${what}`);
 }
 
-function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
+function batchedWakeRig(opts: {
+  speech?: { locus: 'delivery' | 'latest-inbound' };
+  behavior?: 'always' | { debounce: number };
+  proseRouting?: 'locus' | 'hybrid';
+} = {}) {
+  const { speech, behavior = { debounce: 100 }, proseRouting } = opts;
   let tempDir: string;
   let statusPath: string;
   let commandPath: string;
@@ -59,14 +67,14 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', ...(proseRouting ? { proseRouting } : {}) }],
       ...(speech ? { speech } : {}),
       gate: {
         config: {
           policies: [{
             name: 'batch',
             match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] },
-            behavior: { debounce: 100 },
+            behavior,
           }],
           default: 'skip',
         },
@@ -138,6 +146,28 @@ function batchedWakeRig(speech?: { locus: 'delivery' | 'latest-inbound' }) {
     framework: () => framework,
     dm, dmInTwoParts, incoming, sent, publishes, holdBatches,
   };
+}
+
+async function twoChannelBatchHasNoLocus(rig: ReturnType<typeof batchedWakeRig>): Promise<void> {
+  const held = rig.holdBatches();
+  rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+  rig.incoming(ROOM, 'ambient', 'first');
+  await waitFor(() => rig.sent('incoming-sent') === 1, 'first sent');
+  await waitFor(() => held() >= 1, "the first message's batch held past its window");
+  rig.incoming(GENERAL, 'ambient', 'second');
+  await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
+  await rig.framework().runUntilIdle();
+  assert.deepEqual(rig.publishes(), [], 'nothing was published: no single channel was chosen');
+  const texts = rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
+    .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+  assert.ok(texts.includes('joining in'), 'the prose stays in the window');
+  const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
+  assert.equal(notices.length, 1, JSON.stringify(texts));
+  assert.ok(notices[0]!.includes('#room') && notices[0]!.includes('#general'), notices[0]);
+  assert.ok(notices[0]!.includes('no single channel was chosen'), notices[0]);
+  assert.ok(notices[0]!.includes('send your reply to that channel explicitly'), notices[0]);
+  assert.ok(!notices[0]!.includes('came from no channel'), notices[0]);
+  assert.ok(!notices[0]!.includes('configuration'), 'nothing is misconfigured when a batch spans channels');
 }
 
 describe('batched wake routing', () => {
@@ -212,30 +242,47 @@ describe('batched wake routing', () => {
     assert.ok(!routing.some((t) => t.includes('room')), JSON.stringify(routing));
   });
 
-  it("an ambient-only batch names no channel: under the default rule the turn has no locus and its prose stays private", async () => {
+  it('an ambient batch from one channel replies to that channel', async () => {
     const held = holdBatches();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+    incoming(ROOM, 'ambient', 'first');
+    await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+    await waitFor(() => held() >= 1, "the first message's batch held past its window");
+    incoming(ROOM, 'ambient', 'second');
+    await waitFor(() => publishes().length >= 1, 'reply published');
+    assert.deepEqual(publishes(), [ROOM]);
+  });
+
+  it('an ambient batch from two channels has no locus: its prose stays private, and the resident is told which channels the batch came from', async () => {
+    await twoChannelBatchHasNoLocus(rig);
+  });
+
+  it("a sleep's announcement in a turn from two channels is told those channels", async () => {
+    const held = holdBatches();
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'sleep-1', name: 'sleep', input: { seconds: 60 } }], 'tool_use'));
     incoming(ROOM, 'ambient', 'first');
     await waitFor(() => sent('incoming-sent') === 1, 'first sent');
     await waitFor(() => held() >= 1, "the first message's batch held past its window");
     incoming(GENERAL, 'ambient', 'second');
     await waitFor(() => rig.membrane().calls.length >= 1, 'the batch woke the agent');
     await rig.framework().runUntilIdle();
-    assert.deepEqual(publishes(), [], 'nothing was published: no delivery woke this turn');
+    assert.deepEqual(publishes(), []);
     const texts = rig.framework().getAgent('scout')!.getContextManager().getAllMessages()
       .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
-    // The announce-on-change baseline treats "no channel" as the state a
-    // resident boots in, so a first turn without a locus adds no notice; a
-    // later turn that loses one is told (announceLocusIfChanged).
-    assert.ok(texts.includes('joining in'), 'the prose stays in the window');
+    const notices = texts.filter((t) => t.startsWith('[send-undeliverable]'));
+    assert.equal(notices.length, 1, "the announcement's, since a sleep ends the turn: " + JSON.stringify(texts));
+    assert.ok(notices[0]!.includes('#room') && notices[0]!.includes('#general'), notices[0]);
+    assert.ok(notices[0]!.includes('no single channel was chosen'), notices[0]);
+    assert.ok(notices[0]!.includes('send your reply to that channel explicitly'), notices[0]);
+    assert.ok(!notices[0]!.includes('came from no channel') && !notices[0]!.includes('configuration'), notices[0]);
   });
 });
 
 describe("batched wake routing under speech.locus 'latest-inbound'", () => {
-  const rig = batchedWakeRig({ locus: 'latest-inbound' });
+  const rig = batchedWakeRig({ speech: { locus: 'latest-inbound' } });
   const { incoming, sent, publishes, holdBatches } = rig;
 
-  it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
+  it('an ambient batch from two channels keeps the legacy fallback (most recent inbound)', async () => {
     const held = holdBatches();
     rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
     incoming(ROOM, 'ambient', 'first');
@@ -244,6 +291,26 @@ describe("batched wake routing under speech.locus 'latest-inbound'", () => {
     incoming(GENERAL, 'ambient', 'second');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [GENERAL]);
+  });
+});
+
+describe("batched wake routing with proseRouting 'hybrid'", () => {
+  const rig = batchedWakeRig({ proseRouting: 'hybrid' });
+
+  it("an ambient batch from two channels has no locus, and the resident's notice names them", async () => {
+    await twoChannelBatchHasNoLocus(rig);
+  });
+});
+
+describe('a direct wake, for comparison', () => {
+  const rig = batchedWakeRig({ behavior: 'always' });
+  const { incoming, publishes } = rig;
+
+  it('an ambient message that wakes the agent directly replies to its channel', async () => {
+    rig.membrane().pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+    incoming(ROOM, 'ambient', 'hello');
+    await waitFor(() => publishes().length >= 1, 'reply published');
+    assert.deepEqual(publishes(), [ROOM]);
   });
 });
 
