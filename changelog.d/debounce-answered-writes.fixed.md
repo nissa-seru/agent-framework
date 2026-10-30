@@ -1,10 +1,12 @@
-- Debounced gate batches now omit events whose writes the recipient has already
-  read and answered, using the scheduler's existing answered-request evidence.
-  Fully satisfied batches add no gate line and start no turn; partial batches
-  retain their unseen events. Failed or aborted requests do not consume a wake.
-  Channel writes that require a reply wait only for their recipient's final
-  publication, for at most 65 seconds; a timeout keeps the wake. Publication
-  holds do not evict unseen events.
-  Judge, self-wake, sleep, and inference-status timing is unchanged.
-- `gate:debounce-delivered` now counts only events actually delivered to at
-  least one recipient, not events held for publication or already answered.
+- A debounced gate batch's wake starts no turn for an agent that has already
+  read and answered every event in it (#814). Each event is judged as a direct
+  wake's message is: its message at or under a request the agent answered
+  and, for one a reply is owed for (a registered channel's, not marked
+  `chat:ambient` or `chat:system`), the agent's publication there since it
+  read it; or its message gone. The scheduler judges it when the agent's turn
+  would start, so after the agent's last turn and that turn's final
+  publication have ended. A failed or aborted turn answers nothing, and an
+  event the host gave no message of its own keeps the wake. This covers
+  module events, MCPL channel messages and pushes, and heartbeat ticks and
+  reminders; a reply judge's batches and a deferred render's batched wake are
+  unchanged.

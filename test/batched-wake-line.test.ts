@@ -341,14 +341,16 @@ describe('isNewestContextEntry', () => {
     assert.equal(linesIn('LINE-A'), 1, 'written once: a later start writes it no second time');
   });
 
-  it('two handed lines are both written, each naming its message, even when one message is still newest', async () => {
+  it('two handed lines are written as one, naming both messages, even when one message is still newest', async () => {
     command(`dm ev-${++n} 134 1548000000000000001 first DM`);
     const first = await stored('first DM');
     command(`dm ev-${++n} 134 1548000000000000001 second DM`);
     const second = await stored('second DM');
-    (framework as unknown as Placing).placeWakeLines(scout(), [lineFor(first, '[Gate: LINE-1]'), lineFor(second, '[Gate: LINE-2]')]);
-    assert.equal(linesIn('LINE-1'), 1);
-    assert.equal(linesIn('LINE-2'), 1);
+    (framework as unknown as Placing).placeWakeLines(scout(), [lineFor(first, 'LINE-12'), lineFor(second, 'LINE-12')]);
+    const written = internals().agents.get('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).map((b) => (b.type === 'text' ? b.text ?? '' : '')).filter((t) => t.includes('LINE-12'));
+    assert.equal(written.length, 1, 'one line');
+    assert.match(written[0]!, /^\[Gate: 2 events matched\]\n\n- 2 messages in LINE-12 \(oldest ~\d+s ago\)/);
   });
 
   it('a line whose write fails doesn\'t fail the start and stays undecided for a later one; one that landed though its write threw counts as written', async () => {
@@ -404,7 +406,7 @@ describe('isNewestContextEntry', () => {
     const age = Number(/^\[Gate: 1 event matched\]\n\n- 1 message in LINE-AGE \(oldest ~(\d+)s ago\) — already shown above at arrival; this is a batched wake, not new content$/.exec(written ?? '')?.[1]);
     assert.ok(age >= 60, `counted to the write, not from it: ~${age}s`);
     const fixed = lineFor(md, 'LINE-AGE', 5_000);
-    assert.match(wakeLineText(fixed, 65_000), /^\[Gate: 1 event matched\]\n\n- 1 message in LINE-AGE \(oldest ~60s ago\) — already shown above at arrival/, 'the package\'s wakeLineText counts from the event to the time it\'s given');
+    assert.match(wakeLineText([fixed], 65_000), /^\[Gate: 1 event matched\]\n\n- 1 message in LINE-AGE \(oldest ~60s ago\) — already shown above at arrival/, 'the package\'s wakeLineText counts from the event to the time it\'s given');
   });
 
   it('a registered agent that doesn\'t read the window (an ephemeral run) writes no handed line', async () => {
@@ -740,7 +742,7 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
         pendingRequests: Array<{ agentName: string; wakeLines?: unknown[] }>;
       };
       const line = dmLine('ev-1', 'LINE-ID');
-      const provenance = { channelId: 'discord:dm:1', line };
+      const provenance = { channelId: 'discord:dm:1', lines: [line] };
       // As the gate's deliverEvents does: one provenance per batch, to every agent it wakes.
       for (const name of ['scout', 'mira']) internals.eventGate.requestInferenceFn(name, 'gate:debounce', 'gate', provenance);
       const carried = internals.pendingRequests.map((r) => r.wakeLines?.[0]);
@@ -784,7 +786,9 @@ describe('a handed line across readers, a flush, a quiesce and a hold', () => {
       assert.deepEqual(omitted.map((t) => t.reason), ['held', 'held', 'held', 'held'], 'each line traced as held, each time');
       await b.framework.resume();
       b.internals.placeWakeLines(scout, lines);
-      assert.equal(texts(b).filter((t) => t.includes('LINE-HELD')).length, 2, 'a later start writes both');
+      const written = texts(b).filter((t) => t.includes('LINE-HELD'));
+      assert.equal(written.length, 1, 'a later start writes both, as one line');
+      assert.ok(written[0]!.includes('in LINE-HELD (') && written[0]!.includes('in LINE-HELD2 ('), 'naming each message');
     } finally { await done(b); }
   });
 

@@ -58,11 +58,6 @@ const MAX_CONTENT_SNIPPET = 200;
 const MAX_TRACE_SNIPPET = 80;
 /** Max events buffered during inference before oldest are dropped. */
 const MAX_INFERENCE_BUFFER = 100;
-/** One 60s MCPL publish timeout plus 5s for teardown. A longer publication
- *  chain must prefer an extra wake to indefinitely withholding unseen input. */
-const PUBLICATION_FENCE_TIMEOUT_MS = 65_000;
-/** Match the scheduler's once-per-minute fault/stale warning cadence. */
-const WRITE_CHECK_WARN_INTERVAL_MS = 60_000;
 /** Minimum interval between filesystem checks for config changes (ms). */
 const RELOAD_THROTTLE_MS = 1000;
 
@@ -116,19 +111,7 @@ const DEFAULT_CONFIG: GateConfig = {
 // Internal types
 // ---------------------------------------------------------------------------
 
-interface PublicationFence {
-  events: PendingEvent[];
-  timer?: ReturnType<typeof setTimeout>;
-  ready: boolean;
-  timedOut: boolean;
-}
-
 interface PendingEvent {
-  /** Placement of the event's write, not a second record of what was read.
-   *  Retained by reference: admission can precede the host's write. */
-  after?: WritePlacement;
-  /** As on a direct wake: non-ambient channel traffic needs a reply there. */
-  replyTo?: { serverId: string; channelId: string };
   policyName: string;
   content: string;
   eventType: string;
@@ -163,11 +146,14 @@ interface PendingEvent {
    *  a channel message's id, a push event's event id (isNewestEntry). */
   messageId?: string;
   eventId?: string;
+  after?: WritePlacement;
+  replyTo?: { serverId: string; channelId: string };
 }
 
-/** Where the host put a message the gate wrote: the agent whose window it
- *  went to and, when it was held for that agent's live turn, the id it waits
- *  under in the host's queue, or else the id it was stored under. */
+/** Where the host put a message, one the gate wrote or an event's own that
+ *  the host passes to `evaluate`: the agent whose window it went to and,
+ *  when it was held for that agent's live turn, the id it waits under in the
+ *  host's queue, or else the id it was stored under. */
 export interface WritePlacement {
   agent?: string;
   deferredId?: string;
@@ -208,12 +194,13 @@ export interface WakeProvenance {
    *  requests can order by event recency, not by flush order. */
   at?: number;
   /** The batch's `[Gate: …]` line, when the gate handed it to the wake rather
-   *  than wrote it: a WakeLine, the parts its text is rendered from when it's
-   *  written (wakeLineText), decided by a fresh start of the wake's turn as
-   *  WakeLine says. Unlike the fields above, this is content for the agent's
-   *  window, not telemetry: it carries the channel's name as the agent is
-   *  shown it. */
-  line?: WakeLine;
+   *  than wrote it: a WakeLine for each of the batch's events, the parts its
+   *  text is rendered from when it's written (wakeLineText), decided by a
+   *  fresh start of the wake's turn as WakeLine says. Unlike the fields
+   *  above, this is content for the agent's window, not telemetry: it
+   *  carries the channel's name as the agent is shown it, and a quoted
+   *  event's text. */
+  lines?: WakeLine[];
 }
 
 interface DebounceState {
@@ -359,10 +346,26 @@ function referenceLine(count: number, channel: string, oldest: number, now: numb
     `batched wake, not new content`;
 }
 
-/** A handed batched-wake line's text (WakeLine), as it reads when written at
- *  `now`: the gate's words, its message's age counted to then. */
-export function wakeLineText(line: WakeLine, now: number): string {
-  return `[${NOTICE_TAG.gate}: 1 event matched]\n\n${referenceLine(1, line.shown, line.at, now)}`;
+/** A batched wake's line, for the events `lines` name (WakeLine), as it
+ *  reads when written at `now`: each quoted event's text, then each
+ *  channel's messages, counted, with the oldest one's age counted to then. */
+export function wakeLineText(lines: readonly WakeLine[], now: number): string {
+  const rows: string[] = [];
+  const byChannel = new Map<string, { shown: string; count: number; oldest: number }>();
+  for (const line of lines) {
+    if (line.content !== undefined) {
+      rows.push(`- [${line.policyNames.join(', ')}] (${line.entry.eventType}): ${suppliedValue(line.content)}`);
+      continue;
+    }
+    const shown = line.shown ?? '(unknown channel)';
+    const key = JSON.stringify([line.entry.serverId ?? null, line.channelId ?? line.entry.channelId ?? null, shown]);
+    const group = byChannel.get(key) ?? { shown, count: 0, oldest: line.at };
+    group.count += 1;
+    group.oldest = Math.min(group.oldest, line.at);
+    byChannel.set(key, group);
+  }
+  for (const { shown, count, oldest } of byChannel.values()) rows.push(referenceLine(count, shown, oldest, now));
+  return `[${NOTICE_TAG.gate}: ${lines.length} event${lines.length > 1 ? 's' : ''} matched]\n\n${rows.join('\n')}`;
 }
 
 /** The event's own stored entry, as the framework is asked about it. */
@@ -2133,9 +2136,6 @@ export class EventGate {
   // Inference buffering
   private inferring = new Set<string>();
   private inferenceBuffer: PendingEvent[] = [];
-  /** Completed requests whose final channel publication is still settling.
-   *  Only placement-backed channel wakes wait for these receipts. */
-  private publicationFences = new Map<string, Set<PublicationFence>>();
   /** Host quiesce suppression — see setQuiesced. */
   private quiesced = false;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
@@ -2209,8 +2209,6 @@ export class EventGate {
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
-  private isWriteDoneFn?: (agentName: string, after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
-  private writeCheckWarnAt = -Infinity;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2232,10 +2230,6 @@ export class EventGate {
      *  message is answered. */
     requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance, after?: WritePlacement) => void;
     getAgentNames: () => string[];
-    /** @internal Host's existing answered-write test, checked at delivery for
-     *  each recipient. Must not mutate the write or its read state. Absent,
-     *  or throwing: the event stays wakeable. */
-    isWriteDone?: (agentName: string, after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
     /**
      * Whether a channel is held from the recipients (a tune-out epoch in
      * force). A held event never enters a batch — admission runs before the
@@ -2274,9 +2268,10 @@ export class EventGate {
     channelShown?: (channel: { serverId: string; channelId: string }) => string;
     /** Whether an MCPL event's own context entry is still the newest entry in
      *  the window a batched wake's line would be written to, with nothing
-     *  waiting to be written there. A batched wake for that one message
+     *  waiting to be written there. A batched wake for that one message, or
+     *  one with an event `evaluate` was given a write for (`after`),
      *  doesn't write its line when it fires: it hands the line to the wake
-     *  (WakeProvenance.line), for a fresh start of the wake's turn to decide
+     *  (WakeProvenance.lines), for a fresh start of the wake's turn to decide
      *  (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
     /** The event types the gate can see from a source, when the host knows
@@ -2291,7 +2286,6 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
-    this.isWriteDoneFn = opts.isWriteDone;
     this.isHeldFn = opts.isHeld ?? (() => false);
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
@@ -3224,8 +3218,10 @@ export class EventGate {
   // Evaluate — main entry point
   // =========================================================================
 
-  /** `after` is an internal host placement, never event-supplied metadata.
-   *  Without it, a batch keeps its historical wake behavior. */
+  /** `after`: where the host put the event's own message, which it may fill
+   *  in after this call, before the batch fires. A debounced batch's wake
+   *  for an agent that has read and answered it is then dropped
+   *  (WakeLine.after); absent, the event keeps its batch's wake. */
   evaluate(info: GateEventInfo, after?: WritePlacement): GateDecision {
     this.reloadIfChanged();
 
@@ -3716,11 +3712,10 @@ export class EventGate {
     const judge = typeof policy.behavior === 'object' && 'judge' in policy.behavior ? policy.behavior.judge : undefined;
 
     const routeChannelId = this.routeChannelFor(info);
+    const replyTo = routeChannelId !== undefined && info.serverId
+      && !info.tags?.includes('chat:ambient') && !info.tags?.includes('chat:system')
+      ? { serverId: info.serverId, channelId: routeChannelId } : undefined;
     const event: PendingEvent = {
-      // A reply judge decides its own batches; this test is for debounces.
-      ...(!judge && after ? { after } : {}),
-      ...(routeChannelId && info.serverId && !info.tags?.includes('chat:ambient') && !info.tags?.includes('chat:system')
-        ? { replyTo: { serverId: info.serverId, channelId: routeChannelId } } : {}),
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
         ? safeSlice(info.content, 0, MAX_CONTENT_SNIPPET) + '...'
@@ -3739,6 +3734,7 @@ export class EventGate {
       routeChannelId,
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
+      ...(after && !judge ? { after, ...(replyTo ? { replyTo } : {}) } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -3794,7 +3790,7 @@ export class EventGate {
     // write or reload that sends it (clearStateFor), it would report a change
     // that was made as failed.
     try {
-      this.deliverEvents(events, true);
+      this.deliverEvents(events);
     } catch (err) {
       const one = events.length === 1;
       console.error(
@@ -3803,17 +3799,20 @@ export class EventGate {
       );
       return;
     }
+
+    this.emitTrace({
+      type: 'gate:debounce-delivered',
+      policyName,
+      eventCount: events.length,
+      timestamp: Date.now(),
+    });
   }
 
   // =========================================================================
   // Event delivery
   // =========================================================================
 
-  private deliverEvents(
-    batched: PendingEvent[],
-    traceDelivery = false,
-    released?: { agentName: string; timedOut: boolean },
-  ): void {
+  private deliverEvents(batched: PendingEvent[]): void {
     // Delivery-time re-check: a channel tuned out after its events were
     // batched is held now, and "already shown above at arrival" would be
     // untrue of them. They are dropped; the hold's own reader has them.
@@ -3832,71 +3831,6 @@ export class EventGate {
     }
     if (events.length === 0) return;
 
-    const delivered = new Set<PendingEvent>();
-    if (!released && (!this.isWriteDoneFn || !events.some((event) => event.after !== undefined))) {
-      this.deliverBatch(events);
-      for (const event of events) delivered.add(event);
-    } else {
-      const recipients = released ? [released.agentName] : this.getAgentNamesFn();
-      // Keep one shared line per distinct remainder: ordinary residents read
-      // the same message slot. Writing it once per recipient would duplicate
-      // the line in that shared context. As before, separate resident/fork
-      // views are not solved here (recipient selection is a separate concern).
-      const groups: Array<{ events: PendingEvent[]; agents: string[] }> = [];
-      for (const agentName of recipients) {
-        const fences = this.publicationFences.get(agentName);
-        // Each event belongs to one fence, with that fence's own deadline.
-        // A later turn cannot extend the wait for events already held here.
-        const fence = !released && fences && [...fences].find((f) => !f.ready);
-        const unread = events.filter((event) => {
-          if (fence && this.isWriteDoneFn && event.after !== undefined && event.replyTo !== undefined) {
-            // Publication holds have no inference-buffer cap: input which
-            // would otherwise be delivered must never be evicted here.
-            fence.events.push(event);
-            return false;
-          }
-          return released?.timedOut || !this.writeDone(agentName, event);
-        });
-        if (unread.length === 0) continue;
-        const group = groups.find((g) => g.events.length === unread.length && g.events.every((e, i) => e === unread[i]));
-        if (group) group.agents.push(agentName);
-        else groups.push({ events: unread, agents: [agentName] });
-      }
-      // Historically even a host with no recipients writes the batch's line.
-      if (recipients.length === 0) {
-        this.deliverBatch(events, recipients);
-        for (const event of events) delivered.add(event);
-      }
-      for (const group of groups) {
-        this.deliverBatch(group.events, group.agents,
-          released?.agentName ?? (group.agents.length === recipients.length ? undefined : group.agents[0]));
-        for (const event of group.events) delivered.add(event);
-      }
-    }
-    if (traceDelivery) {
-      const counts = new Map<string, number>();
-      for (const event of delivered) counts.set(event.policyName, (counts.get(event.policyName) ?? 0) + 1);
-      for (const [policyName, eventCount] of counts) {
-        this.emitTrace({ type: 'gate:debounce-delivered', policyName, eventCount, timestamp: Date.now() });
-      }
-    }
-  }
-
-  private writeDone(agentName: string, event: PendingEvent): boolean {
-    if (!event.after || !this.isWriteDoneFn) return false;
-    try {
-      return this.isWriteDoneFn(agentName, event.after, event.replyTo) === true;
-    } catch (err) {
-      const now = this.now();
-      if (now - this.writeCheckWarnAt >= WRITE_CHECK_WARN_INTERVAL_MS) {
-        this.writeCheckWarnAt = now;
-        console.error(`[gate] Could not check whether a batched write was answered; keeping its wake (check errors throttled to once per minute): ${errorText(err)}`);
-      }
-      return false;
-    }
-  }
-
-  private deliverBatch(events: PendingEvent[], recipients?: string[], forAgent?: string): void {
     const policyNames = [...new Set(events.map(e => e.policyName))];
 
     // Events whose content the framework already stored at arrival (MCPL
@@ -3904,71 +3838,63 @@ export class EventGate {
     // them here would inject a duplicate copy of the message minutes after
     // the fact, reading as fresh input the agent may have already handled.
     // Only events with no context entry of their own carry their content.
-    const quoted = events.filter(e => !e.inContext);
-    const referenced = events.filter(e => e.inContext);
-
-    const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${suppliedValue(e.content)}`);
-    // How each referenced channel is named in the line, in order.
-    const shown: string[] = [];
-    if (referenced.length > 0) {
-      // By channel, its server and its id: two servers' channels can share
-      // an id.
-      const byChannel = new Map<string, { name: string; count: number; oldest: number; label?: string }>();
-      for (const e of referenced) {
-        // The registered id when known, so this line names the channel the
-        // same way routing notices and send tools do (a push event's own
-        // channelId is the adapter's raw id), shown as the agent names it
-        // back where the event names its server.
-        // Only a registered id is a channel name; an adapter's raw id is
-        // shown as it is.
-        const id = e.routeChannelId ?? e.channelId;
-        const name = id === undefined
-          ? '(unknown channel)'
-          : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
-            ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
-            : suppliedValue(id);
-        const key = JSON.stringify([e.serverId ?? null, id ?? null]);
-        const entry = byChannel.get(key) ?? { name, count: 0, oldest: e.timestamp, label: e.channelLabel };
-        entry.count += 1;
-        entry.oldest = Math.min(entry.oldest, e.timestamp);
-        entry.label = entry.label ?? e.channelLabel;
-        byChannel.set(key, entry);
-      }
-      for (const { name, count, oldest, label } of byChannel.values()) {
-        // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id. A name
-        // may carry its own `#`, so one is added only where the name lacks
-        // it, as at the other places that add a `#`.
-        const channel = label ? `${label.startsWith('#') ? '' : '#'}${suppliedValue(label)} (${name})` : name;
-        shown.push(channel);
-        lines.push(referenceLine(count, channel, oldest, Date.now()));
-      }
+    // By channel, its server and its id: two servers' channels can share an
+    // id.
+    const channelKey = (e: PendingEvent) => JSON.stringify([e.serverId ?? null, e.routeChannelId ?? e.channelId ?? null]);
+    const byChannel = new Map<string, { name: string; label?: string }>();
+    for (const e of events) {
+      if (!e.inContext) continue;
+      // The registered id when known, so this line names the channel the
+      // same way routing notices and send tools do (a push event's own
+      // channelId is the adapter's raw id), shown as the agent names it
+      // back where the event names its server.
+      // Only a registered id is a channel name; an adapter's raw id is
+      // shown as it is.
+      const id = e.routeChannelId ?? e.channelId;
+      const name = id === undefined
+        ? '(unknown channel)'
+        : e.routeChannelId !== undefined && e.serverId !== undefined && this.channelShownFn
+          ? this.channelShownFn({ serverId: e.serverId, channelId: e.routeChannelId })
+          : suppliedValue(id);
+      const entry = byChannel.get(channelKey(e)) ?? { name, label: e.channelLabel };
+      entry.label = entry.label ?? e.channelLabel;
+      byChannel.set(channelKey(e), entry);
     }
-
-    // The line says which messages a wake is for. For one message that is
-    // still the newest thing in the window it would be written to, it says
-    // nothing the message right above doesn't. But the turn compiles later,
-    // and what lands in between puts the message above other entries, so the
-    // gate hands the line to the wake (WakeProvenance.line) and a fresh start
-    // of the wake's turn decides it (WakeLine). Several messages, one with
-    // anything after it, or content the line quotes, keep the line now.
-    const text = `[${NOTICE_TAG.gate}: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
-    const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
-    let line: WakeLine | undefined;
-    if (only && this.newestEntry(only)) {
-      const shownChannel = only.routeChannelId ?? only.channelId;
-      line = {
-        entry: entryRef(only),
-        policyNames,
-        shown: shown[0],
-        at: only.timestamp,
+    // Prefer the human-readable name; keep the id parenthesized so the
+    // agent can still address tools that want the composite id. A name
+    // may carry its own `#`, so one is added only where the name lacks
+    // it, as at the other places that add a `#`.
+    const shownOf = (e: PendingEvent): string => {
+      const { name, label } = byChannel.get(channelKey(e))!;
+      return label ? `${label.startsWith('#') ? '' : '#'}${suppliedValue(label)} (${name})` : name;
+    };
+    const lines: WakeLine[] = events.map((e) => {
+      const shownChannel = e.routeChannelId ?? e.channelId;
+      return {
+        entry: entryRef(e),
+        policyNames: [e.policyName],
+        at: e.timestamp,
         ...(shownChannel !== undefined ? { channelId: shownChannel } : {}),
+        ...(e.inContext ? { shown: shownOf(e) } : { content: e.content }),
+        ...(e.after ? { after: e.after } : {}),
+        ...(e.replyTo ? { replyTo: e.replyTo } : {}),
       };
-    } else {
-      this.addMessageFn('user', [{ type: 'text', text }], {
+    });
+
+    // The line says which messages a wake is for. A batch with an event the
+    // agent may have read and answered by the time its turn starts, or one
+    // message that is still the newest thing in the window it would be
+    // written to, has its line decided at that start: the gate hands it to
+    // the wake (WakeProvenance.lines), as WakeLine says. Any other batch
+    // keeps its line now.
+    const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
+    const handed = this.isNewestEntryFn !== undefined
+      && (events.some((e) => e.after !== undefined) || (only !== undefined && this.newestEntry(only)));
+    if (!handed) {
+      this.addMessageFn('user', [{ type: 'text', text: wakeLineText(lines, Date.now()) }], {
         source: 'gate:debounce',
         policies: policyNames,
-      }, forAgent);
+      });
     }
 
     // Provenance of the batched wake (who/where woke the agent): the newest
@@ -3978,11 +3904,11 @@ export class EventGate {
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
     // any traffic. Ambient-only batches set no locus. A batch whose line the
-    // gate left to the turn's start carries it too (`line`), one object
-    // shared by every agent the batch wakes, so it is written once.
+    // gate left to the turn's start carries it too (`lines`), the same
+    // objects for every agent the batch wakes, so it is written once.
     const chosen = wakeProvenance(events);
-    const provenance = line ? { ...chosen, line } : chosen;
-    for (const agentName of recipients ?? this.getAgentNamesFn()) {
+    const provenance = handed ? { ...chosen, lines } : chosen;
+    for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
@@ -4315,30 +4241,7 @@ export class EventGate {
     if (this.changesJudgedContext(agentName)) this.stopJudging();
   }
 
-  /** `repliesSettled` is an internal, per-agent fence for final publication.
-   *  It delays only that recipient's placement-backed channel debounce checks,
-   *  for at most PUBLICATION_FENCE_TIMEOUT_MS. The judge, self-wakes, sleep,
-   *  and inference-status snapshot keep their original timing. */
-  onInferenceEnded(agentName: string, repliesSettled?: Promise<void>): void {
-    if (repliesSettled && !this.disposed) {
-      const fence: PublicationFence = { events: [], ready: false, timedOut: false };
-      const fences = this.publicationFences.get(agentName) ?? new Set<PublicationFence>();
-      fences.add(fence);
-      this.publicationFences.set(agentName, fences);
-      const release = (timedOut = false) => {
-        if (this.disposed || fence.ready) return;
-        fence.ready = true;
-        fence.timedOut = timedOut;
-        clearTimeout(fence.timer);
-        if (timedOut) {
-          console.error(`[gate] Final-publication fence for ${quotedValue(agentName)} exceeded ${PUBLICATION_FENCE_TIMEOUT_MS} ms; releasing its held events as wakeable`);
-        }
-        this.flushPublicationFencesIfClear();
-      };
-      fence.timer = setTimeout(() => release(true), PUBLICATION_FENCE_TIMEOUT_MS);
-      fence.timer.unref?.();
-      void repliesSettled.then(() => release(), () => release());
-    }
+  onInferenceEnded(agentName: string): void {
     this.inferring.delete(agentName);
     this.flushInferenceBufferIfClear();
     this.flushJudgeHeldIfClear();
@@ -4369,7 +4272,6 @@ export class EventGate {
 
   private flushInferenceBufferIfClear(): void {
     if (this.quiesced) return;
-    this.flushPublicationFencesIfClear();
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
       // Defer to avoid re-entrancy inside trace callbacks. A delivery that
@@ -4377,7 +4279,7 @@ export class EventGate {
       // batch: thrown in the microtask, it would be uncaught.
       queueMicrotask(() => {
         try {
-          this.deliverEvents(events, true);
+          this.deliverEvents(events);
         } catch (err) {
           const one = events.length === 1;
           console.error(
@@ -4386,29 +4288,6 @@ export class EventGate {
           );
         }
       });
-    }
-  }
-
-  private flushPublicationFencesIfClear(): void {
-    if (this.disposed || this.quiesced || this.inferring.size > 0) return;
-    for (const [agentName, fences] of this.publicationFences) {
-      for (const fence of fences) {
-        if (!fence.ready) continue;
-        fences.delete(fence);
-        const events = fence.events.splice(0);
-        if (events.length === 0) continue;
-        // Keep released events outside the capped inference buffer too. If a
-        // turn or surgery is active at release, the ready fence waits here.
-        queueMicrotask(() => {
-          if (this.disposed) return;
-          try {
-            this.deliverEvents(events, true, { agentName, timedOut: fence.timedOut });
-          } catch (err) {
-            console.error(`[gate] ${events.length} events held for final publication couldn't be delivered (${errorText(err)}), so the batch is dropped`);
-          }
-        });
-      }
-      if (fences.size === 0) this.publicationFences.delete(agentName);
     }
   }
 
@@ -4427,13 +4306,9 @@ export class EventGate {
   } {
     let judgeHeldEvents = 0;
     for (const held of this.judgeHeld.values()) judgeHeldEvents += held.events.length;
-    const buffered = new Set(this.inferenceBuffer);
-    for (const fences of this.publicationFences.values()) {
-      for (const fence of fences) for (const event of fence.events) buffered.add(event);
-    }
     return {
       inferring: [...this.inferring],
-      bufferedEvents: buffered.size,
+      bufferedEvents: this.inferenceBuffer.length,
       droppedBufferedEvents: this.droppedBufferedEvents,
       sleepUntil: this.sleepUntil,
       judgeHeldEvents,
@@ -4896,10 +4771,6 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
-    for (const fences of this.publicationFences.values()) {
-      for (const fence of fences) clearTimeout(fence.timer);
-    }
-    this.publicationFences.clear();
     // stop() disposes the gate once its streams and event loop have ended (a
     // turn still compiling then is dropped at its next check, before it sends
     // anything). An agent left here by a turn whose exit didn't end it (a

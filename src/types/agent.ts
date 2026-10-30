@@ -601,6 +601,14 @@ export interface InferenceRequest {
    *  published into that channel having read it, or once the message isn't
    *  on its store's current branch, the wake starts no turn. */
   readsStoredMessage?: string;
+  /** Host-owned: this wake's sole cause is the batch its `wakeLines` name,
+   *  one line per event. Once the agent is done with every line's write
+   *  (WakeLine.after), each judged as `readsDeferredWrite` or
+   *  `readsStoredMessage` is, with the channel its line names a reply as
+   *  owed in (WakeLine.replyTo) as the wake's channel, the wake starts no
+   *  turn. A line with no write, or one written to another agent's window,
+   *  keeps the wake. */
+  readsWakeLines?: true;
   agentName: string;
   reason: string;
   source: string;

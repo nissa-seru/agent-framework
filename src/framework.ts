@@ -893,7 +893,7 @@ import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { asCalled, cutOffRefusal, markedInputRefusal, toolArgsProblems } from './tool-args.js';
 import { cutOffRound, type CutOffCall } from './cut-off-round.js';
-import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText } from './gate/event-gate.js';
+import { EventGate, MCPL_GATE_EVENT_TYPES, checkToolInput, formatShadowWarning, shownValue, wakeLineText, type WritePlacement } from './gate/event-gate.js';
 import { ReplyJudge } from './gate/reply-judge.js';
 import { HEARTBEAT_CHANGING_TOOLS, Heartbeat, isHeartbeatMcplServer, type HeartbeatScheduledWake, type HeartbeatWake } from './heartbeat/heartbeat.js';
 import type { GateEntryRef, GateEventInfo, WakeLine } from './gate/types.js';
@@ -3538,7 +3538,7 @@ function isPrimaryIfUnread(metadata: unknown): boolean {
 /** The batched-wake lines a merge of wakes carries (InferenceRequest
  *  wakeLines), one per event, in request order; undefined for none. */
 function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | undefined {
-  const byEntry = new Map<string, WakeLine>();
+  const byEntry = new Map<string | WakeLine, WakeLine>();
   for (const request of requests) {
     for (const line of request.wakeLines ?? []) {
       const key = wakeLineKey(line);
@@ -3548,10 +3548,18 @@ function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | und
   return byEntry.size > 0 ? [...byEntry.values()] : undefined;
 }
 
-/** A batched-wake line's identity: its event's stored entry. */
-function wakeLineKey(line: WakeLine): string {
+/** A batched-wake line's identity: its event's stored entry, or the line
+ *  itself for an event the window has no entry of its own for. */
+function wakeLineKey(line: WakeLine): string | WakeLine {
   const { eventType, serverId, channelId, messageId, eventId } = line.entry;
+  if (messageId === undefined && eventId === undefined) return line;
   return JSON.stringify([eventType, serverId ?? null, channelId ?? null, messageId ?? null, eventId ?? null]);
+}
+
+function sameWakeLines(a: readonly WakeLine[] | undefined, b: readonly WakeLine[] | undefined): boolean {
+  const left = a ?? [];
+  const right = b ?? [];
+  return left.length === right.length && left.every((line, i) => wakeLineKey(line) === wakeLineKey(right[i]!));
 }
 
 /** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
@@ -4860,7 +4868,7 @@ export class AgentFramework {
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
             // The batch's line, when the gate left it to the turn's start
             // (beginAgentTurn decides it: placeWakeLines).
-            ...(provenance?.line ? { wakeLines: [provenance.line] } : {}),
+            ...(provenance?.lines ? { wakeLines: provenance.lines, readsWakeLines: true as const } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
             // DM) routes like the direct path does: the reply goes to that
             // message's channel. Without it the turn froze on the
@@ -4885,7 +4893,6 @@ export class AgentFramework {
           });
         },
         getAgentNames: () => framework.registry.gateRecipients(),
-        isWriteDone: (agentName, after, replyTo) => framework.gateWriteDone(agentName, after, replyTo),
         isHeld: (serverId, channelId) =>
           !!(serverId && channelId && framework.tuneOutCoordinator?.holdFor(serverId, channelId)),
         // Push events reach the gate with the adapter's raw channel id; map
@@ -6236,7 +6243,7 @@ export class AgentFramework {
     const targets = this.heartbeatTargets();
     const silent = wake.kind === 'heartbeat' && wake.silent;
     // Without a gate, a push wakes the agent, and so does a tick.
-    const triggers = (after?: import('./gate/event-gate.js').WritePlacement): boolean => !this.eventGate || this.eventGate.evaluate(this.heartbeatGateEvent({ ...wake, silent }), after).trigger;
+    const triggers = (after?: WritePlacement): boolean => !this.eventGate || this.eventGate.evaluate(this.heartbeatGateEvent({ ...wake, silent }), after).trigger;
     if (silent) {
       if (!triggers()) return;
       console.error(`[heartbeat] silent scheduled wake ${logValue(wake.eventId)}`);
@@ -6479,7 +6486,7 @@ export class AgentFramework {
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
       a.readsDeferredWrite === b.readsDeferredWrite && a.readsStoredMessage === b.readsStoredMessage &&
-      (a.wakeLines ?? []).map(wakeLineKey).join('\n') === (b.wakeLines ?? []).map(wakeLineKey).join('\n');
+      a.readsWakeLines === b.readsWakeLines && sameWakeLines(a.wakeLines, b.wakeLines);
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
@@ -18941,9 +18948,6 @@ export class AgentFramework {
     // A deferred batch is admitted when it asks for its wake: the hold and
     // the gate decide now; its materialized delivery at assembly is vetoed
     // (`triggerInference: false`) and so is not shown to the gate again.
-    // No debounce placement here, even for a deferred render's plain wake:
-    // its reply requirement is the whole batch's allAmbient, not the latest
-    // occurrence's tags. Keep that aggregate wake conservative (#814).
     const decision = this.admitInbound({
       lane: 'push',
       serverId: occ.serverId,
@@ -19640,7 +19644,7 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${request.coalescingSubject ?? ''}|${request.readsDeferredWrite ?? ''}|${request.readsStoredMessage ?? ''}|${request.readsWakeLines ? 'l' : ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           // The wake it absorbs hands on its lines (WakeLine): each event's
@@ -19752,6 +19756,7 @@ export class AgentFramework {
         // keep its wake forever.
         const to = r.channelId === undefined || r.ambient === true || r.systemNotice === true
           ? undefined : { serverId: r.source, channelId: r.channelId };
+        if (r.readsWakeLines && r.wakeLines?.length) return r.wakeLines.every((line) => this.wakeLineDone(agent, line));
         return r.readsDeferredWrite !== undefined ? this.deferredWriteDone(agent, r.readsDeferredWrite, to)
           : r.readsStoredMessage !== undefined && this.storedMessageDone(agent, r.readsStoredMessage, to);
       });
@@ -19759,7 +19764,7 @@ export class AgentFramework {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
         requests.push(...left);
-        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the wake's channel where it carries one not marked ambient, or that were removed` +
+        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
           this.endPendingPrimary(agentName);
@@ -19927,6 +19932,7 @@ export class AgentFramework {
           ? trigger?.readsDeferredWrite : undefined,
         readsStoredMessage: requests.every((r) => r.readsStoredMessage === trigger?.readsStoredMessage)
           ? trigger?.readsStoredMessage : undefined,
+        readsWakeLines: requests.every((r) => r.readsWakeLines) ? true : undefined,
         // Every merged wake's handed line, each event's once: the turn's start
         // decides each (beginAgentTurn).
         wakeLines: mergeWakeLines(requests),
@@ -23929,8 +23935,8 @@ export class AgentFramework {
     // once this attempt's compile has moved the watermark past the write.
     // This frame's activeTurnTriggers entry keeps the trigger as it came; a
     // retry's frame records the copy it carries.
-    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined || trigger?.readsStoredMessage !== undefined) {
-      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, readsStoredMessage: _stored, ...retry } = trigger;
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsDeferredWrite !== undefined || trigger?.readsStoredMessage !== undefined || trigger?.readsWakeLines) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsDeferredWrite: _read, readsStoredMessage: _stored, readsWakeLines: _lines, ...retry } = trigger;
       trigger = retry;
     }
     // The wakes merged into this start are the turn's now: it reads them,
@@ -24712,7 +24718,6 @@ export class AgentFramework {
     const streamRouting = this.routingOf(agent.name);
     let hadToolCalls = false;
     let generationLost = false;
-    let finishGateReplies: (() => void) | undefined;
 
     // ---- Present-while-acting turn state ---------------------------------
     // Output locus for the WHOLE logical turn: frozen when the turn opened
@@ -25816,13 +25821,7 @@ export class AgentFramework {
             // field.
             delete streamRouting.unpostedSpeech;
             agent.reset();
-            if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId && this.eventGate) {
-              // The judge/status window ends now, as before. A debounce's
-              // channel-write check waits for the final publication receipt;
-              // every exit, including a failed send or disposal, releases it.
-              const repliesSettled = new Promise<void>((resolve) => { finishGateReplies = resolve; });
-              this.eventGate.onInferenceEnded(agent.name, repliesSettled);
-            }
+            if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, {
               stopReason: 'completed',
               speech: guardedWrapperTool || cutResults
@@ -26780,7 +26779,6 @@ export class AgentFramework {
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
-      finishGateReplies?.();
       // The accounting writes to the store, and a write that fails must not
       // skip the teardown after it.
       try {
@@ -29788,7 +29786,9 @@ export class AgentFramework {
    * decision, before the notices the turn's start writes itself (the locus
    * notice among them), and before the agent's answer to the wake.
    *
-   * - A wake's one line whose event is still the newest entry is left out:
+   * - A line whose event the delivery agent has read and answered is left
+   *   out (wakeLineDone, as the wake's drop judges it).
+   * - A wake's one line left whose event is still the newest entry is left out:
    *   no message follows the wake's, so it is the wake's whole cause, and the
    *   start's token defers an arrival into the window past its request. (The
    *   start's own notices, written after this, aren't messages a reply could
@@ -29800,7 +29800,7 @@ export class AgentFramework {
    *   slot holds, as on `main`: a reply after the message is in the message's
    *   own channel, but a message from another channel that lands between the
    *   gate's decision and its compile follows the message with no line.
-   * - Two or more lines are all written, each naming its message, its age
+   * - Two or more lines are written as one, naming each message, their ages
    *   counted to now.
    * - None is written while the host is quiesced or another reader of the
    *   slot has a turn alive (slotHeldFrom, as for a clock row): written, a
@@ -29818,10 +29818,11 @@ export class AgentFramework {
   private placeWakeLines(agent: Agent, lines: readonly WakeLine[]): void {
     const slot = this.deliveryAgent();
     if (!slot || agent !== slot) return;
-    const open = lines.filter((line) => !this.placedWakeLines.has(line));
+    const owed = lines.filter((line) => !this.wakeLineDone(slot, line));
+    const open = owed.filter((line) => !this.placedWakeLines.has(line));
     const held = this.slotHeldFrom(agent);
     const leftOut = held
-      || (lines.length === 1 && open.length === 1 && this.isNewestIn(slot, open[0].entry));
+      || (owed.length === 1 && open.length === 1 && this.isNewestIn(slot, open[0].entry));
     if (leftOut) {
       const reason = held ? 'held' : 'newest';
       for (const line of open) {
@@ -29835,29 +29836,28 @@ export class AgentFramework {
       }
       return;
     }
-    for (const line of open) {
-      const metadata = { source: 'gate:debounce', policies: line.policyNames } as MessageMetadata;
-      // A line is the wake's context, not its cause, so a write that fails
-      // doesn't fail the start: the line stays undecided, for a later fresh
-      // start of the wake. One whose write threw after its row landed counts
-      // as written, read back as the clock row's is.
-      const before = this.storedCountOf(slot);
-      let id: MessageId;
-      try {
-        id = slot.getContextManager().addMessage('user', [{ type: 'text', text: wakeLineText(line, Date.now()) }], metadata);
-      } catch (err) {
-        const landed = before === undefined ? undefined
-          : this.storedSince(slot, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', 'a batched wake\'s line');
-        if (!landed || landed.length === 0) {
-          console.error(`[gate] ${agent.name}: a batched wake's line could not be written${landed ? '' : ' (whether it landed is unknown)'}:`, err);
-          continue;
-        }
-        console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
-        id = landed[0]!.id;
+    if (open.length === 0) return;
+    const metadata = { source: 'gate:debounce', policies: [...new Set(open.flatMap((line) => line.policyNames))] } as MessageMetadata;
+    // A line is the wake's context, not its cause, so a write that fails
+    // doesn't fail the start: the line stays undecided, for a later fresh
+    // start of the wake. One whose write threw after its row landed counts
+    // as written, read back as the clock row's is.
+    const before = this.storedCountOf(slot);
+    let id: MessageId;
+    try {
+      id = slot.getContextManager().addMessage('user', [{ type: 'text', text: wakeLineText(open, Date.now()) }], metadata);
+    } catch (err) {
+      const landed = before === undefined ? undefined
+        : this.storedSince(slot, before, (m) => (m.metadata as { source?: unknown } | undefined)?.source === 'gate:debounce', 'gate', 'a batched wake\'s line');
+      if (!landed || landed.length === 0) {
+        console.error(`[gate] ${agent.name}: a batched wake's line could not be written${landed ? '' : ' (whether it landed is unknown)'}:`, err);
+        return;
       }
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
-      this.placedWakeLines.add(line);
+      console.error(`[gate] ${agent.name}: a batched wake's line landed though its write threw:`, err);
+      id = landed[0]!.id;
     }
+    this.emitTrace({ type: 'message:added', messageId: id, source: 'gate:wake-line' });
+    for (const line of open) this.placedWakeLines.add(line);
   }
 
   /** Whether `entry`'s own stored entry is the newest in `agent`'s window,
@@ -31185,34 +31185,17 @@ export class AgentFramework {
     }
   }
 
+  private wakeLineDone(agent: Agent, line: WakeLine): boolean {
+    const mark = this.readsWriteFor(line.after, agent.name);
+    if (mark.readsDeferredWrite !== undefined) return this.deferredWriteDone(agent, mark.readsDeferredWrite, line.replyTo);
+    return mark.readsStoredMessage !== undefined && this.storedMessageDone(agent, mark.readsStoredMessage, line.replyTo);
+  }
+
   private writeAnswered(agent: Agent, cm: ContextManager, row: StoredMessage, to: PublishDestination | undefined): boolean {
     const watermark = agent.getAnsweredWatermark();
     const branch = cm.currentBranch().name;
     if (!watermark || watermark.branch !== branch || row.sequence > watermark.sequence) return false;
     return to === undefined || agent.publishedAfterReading(destinationKey(to), branch, row.sequence);
-  }
-
-  /** Read-only counterpart of the scheduler's write checks for a debounce.
-   *  Keep the same placement-owner restriction: another resident's live
-   *  boundary can cover shared rows it never received (#819). Unknown
-   *  landings stay wakeable rather than being settled while filtering. */
-  private gateWriteDone(agentName: string, after: import('./gate/event-gate.js').WritePlacement, to?: PublishDestination): boolean {
-    const agent = this.agents.get(agentName);
-    if (!agent) return false;
-    const mark = this.readsWriteFor(after, agentName);
-    const cm = agent.getContextManager();
-    if (mark.readsDeferredWrite !== undefined) {
-      const id = mark.readsDeferredWrite;
-      if (this.deferredMessages.some((m) => m.id === id)) return false;
-      const row = this.landedRow(cm, id);
-      if (!row) return !this.unackedDeferredWrites.some((m) => m.id === id);
-      return this.writeAnswered(agent, cm, row, to);
-    }
-    if (mark.readsStoredMessage !== undefined) {
-      const row = cm.getMessage(mark.readsStoredMessage);
-      return !row || this.writeAnswered(agent, cm, row, to);
-    }
-    return false;
   }
 
   private readsWriteFor(placement: { agent?: string; deferredId?: string; messageId?: string } | undefined, agentName: string): Pick<InferenceRequest, 'readsDeferredWrite' | 'readsStoredMessage'> {
@@ -37033,7 +37016,7 @@ export class AgentFramework {
    * framework's policy inputs (recipients, the hold in force, the wake
    * gate), traced. Callers apply it; nothing downstream re-asks.
    */
-  private admitInbound(env: InboundEnvelope, after?: import('./gate/event-gate.js').WritePlacement): AdmissionDecision {
+  private admitInbound(env: InboundEnvelope, after?: WritePlacement): AdmissionDecision {
     const gateInfo = (e: InboundEnvelope) => ({
       content: e.gateContent,
       eventType: String(e.gateMetadata.eventType ?? 'unknown'),

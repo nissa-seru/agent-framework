@@ -6,6 +6,8 @@
  * Policies are read from a `gate.json` file with hot-reload support.
  */
 
+import type { WritePlacement } from './event-gate.js';
+
 // ---------------------------------------------------------------------------
 // Gate behaviors
 // ---------------------------------------------------------------------------
@@ -417,17 +419,21 @@ export interface GateEntryRef {
   eventId?: string;
 }
 
-/** A batched wake's `[Gate: …]` line that the gate handed to the wake rather
- *  than wrote: its batch was one event whose entry was still the newest in
- *  the window when the batch fired (EventGate's `isNewestEntry`). A fresh
- *  start of the wake's turn decides it (the framework's placeWakeLines): the
- *  delivery agent's own start leaves it out while that entry is still the
- *  newest, and writes it once something follows; a co-resident's start
- *  places none; two or more such lines are each written;
- *  and none is written while the host is quiesced or another reader of the
- *  residents' shared slot has a turn alive. A line left out stays for a
- *  later fresh start of the same wake. Its text is rendered when it's
- *  written (wakeLineText), so its age is true then.
+/** One event's part of a batched wake's `[Gate: …]` line, which the gate
+ *  handed to the wake rather than wrote (WakeProvenance.lines): its batch
+ *  had an event with a write the agent may already have read and answered
+ *  (`after`), or was one event whose entry was still the newest in the
+ *  window when the batch fired (EventGate's `isNewestEntry`). A fresh start
+ *  of the wake's turn decides its lines (the framework's placeWakeLines):
+ *  the delivery agent's own start leaves out each line whose event it has
+ *  read and answered, judged as the wake's drop is
+ *  (InferenceRequest.readsWakeLines), and the line of a remaining event that
+ *  is the only one and still the newest entry, and writes the others as one
+ *  message; a co-resident's start places none; and none is written while
+ *  the host is quiesced or another reader of the residents' shared slot has
+ *  a turn alive. A line not written stays for a later fresh start of the
+ *  same wake. Its text is rendered when it's written (wakeLineText), so its
+ *  ages are true then.
  *
  *  Every request for one wake carries the same object: the framework writes
  *  each line once by its identity, across the wake's retries and holds. A
@@ -437,13 +443,26 @@ export interface WakeLine {
   /** The event's own entry. */
   entry: GateEntryRef;
   policyNames: string[];
-  /** The channel as the line names it to the agent. */
-  shown: string;
+  /** The channel as the line names it to the agent; absent for an event the
+   *  line quotes (`content`). */
+  shown?: string;
   /** When the event arrived (ms): the line's age is counted from it to when
    *  the line is written (wakeLineText). */
   at: number;
   /** The channel the line names, as the omission's trace reports it. */
   channelId?: string;
+  /** The event's text, which its line quotes: an event other than an MCPL
+   *  channel message or push, which the window holds already. */
+  content?: string;
+  /** Where the host put the event's write, as the host passed it to
+   *  EventGate's `evaluate`. The event counts as read and answered by the
+   *  agent the write went to once a request that carried the write was
+   *  answered and, where `replyTo` names a channel, that agent has since
+   *  published there having read it, or once the write is gone. */
+  after?: WritePlacement;
+  /** The channel a reply to the event is owed in: its registered channel,
+   *  unless its server marked it `chat:ambient` or `chat:system`. */
+  replyTo?: { serverId: string; channelId: string };
 }
 
 /** Per-policy runtime statistics (for gate:status). */
