@@ -164,7 +164,8 @@ export interface WritePlacement {
  * Where a gate-requested wake came from, handed to the framework alongside the
  * reason so the turn's InferenceRequest can carry it (host telemetry stamps
  * "who woke the agent" from it). Ids only, never content or display names,
- * except `line`, which is the batch's own text for the agent's window.
+ * except `lines`, the batch's own text for the agent's window, a quoted
+ * event's text and the channels' names included.
  */
 export interface WakeProvenance {
   /** Composite channel id of the chosen event — telemetry only, never a
@@ -3219,9 +3220,11 @@ export class EventGate {
   // =========================================================================
 
   /** `after`: where the host put the event's own message, which it may fill
-   *  in after this call, before the batch fires. A debounced batch's wake
-   *  for an agent that has read and answered it is then dropped
-   *  (WakeLine.after); absent, the event keeps its batch's wake. */
+   *  in after this call, before the batch fires. For a host that places
+   *  handed lines (`isNewestEntry`) and passes them on as the request's
+   *  `wakeLines` with `readsWakeLines`, a debounced batch's wake for an agent
+   *  that has read and answered it is then dropped (WakeLine.after); absent,
+   *  the event keeps its batch's wake. */
   evaluate(info: GateEventInfo, after?: WritePlacement): GateDecision {
     this.reloadIfChanged();
 
@@ -3881,12 +3884,12 @@ export class EventGate {
       };
     });
 
-    // The line says which messages a wake is for. A batch with an event the
-    // agent may have read and answered by the time its turn starts, or one
-    // message that is still the newest thing in the window it would be
-    // written to, has its line decided at that start: the gate hands it to
-    // the wake (WakeProvenance.lines), as WakeLine says. Any other batch
-    // keeps its line now.
+    // The line says which messages a wake is for. For one message that is
+    // still the newest thing in the window it would be written to, it says
+    // nothing the message right above doesn't. But the turn compiles later,
+    // and what lands in between puts the message above other entries, so the
+    // gate hands the line to the wake (WakeProvenance.lines) and a fresh start
+    // of the wake's turn decides it (WakeLine).
     const only = events.length === 1 && events[0].inContext ? events[0] : undefined;
     const handed = this.isNewestEntryFn !== undefined
       && (events.some((e) => e.after !== undefined) || (only !== undefined && this.newestEntry(only)));
@@ -3903,9 +3906,7 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` names the turn's speech locus too — the reply goes
     // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches set no locus. A batch whose line the
-    // gate left to the turn's start carries it too (`lines`), the same
-    // objects for every agent the batch wakes, so it is written once.
+    // any traffic. Ambient-only batches set no locus.
     const chosen = wakeProvenance(events);
     const provenance = handed ? { ...chosen, lines } : chosen;
     for (const agentName of this.getAgentNamesFn()) {

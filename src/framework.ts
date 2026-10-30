@@ -3538,7 +3538,7 @@ function isPrimaryIfUnread(metadata: unknown): boolean {
 /** The batched-wake lines a merge of wakes carries (InferenceRequest
  *  wakeLines), one per event, in request order; undefined for none. */
 function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | undefined {
-  const byEntry = new Map<string | WakeLine, WakeLine>();
+  const byEntry = new Map<string | object, WakeLine>();
   for (const request of requests) {
     for (const line of request.wakeLines ?? []) {
       const key = wakeLineKey(line);
@@ -3548,9 +3548,8 @@ function mergeWakeLines(requests: readonly InferenceRequest[]): WakeLine[] | und
   return byEntry.size > 0 ? [...byEntry.values()] : undefined;
 }
 
-/** A batched-wake line's identity: its event's stored entry, or the line
- *  itself for an event the window has no entry of its own for. */
-function wakeLineKey(line: WakeLine): string | WakeLine {
+function wakeLineKey(line: WakeLine): string | object {
+  if (line.after) return line.after;
   const { eventType, serverId, channelId, messageId, eventId } = line.entry;
   if (messageId === undefined && eventId === undefined) return line;
   return JSON.stringify([eventType, serverId ?? null, channelId ?? null, messageId ?? null, eventId ?? null]);
@@ -17463,7 +17462,8 @@ export class AgentFramework {
           this.storeDueClock(target, 'event');
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
-        const placement = this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content));
+        const written = this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content));
+        Object.assign(placement, written);
         // Delivered to the fork, so it is the latest delivered inbound too
         // (the channel context's `incoming`; the fallback locus under the
         // legacy rule), as a resident's delivery is below.
@@ -17474,7 +17474,7 @@ export class AgentFramework {
         if (this.conversationRouter.getBinding(channel)?.agentName === target.name) {
           this.conversationRouter.touch(channel);
         }
-        this.emitTrace({ type: 'message:added', messageId: placement.messageId ?? '', source: 'mcpl:channel-incoming' });
+        this.emitTrace({ type: 'message:added', messageId: written.messageId ?? '', source: 'mcpl:channel-incoming' });
         if (decision.wake) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
@@ -17485,12 +17485,14 @@ export class AgentFramework {
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
-        return placement;
+        return written;
       }
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       decision.recipients = [target.name];
     } else if (this.conversationRouter) {
-      return this.routeConversationIncoming({ ...event, content }, metadata, decision);
+      const written = await this.routeConversationIncoming({ ...event, content }, metadata, decision);
+      if (written) Object.assign(placement, written);
+      return written;
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
@@ -29786,9 +29788,7 @@ export class AgentFramework {
    * decision, before the notices the turn's start writes itself (the locus
    * notice among them), and before the agent's answer to the wake.
    *
-   * - A line whose event the delivery agent has read and answered is left
-   *   out (wakeLineDone, as the wake's drop judges it).
-   * - A wake's one line left whose event is still the newest entry is left out:
+   * - A wake's one line whose event is still the newest entry is left out:
    *   no message follows the wake's, so it is the wake's whole cause, and the
    *   start's token defers an arrival into the window past its request. (The
    *   start's own notices, written after this, aren't messages a reply could
@@ -29800,8 +29800,6 @@ export class AgentFramework {
    *   slot holds, as on `main`: a reply after the message is in the message's
    *   own channel, but a message from another channel that lands between the
    *   gate's decision and its compile follows the message with no line.
-   * - Two or more lines are written as one, naming each message, their ages
-   *   counted to now.
    * - None is written while the host is quiesced or another reader of the
    *   slot has a turn alive (slotHeldFrom, as for a clock row): written, a
    *   line would land inside that turn, and deferred, it would wait for the

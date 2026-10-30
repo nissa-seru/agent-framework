@@ -2,6 +2,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { EventResponse, ProcessEvent, ProcessState } from '../src/index.js';
+import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, StreamEvent } from '@animalabs/membrane';
 import type { EventGate } from '../src/gate/event-gate.js';
 import { fixture, eventually } from './helpers/coalescing-fixture.js';
@@ -34,6 +35,19 @@ class BeforeCompletionStream extends MockYieldingStream {
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     for await (const event of { [Symbol.asyncIterator]: () => super[Symbol.asyncIterator]() }) {
       if (event.type === 'complete') await this.beforeComplete?.();
+      yield event;
+    }
+  }
+}
+
+class RateLimitedAtComplete extends MockYieldingStream {
+  constructor(replies: ConstructorParameters<typeof MockYieldingStream>[0], private readonly error: Error) { super(replies, true); }
+  override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    for await (const event of { [Symbol.asyncIterator]: () => super[Symbol.asyncIterator]() }) {
+      if (event.type === 'complete') {
+        yield { type: 'error', error: this.error } as StreamEvent;
+        return;
+      }
       yield event;
     }
   }
@@ -100,8 +114,8 @@ function heard(stream: MockYieldingStream) { return JSON.stringify(stream.receiv
 describe('debounced writes already read and answered', () => {
   for (const lane of ['module', 'channel', 'push', 'heartbeat'] as const) {
     for (const held of [false, true]) {
-      it(`${lane}: a 200 ms batch ${held ? 'held for inference' : 'firing after the turn'} starts no second call`, async () => {
-        const { f, module, streams, start } = await setup();
+      it(`${lane}: ${held ? 'a 200 ms batch held for inference' : 'a batch fired after the turn'} starts no second call`, async () => {
+        const { f, module, streams, start } = await setup(held ? 200 : 60_000);
         try {
           const { loop } = await start();
           await send(f, lane);
@@ -109,6 +123,10 @@ describe('debounced writes already read and answered', () => {
           if (held) await eventually(() => gateOf(f).inferenceDiagnostics().bufferedEvents === 1, 'batch held');
           module.release('first');
           await loop;
+          if (!held) {
+            assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 0, 'premise: nothing held for inference');
+            fire(f);
+          }
           await eventually(() => gateOf(f).debounceTimers.size === 0, 'debounce fired');
           await f.framework.runUntilIdle();
           assert.ok(heard(streams[0]!).includes('new event'), 'the tool boundary carried the event');
@@ -232,20 +250,20 @@ describe('debounced writes already read and answered', () => {
   });
 
 
-  for (const ambient of [false, true]) {
-    it(`a channel event read without replying there ${ambient ? 'drops its ambient wake' : 'keeps its addressed wake'}`, async () => {
+  for (const kind of ['addressed', 'ambient', 'system'] as const) {
+    it(`a channel event read without replying there ${kind === 'addressed' ? 'keeps its addressed wake' : kind === 'ambient' ? 'drops its ambient wake' : 'drops a chat:system notice\'s wake'}`, async () => {
       const { f, module, start } = await setup(60_000);
       try {
         await registerOpen(f, 'elsewhere');
         const { loop } = await start('elsewhere');
-        await incoming(f, 'work', 'mid', 'new event', ambient ? ['chat:ambient'] : MENTION);
+        await incoming(f, 'work', 'mid', 'new event', kind === 'ambient' ? ['chat:ambient'] : kind === 'system' ? ['chat:system'] : MENTION);
         await eventually(() => deferred(f, 'new event'), 'event deferred');
         module.release('first');
         await loop;
         assert.ok(!f.published.some((p) => p.channelId === 'work'), 'the first turn did not reply there');
         fire(f);
         await f.framework.runUntilIdle();
-        assert.equal(f.membrane.calls.length, ambient ? 1 : 2);
+        assert.equal(f.membrane.calls.length, kind === 'addressed' ? 2 : 1);
       } finally { await f.close(); }
     });
   }
@@ -284,8 +302,8 @@ describe('debounced writes already read and answered', () => {
     } finally { await f.close(); }
   });
 
-  for (const outcome of ['throws', 'refuses', 'stops', 'disposes'] as const) {
-    it(`a final publication that ${outcome} ${outcome === 'throws' || outcome === 'refuses' ? 'keeps the channel event\'s batched wake' : 'leaves no batch held'}`, async () => {
+  for (const outcome of ['publishes', 'throws', 'refuses', 'stops', 'disposes'] as const) {
+    it(`a final publication that ${outcome} ${outcome === 'publishes' ? 'drops the channel event\'s batched wake once it has published' : outcome === 'throws' || outcome === 'refuses' ? 'keeps the channel event\'s batched wake' : 'leaves no batch held'}`, async () => {
       const { f, module, start } = await setup(60_000);
       const registry = (f.framework as unknown as {
         channelRegistry: { routeSpeech: (...args: unknown[]) => Promise<unknown> };
@@ -298,6 +316,7 @@ describe('debounced writes already read and answered', () => {
         if (publishing) return original(...args);
         publishing = true;
         await wait;
+        if (outcome === 'publishes') return original(...args);
         if (outcome === 'throws') throw new Error('publication failed');
         return null; // a refusal (including a connection closed during stop)
       };
@@ -316,7 +335,11 @@ describe('debounced writes already read and answered', () => {
         release();
         await loop;
         await stopping;
-        if (outcome !== 'stops' && outcome !== 'disposes') {
+        if (outcome === 'publishes') {
+          await f.framework.runUntilIdle();
+          assert.ok(f.published.some((p) => p.channelId === 'work'), 'premise: the held publication reached the channel');
+          assert.equal(f.membrane.calls.length, 1, 'judged after the publication, the wake is dropped');
+        } else if (outcome !== 'stops' && outcome !== 'disposes') {
           await f.framework.runUntilIdle();
           assert.equal(f.membrane.calls.length, 2, 'failed publication leaves a chance to reply');
         }
@@ -324,6 +347,33 @@ describe('debounced writes already read and answered', () => {
       } finally { release(); await f.close(); }
     });
   }
+
+  it("a batched wake's turn that fails into a provider's stated wait after a tool round answered its event is retried, not dropped", async () => {
+    const { f, module } = await setup(60_000);
+    (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+      f.membrane.calls.push(request);
+      if (f.membrane.calls.length === 1) {
+        return new RateLimitedAtComplete([waitCall('first'), say('answered')], new MembraneError({
+          type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 30,
+          message: 'rate limit reached', rawError: { status: 429 }, rawRequest: request,
+        }));
+      }
+      return new MockYieldingStream([say('retried')], true);
+    };
+    try {
+      await send(f, 'module');
+      await f.framework.runUntilIdle();
+      fire(f);
+      const idle = f.framework.runUntilIdle();
+      await eventually(() => module.entered.has('first'), "the batch's turn reached its tool");
+      module.release('first');
+      await idle;
+      const holds = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> }).providerAccelerationCooldowns;
+      await eventually(() => !holds.has('agent'), "the provider's stated wait released the turn's retry");
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 2, 'the retry ran');
+    } finally { await f.close(); }
+  });
 
   for (const outcome of ['aborted', 'failed'] as const) {
     it(`an ${outcome} turn keeps the held batch wake`, async () => {
