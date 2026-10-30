@@ -14,7 +14,7 @@
 import type { ToolResult } from '../../types/events.js';
 import { type Change, type FilePlan, type Leaves, type MatchProblem, SHOWN_MATCHES } from './edit-plan.js';
 import { answerText, fieldLine, sectionLead, sectionText, shownValue, textAnswer, type DiskState } from './result-text.js';
-import { MAX_LINE_CHARS, numberedLine, safeCut } from './text.js';
+import { MAX_LINE_CHARS, safeCut } from './text.js';
 
 /** The tool a call came through, which words its refusals and receipt. */
 export type EditTool = 'edit' | 'edit_many';
@@ -437,6 +437,7 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
   };
   const out: string[] = [];
   const omitted: string[] = [];
+  let firstNear = 0;
   for (const region of regions) {
     // The region's lines, numbered, built one at a time while they fit, so a
     // region of millions of lines, which is named by its lines, isn't built
@@ -449,10 +450,10 @@ export function shownRegions(plan: FilePlan, budget: { left: number }, maxChars:
       const newline = plan.updated.indexOf('\n', lineStart);
       const lineEnd = newline === -1 || newline >= region.end ? region.end : newline;
       const text = asStored(plan.updated.slice(lineStart, lineEnd), n, lineEnd === newline);
-      const near = spans.filter((span) => n >= span.startLine - CONTEXT_LINES && n <= span.endLine + CONTEXT_LINES);
-      const numberedText = !near.length || near.some((span) => n > span.startLine && n < span.endLine)
-        ? numberedLine(text, n)
-        : nearLine(text, n, near);
+      while (spans[firstNear]!.endLine + CONTEXT_LINES < n) firstNear++;
+      const near: Span[] = [];
+      for (let k = firstNear; k < spans.length && spans[k]!.startLine - CONTEXT_LINES <= n; k++) near.push(spans[k]!);
+      const numberedText = nearLine(text, n, near);
       cost += numberedText.length + (lines.length ? 1 : 0);
       if (cost > budget.left) fits = false;
       else lines.push(numberedText);

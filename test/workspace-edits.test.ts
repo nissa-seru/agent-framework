@@ -279,6 +279,30 @@ test("a replacement of several lines shows its first line from 80 before it, its
     `    13\t${'a'.repeat(80)} [… 920 more chars]`,
     `    14\t${'a'.repeat(80)} [… 920 more chars]`,
   ].join('\n'));
+  await file('ends.txt', `${lines.join('\n')}\n`);
+  const ends = dataOf(await call('edit', { path: 'work/ends.txt', oldString: 'MARK', newString: 'ONE\n' }));
+  assert.equal(ends.changed, [
+    `     8\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `     9\t[… 920 chars before] ${'a'.repeat(80)}`,
+    `    10\t[… 380 chars before] ${'b'.repeat(80)}ONE`,
+    `    11\t${'c'.repeat(80)} [… 456 more chars]`,
+    `    12\t${'a'.repeat(80)} [… 920 more chars]`,
+  ].join('\n'));
+});
+
+test("a change's own text shows as far as a line's 2,000 allows, on its first, last and between lines alike, a tail no longer than its marker shown whole", async (t) => {
+  const { call, file } = setup(t);
+  await file('counted.txt', 'MARKy\n');
+  const counted = dataOf(await call('edit', { path: 'work/counted.txt', oldString: 'MARK', newString: 'x'.repeat(3000) }));
+  assert.equal(counted.changed, `     1\t${'x'.repeat(2000)} [… 1001 more chars]`);
+  await file('shown.txt', `MARK${'y'.repeat(10)}\n`);
+  const shown = dataOf(await call('edit', { path: 'work/shown.txt', oldString: 'MARK', newString: 'x'.repeat(1995) }));
+  assert.equal(shown.changed, `     1\t${'x'.repeat(1995)}${'y'.repeat(10)}`);
+  await file('between.txt', 'MARK\n');
+  const between = dataOf(await call('edit', {
+    path: 'work/between.txt', oldString: 'MARK', newString: `ONE\n${'m'.repeat(2005)}\n${'n'.repeat(3000)}\nTWO`,
+  }));
+  assert.equal(between.changed, `     1\tONE\n     2\t${'m'.repeat(2005)}\n     3\t${'n'.repeat(2000)} [… 1000 more chars]\n     4\tTWO`);
 });
 
 test("a part of a line is left out only where its marker is shorter than it, so a line with nothing worth cutting reads whole", async (t) => {
@@ -289,6 +313,14 @@ test("a part of a line is left out only where its marker is shorter than it, so 
   await file('past.txt', `${'p'.repeat(110)}\nMARK\n${'s'.repeat(110)}\n`);
   const cut = dataOf(await call('edit', { path: 'work/past.txt', oldString: 'MARK', newString: 'DONE' }));
   assert.equal(cut.changed, `     1\t[… 30 chars before] ${'p'.repeat(80)}\n     2\tDONE\n     3\t${'s'.repeat(80)} [… 30 more chars]`);
+  await file('gap.txt', `${'a'.repeat(20)}ONE${'b'.repeat(170)}TWO${'c'.repeat(20)}\n`);
+  const gap = dataOf(await call('edit_many', {
+    edits: [
+      { path: 'work/gap.txt', oldString: 'ONE', newString: '1' },
+      { path: 'work/gap.txt', oldString: 'TWO', newString: '2' },
+    ],
+  }));
+  assert.equal(gap.changed, `work/gap.txt\n     1\t${'a'.repeat(20)}1${'b'.repeat(170)}2${'c'.repeat(20)}`);
 });
 
 test("a receipt names the lines of an edit's other replacements, the first 20 and how many more", async (t) => {
