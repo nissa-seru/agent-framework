@@ -1953,8 +1953,7 @@ export class WorkspaceModule implements Module {
           + 'its newString read the same way. '
           + "Only the replaced text changes, and the new text's line ends take those of the text it replaces. "
           + 'A change disk made to the file is taken in first, and the answer says so. '
-          + "The answer shows the changed region, numbered: the new text with up to 80 characters on each side of it, as far as a line's 2,000 allows, and two lines before and after, "
-          + 'each as its 80 characters nearest the change; what it leaves out of a line is marked with how many characters it holds. '
+          + 'The answer shows the changed region, numbered, a long line from shortly before the change on it, as its length allows. '
           + 'For several edits at once, in one file or across files, applied all or none, use edit_many.' + editDirect,
         inputSchema: {
           type: 'object' as const,
@@ -1977,7 +1976,7 @@ export class WorkspaceModule implements Module {
           + "A refusal names the problems it finds, each by its edit's number in the list (from 1). "
           + 'All or none holds in the workspace: on a mount that writes to disk, disk can still refuse a file, '
           + "and the answer then says every edit is stored and names each file disk refused, with its push's reason. "
-          + "The answer shows each edit's first changed region as edit's answer shows its change."
+          + "The answer shows each edit's first changed region, numbered, a long line from shortly before each change on it, as its length allows."
           + editManyDirect,
         inputSchema: {
           type: 'object' as const,

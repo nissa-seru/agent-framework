@@ -10,4 +10,4 @@
   line is marked with how many characters it holds, as a long line's
   left-out parts were, and a part is left out only where its marker is
   shorter than it, so a line with nothing worth cutting reads as before
-  (connectome-host#546). The two tools' descriptions change with it.
+  (connectome-host#546).
