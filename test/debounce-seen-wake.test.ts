@@ -167,6 +167,30 @@ describe('debounced writes already read and answered', () => {
     } finally { off(); await f.close(); }
   });
 
+  it("a co-resident whose own turn answered the slot after the event still wakes for a batch written to the delivery agent's window", async () => {
+    const { f, module } = await setup(60_000, false, undefined,
+      ['agent', 'other'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
+    const turns: string[] = [];
+    const off = f.framework.onTrace((event) => {
+      if (event.type === 'inference:started') turns.push(event.agentName);
+    });
+    try {
+      await send(f, 'module');
+      await f.framework.runUntilIdle();
+      (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+        agentName: 'other', reason: 'test', source: 'editor', channelId: 'work', channelServerId: 'editor', timestamp: Date.now(),
+      });
+      const idle = f.framework.runUntilIdle();
+      await eventually(() => module.entered.has('first'), "other's turn reached its tool");
+      module.release('first');
+      await idle;
+      assert.deepEqual(turns, ['other'], "premise: other's turn read the slot after the event and was answered");
+      fire(f);
+      await f.framework.runUntilIdle();
+      assert.deepEqual(turns.slice(1).sort(), ['agent', 'other'], "the event is the delivery agent's write, so other's answer doesn't take its wake");
+    } finally { off(); await f.close(); }
+  });
+
   it('residents of a slot whose delivery agent answered the batch still wake, and the slot gets no line naming what it answered', async () => {
     const { f, module, start } = await setup(60_000, false, undefined,
       ['agent', 'other', 'third'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
