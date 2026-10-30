@@ -383,7 +383,7 @@ describe('debounced writes already read and answered', () => {
       f.membrane.calls.push(request);
       if (f.membrane.calls.length === 1) {
         return new RateLimitedAtComplete([waitCall('first'), say('answered')], new MembraneError({
-          type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 30,
+          type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs: 600_000,
           message: 'rate limit reached', rawError: { status: 429 }, rawRequest: request,
         }));
       }
@@ -397,8 +397,9 @@ describe('debounced writes already read and answered', () => {
       await eventually(() => module.entered.has('first'), "the batch's turn reached its tool");
       module.release('first');
       await idle;
-      const holds = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> }).providerAccelerationCooldowns;
-      await eventually(() => !holds.has('agent'), "the provider's stated wait released the turn's retry");
+      const holds = (f.framework as unknown as { providerAccelerationCooldowns: Map<string, { heldRequests: unknown[] }> }).providerAccelerationCooldowns;
+      assert.equal(holds.get('agent')?.heldRequests.length, 1, "premise: the provider's stated wait holds the turn's retry");
+      f.framework.releaseProviderWait('agent');
       await f.framework.runUntilIdle();
       assert.equal(f.membrane.calls.length, 2, 'the retry ran');
     } finally { await f.close(); }
