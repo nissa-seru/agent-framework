@@ -94,10 +94,12 @@ async function setup(debounce = 200, failing = false, beforeComplete?: (f: Fixtu
   };
   return { f, module, streams, start };
 }
-async function send(f: Fixture, lane: 'module' | 'channel' | 'push' | 'heartbeat', body = 'new event', id = 'mid') {
-  if (lane === 'heartbeat') {
-    (f.framework as unknown as { deliverHeartbeat(wake: unknown): void })
-      .deliverHeartbeat({ kind: 'reminder', reminderId: `r-${id}`, recurring: false, text: body, eventId: `hb-${id}` });
+async function send(f: Fixture, lane: 'module' | 'channel' | 'push' | 'heartbeat' | 'reminder', body = 'new event', id = 'mid') {
+  if (lane === 'heartbeat' || lane === 'reminder') {
+    (f.framework as unknown as { deliverHeartbeat(wake: import('../src/heartbeat/heartbeat.js').HeartbeatWake): void }).deliverHeartbeat(
+      lane === 'heartbeat'
+        ? { kind: 'heartbeat', reason: 'schedule', silent: false, text: body, eventId: id }
+        : { kind: 'reminder', reminderId: id, recurring: false, text: body, eventId: id });
   } else if (lane === 'module') {
     f.framework.pushEvent({ type: 'clock:reminder', source: 'clock', content: body } as unknown as ProcessEvent);
   } else if (lane === 'channel') {
@@ -112,7 +114,7 @@ function deferred(f: Fixture, body: string) {
 function heard(stream: MockYieldingStream) { return JSON.stringify(stream.receivedToolResultOptions); }
 
 describe('debounced writes already read and answered', () => {
-  for (const lane of ['module', 'channel', 'push', 'heartbeat'] as const) {
+  for (const lane of ['module', 'channel', 'push', 'heartbeat', 'reminder'] as const) {
     for (const held of [false, true]) {
       it(`${lane}: ${held ? 'a 200 ms batch held for inference' : 'a batch fired after the turn'} starts no second call`, async () => {
         const { f, module, streams, start } = await setup(held ? 200 : 60_000);
@@ -209,7 +211,7 @@ describe('debounced writes already read and answered', () => {
     } finally { off(); await f.close(); }
   });
 
-  it('residents of a slot whose delivery agent answered the batch still wake, and the slot gets no line naming what it answered', async () => {
+  it('unsatisfied residents retain stored content without re-presenting it in a shared summary', async () => {
     const { f, module, start } = await setup(60_000, false, undefined,
       ['agent', 'other', 'third'].map((name) => ({ name, model: 'test', systemPrompt: 'test' })));
     try {
@@ -219,12 +221,19 @@ describe('debounced writes already read and answered', () => {
       module.release('first');
       await loop;
       fire(f);
-      await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 3, 'both residents that had not answered wake');
-      for (const name of ['agent', 'other', 'third']) {
-        const lines = f.framework.getAgent(name)!.getContextManager().getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
-        assert.equal(lines.length, 0, `${name}'s window has no line for the answered event`);
+      const linesFor = (name: string) => f.framework.getAgent(name)!.getContextManager()
+        .getAllMessages().filter((row) => row.metadata?.source === 'gate:debounce');
+      const other = linesFor('other');
+      const third = linesFor('third');
+      assert.equal(other.length, 0, 'a shared summary must not re-present the event to its answered owner');
+      assert.deepEqual(third, other);
+      for (const name of ['other', 'third']) {
+        assert.match(JSON.stringify(f.framework.getAgent(name)!.getContextManager().getAllMessages()), /new event/, 'original stored content is still in each resident window');
       }
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 3, 'both unsatisfied recipients wake');
+      for (const request of f.membrane.calls.slice(1)) assert.match(JSON.stringify(request), /new event/, 'each request actually includes the original input');
+      for (const name of ['agent', 'other', 'third']) assert.deepEqual(linesFor(name), [], `${name}'s window has no line for the event its delivery agent answered`);
     } finally { await f.close(); }
   });
 
@@ -339,7 +348,7 @@ describe('debounced writes already read and answered', () => {
           await f.framework.runUntilIdle();
           assert.ok(f.published.some((p) => p.channelId === 'work'), 'premise: the held publication reached the channel');
           assert.equal(f.membrane.calls.length, 1, 'judged after the publication, the wake is dropped');
-        } else if (outcome !== 'stops' && outcome !== 'disposes') {
+        } else if (outcome === 'throws' || outcome === 'refuses') {
           await f.framework.runUntilIdle();
           assert.equal(f.membrane.calls.length, 2, 'failed publication leaves a chance to reply');
         }
