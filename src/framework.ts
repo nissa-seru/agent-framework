@@ -13051,7 +13051,9 @@ export class AgentFramework {
           },
           debounceMs: {
             type: 'number',
-            description: 'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000).',
+            description:
+              'Shorthand for { debounce: ms }: wake once after ms of quiet (100–300000), unless by the ' +
+              'time it would start your turn you\'ve read and answered every event in the batch.',
           },
           rateLimit: {
             type: 'object',
