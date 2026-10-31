@@ -226,6 +226,27 @@ export interface Module {
   onToolBatchComplete?(agentName: string): Promise<void>;
 
   /**
+   * A notice of how a turn's closing words ended: a text-only turn's reply;
+   * a tool turn's words after its last tool round (on the XML tool path, the
+   * whole turn's, as its final routing takes them); for a turn a tool ended,
+   * its last round's words. `parts` has one part per run or envelope the
+   * final routing routes, keeps or holds, in the order written. It is empty
+   * when the closing words have none (on the native path, a closing round
+   * with no words); on the XML tool path (no verbatim round content) it is
+   * also empty for a turn a tool ends, whose last round's words the
+   * framework doesn't route. Called once per logical turn end, after the
+   * turn's final routing is decided and before its receipt where it has one,
+   * whether or not the framework has a channel registry, so a module
+   * relaying an agent's reply can relay exactly what was routed and say why
+   * the rest wasn't. A notice, not an ask: the framework doesn't await it,
+   * and a module that throws or rejects changes nothing for the turn. Not
+   * called for a turn that fails or is stopped, where no final routing
+   * happens. Under explicit routing, a turn a tool ends is reported once its
+   * deliveries have run, which can be after the turn's work has ended.
+   */
+  onFinalProse?(agentName: string, parts: FinalProsePart[]): void | Promise<void>;
+
+  /**
    * Declare extra settings for the synthesized `agent_settings` tool.
    * Modules owning hot-tunable runtime state (e.g. a host settings module
    * managing extended-thinking toggles) expose it here instead of registering
@@ -702,6 +723,52 @@ export interface MessageEdit {
   messageId: MessageId;
   content: ContentBlock[];
 }
+
+// ============================================================================
+// Final Prose (Module.onFinalProse)
+// ============================================================================
+
+/**
+ * How one run of a turn's closing words ended, as Module.onFinalProse
+ * reports it. A silent turn's runs are `silent`; without a channel registry
+ * they are `no-registry`, or `no-destination` for a hybrid or explicit agent;
+ * otherwise the agent's prose routing decides. `text` is carried only where
+ * a host may hand the words on: words routed, and words the framework never
+ * routes (disabled routing; no channel registry, for a locus or disabled
+ * agent). Words the framework kept or held are named by kind alone; under
+ * disabled routing that is only a round a skip_reply silences. A delivery
+ * that fails after the routing decided on it is still `routed`, and an
+ * explicit or hybrid one may also come back to the agent as a draft to
+ * resend.
+ */
+export type FinalProsePart =
+  /** The turn's routing decided to send them. Whether a post landed, or had anywhere to go, is for the turn's receipt to say, or under explicit routing the bounce. */
+  | { kind: 'routed'; text: string }
+  /** Kept by the agent's own choice: skip_reply, a drafts round's kept words, a private think, a skip_reply envelope; under disabled routing, only a round a skip_reply silences. */
+  | { kind: 'private' }
+  /** Held because a send this turn reached where they were going: `where` as the agent is shown it, `delivered` false where the send may have posted. */
+  | { kind: 'sent'; where: string; delivered: boolean }
+  /** Held because the framework can't tell where, or whether, a send this turn posted. */
+  | { kind: 'sent-unknown' }
+  /**
+   * Not delivered for want of a destination: explicit or hybrid routing's
+   * words with none, with one that didn't resolve, or whose `{{unsent}}`
+   * couldn't be resent, bounced or held as a draft; a heartbeat turn's with
+   * no locus; and, without a channel registry, each closing run of a hybrid
+   * or explicit agent, whatever its envelopes.
+   */
+  | { kind: 'no-destination' }
+  /**
+   * Not routed: the agent's proseRouting is 'disabled', which decides no
+   * privacy beyond a round a skip_reply silences. A same-round private think,
+   * a drafts round, a script's calls, a round cut off at the output limit and
+   * a silence carried into a retry or restart leave words `disabled`.
+   */
+  | { kind: 'disabled'; text: string }
+  /** Not routed: a silent turn's (a silent heartbeat's). */
+  | { kind: 'silent' }
+  /** Not routed: the framework has no channel registry (a locus or disabled agent's words). */
+  | { kind: 'no-registry'; text: string };
 
 // ============================================================================
 // Speech Handler Types

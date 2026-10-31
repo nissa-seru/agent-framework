@@ -73,6 +73,7 @@ import type {
   AgentState,
   Module,
   SpeechContext,
+  FinalProsePart,
   ContextMaintenanceRun,
   ContextMaintenanceAgentRun,
   ContextMaintenanceSnapshot,
@@ -1606,6 +1607,11 @@ interface ProseRound {
   draftsRound?: boolean;
   /** The outgoing stream of the stream that queued the round. */
   onPublished?: SpeechPublished;
+  parts?: FinalProsePart[];
+}
+
+function notePart(round: ProseRound, part: FinalProsePart): void {
+  round.parts?.push(part);
 }
 
 /**
@@ -20067,7 +20073,9 @@ export class AgentFramework {
   ): boolean {
     if (segments.length === 0) return false;
     const routing = round.routing;
-    if (cause === 'private' || cause === 'kept' || privateThink) {
+    const kept = cause === 'private' || cause === 'kept' || privateThink;
+    for (const _segment of segments) notePart(round, kept ? { kind: 'private' } : this.heldPart(cause as SendHold));
+    if (kept) {
       // Match explicit mode: skip_reply keeps publication private but can
       // still set a bounce aside. A private-think round interprets no text.
       if (cause === 'private' && !privateThink && agent.proseRouting === 'hybrid') {
@@ -20114,6 +20122,7 @@ export class AgentFramework {
     type Part = { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean };
     const runs: Array<{ hold: SendHold; target: ChannelRef | null; parts: Part[] }> = [];
     const hold = (sendHold: SendHold, target: ChannelRef | null, part: Part): void => {
+      notePart(round, draftsCause && !part.deliberate ? { kind: 'private' } : this.heldPart(sendHold));
       const last = runs.at(-1);
       if (last && sameChannel(last.target, target)) last.parts.push(part);
       else runs.push({ hold: sendHold, target, parts: [part] });
@@ -20132,6 +20141,7 @@ export class AgentFramework {
           routing.hybridHold = 'private';
           if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
           privateCount++;
+          notePart(round, { kind: 'private' });
         } else if (parsed.kind === 'target') {
           // As deliverHybridProse resolves it: a channel its server declared
           // inbound-only is refused as a target for speech.
@@ -20151,6 +20161,7 @@ export class AgentFramework {
           }
           const words = this.unsentWords(agent, parsed.body);
           if ('draft' in words) {
+            notePart(round, this.heldPart(sendHold));
             if (!kept.includes(words.draft)) kept.push(words.draft);
           } else {
             hold(sendHold, to, {
@@ -20172,6 +20183,7 @@ export class AgentFramework {
           hold(sendHold, null, { text: envelope, deliberate: true });
         } else if (routing.hybridHold === 'private') {
           privateCount++;
+          notePart(round, { kind: 'private' });
         } else {
           const target = routing.hybridHold === 'failed' ? null : routing.pin ?? locus;
           const sendHold = sendHoldAt(sends, target);
@@ -20199,6 +20211,12 @@ export class AgentFramework {
     const drafts = routing.drafts;
     for (const draft of kept) if (!drafts.some((d) => d.id === draft.id)) drafts.push(draft);
     return heldAny;
+  }
+
+  private heldPart(hold: SendHold): FinalProsePart {
+    return hold.kind === 'place'
+      ? { kind: 'sent', where: this.channelShown(hold.place.to), delivered: hold.place.delivered }
+      : { kind: 'sent-unknown' };
   }
 
   private sendHoldText(hold: SendHold, target: ChannelRef | null, when: number | 'end' | 'turn'): string {
@@ -20964,6 +20982,7 @@ export class AgentFramework {
       this.holdHeartbeatProse(agent, [text], round);
       return null;
     }
+    notePart(round, { kind: 'routed', text });
     return this.channelRegistry!.routeSpeech(agent.name, text, locus);
   }
 
@@ -20976,6 +20995,7 @@ export class AgentFramework {
 
   /** Hold a heartbeat turn's plain speech as drafts ('no-destination'), named by `round`'s notice. */
   private holdHeartbeatProse(agent: Agent, texts: string[], round: ProseRound): Draft[] {
+    for (const _text of texts) notePart(round, { kind: 'no-destination' });
     console.error(`[prose] ${agent.name}: heartbeat turn — ${texts.length} plain-speech segment(s) held as drafts (no destination)`);
     return this.holdProseDrafts(agent, texts, 'no-destination', {
       routing: round.routing,
@@ -22690,6 +22710,7 @@ export class AgentFramework {
     const parsed = parseHybridProsePrefix(normalized);
     if (parsed.continueTurn) routing.continuation = true;
     if (parsed.kind === 'private') {
+      notePart(round, { kind: 'private' });
       delete routing.pin;
       routing.hybridHold = 'private';
       // `>>>skip_reply {{unsent}}`: the resident sets the bounced draft aside.
@@ -22700,6 +22721,7 @@ export class AgentFramework {
     if (parsed.kind === 'target') {
       const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!, { forSpeech: true, own: this.ownChannels(routing) });
       if ('error' in resolved) {
+        notePart(round, { kind: 'no-destination' });
         delete routing.pin;
         routing.hybridHold = 'failed';
         this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>', round);
@@ -22709,6 +22731,7 @@ export class AgentFramework {
       const usedClipboard = body.includes('{{unsent}}');
       const unsent = usedClipboard ? this.takeUnsent(agent, body, round, '>>>') : {};
       if (unsent.refused) {
+        notePart(round, { kind: 'no-destination' });
         delete routing.pin;
         routing.hybridHold = 'failed';
         return;
@@ -22722,6 +22745,7 @@ export class AgentFramework {
         console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
         return;
       }
+      notePart(round, { kind: 'routed', text: body });
       try {
         const outcome = await this.deliverWithUnsent(agent, body, pinned, unsent.draft);
         this.recordProseDelivery(routing, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
@@ -22747,17 +22771,20 @@ export class AgentFramework {
       return;
     }
     if (attempted) {
+      notePart(round, { kind: 'no-destination' });
       delete routing.pin;
       routing.hybridHold = 'failed';
       this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>', round);
       return;
     }
     if (routing.hybridHold === 'private') {
+      notePart(round, { kind: 'private' });
       routing.keptPrivate++;
       return;
     }
     const sticky = routing.pin;
     if (routing.hybridHold === 'failed' || (!allowLocus && !sticky)) {
+      notePart(round, { kind: 'no-destination' });
       this.holdProseDrafts(agent, [envelope], 'no-destination', round.draftsRound ? { ...round, notice: 'later' } : round);
       return;
     }
@@ -22766,6 +22793,7 @@ export class AgentFramework {
       return;
     }
     const target = sticky ?? locus;
+    notePart(round, { kind: 'routed', text: envelope });
     try {
       const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
       this.recordProseDelivery(routing, outcome);
@@ -22836,6 +22864,7 @@ export class AgentFramework {
     routing.lastEnvelopeBounced = false;
 
     if (parsed.kind === 'private') {
+      notePart(round, { kind: 'private' });
       // The text already lives in the assistant message (window/chronicle);
       // "delivery" is deliberately a no-op. `>>skip_reply {{unsent}}` sets
       // the bounced draft aside.
@@ -22845,6 +22874,7 @@ export class AgentFramework {
     }
 
     if (round.keepPrivate) {
+      notePart(round, { kind: 'private' });
       // skip_reply's promise: "Any plain text you wrote this turn stays
       // private and is NOT posted". Every envelope of the round stays in the
       // context, as a >>skip_reply envelope does: it isn't sent, isn't held
@@ -22864,6 +22894,7 @@ export class AgentFramework {
       const res = envelope.resolved;
       if (!res) throw new Error(`[prose] ${name}: a >> envelope reached delivery without the target admitted with it`);
       if ('error' in res) {
+        notePart(round, { kind: 'no-destination' });
         // A target refused for speech drops the pin, which later text
         // follows: the text after the target was meant for that channel, not
         // the earlier one, so it bounces too.
@@ -22878,6 +22909,7 @@ export class AgentFramework {
     } else {
       const sticky = routing.pin;
       if (!sticky) {
+        notePart(round, { kind: 'no-destination' });
         if (round.draftsRound) {
           console.error(`[prose] ${name}: unprefixed — ${rawText.length} chars held with no notice (a drafts round, no destination)`);
           const words = this.unsentWords(agent, rawText);
@@ -22904,7 +22936,10 @@ export class AgentFramework {
     const envelopeBody = body;
     const usedClipboard = body.includes('{{unsent}}');
     const unsent = usedClipboard ? this.takeUnsent(agent, body, round, '>>') : {};
-    if (unsent.refused) return;
+    if (unsent.refused) {
+      notePart(round, { kind: 'no-destination' });
+      return;
+    }
     if (usedClipboard) {
       // A function replacement: a draft's words go in exactly, `$&` and `$$` included.
       body = body.replaceAll('{{unsent}}', () => unsent.draft?.text ?? '');
@@ -22914,6 +22949,7 @@ export class AgentFramework {
       return;
     }
 
+    notePart(round, { kind: 'routed', text: body });
     let delivered = false;
     try {
       const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft);
@@ -24709,6 +24745,16 @@ export class AgentFramework {
     // prose keeps its own turn's routing state (turnRouting), and the next
     // turn's posts wait behind it.
     let turnSpeechChain: Promise<void> = this.proseSpeechChains.get(agent.name) ?? Promise.resolve();
+    let lastRoundRuns: string[] = [];
+    let lastRoundParts: FinalProsePart[] = [];
+    let verbatimRounds = false;
+    const unroutedParts = (runs: string[]): FinalProsePart[] | undefined => {
+      if (trigger?.suppressProse) return runs.map(() => ({ kind: 'silent' }));
+      if (this.channelRegistry) return undefined;
+      return runs.map((text) => turnProseRouting === 'explicit' || turnProseRouting === 'hybrid'
+        ? { kind: 'no-destination' }
+        : { kind: 'no-registry', text });
+    };
     this.proseSpeechChains.set(agent.name, turnSpeechChain);
     const chainSpeech = (link: () => Promise<void>, failure: string): void => {
       turnSpeechChain = turnSpeechChain.then(link).catch((err) => console.error(failure, err));
@@ -24985,13 +25031,20 @@ export class AgentFramework {
       // so settle the delivery chain and drop the receipt. A
       // budget restart keeps the same turn's routing and tallies;
       // the continuation stream's end writes one receipt for it.
+      const reportClosingRound = (): void => this.moduleRegistry.notifyFinalProse(agent.name, unroutedParts(lastRoundRuns) ?? lastRoundParts);
       if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
         await turnSpeechChain;
+        reportClosingRound();
         this.appendProseDeliveryReceipt(agent, streamRouting);
       } else if (cancelKind === 'turn_ended' && !trigger?.suppressProse) {
         // Explicit mode doesn't hold the turn for its deliveries, so its
         // closed-channel note comes once they've run.
-        void turnSpeechChain.then(() => this.appendClosedChannelNoteAlone(agent, streamRouting));
+        void turnSpeechChain.then(() => {
+          reportClosingRound();
+          this.appendClosedChannelNoteAlone(agent, streamRouting);
+        });
+      } else if (cancelKind === 'turn_ended') {
+        reportClosingRound();
       }
       // A `!` an earlier round asked for still starts its
       // continuation when a tool ends the turn, once the turn's
@@ -25241,10 +25294,16 @@ export class AgentFramework {
             if (firstRoundRead === undefined) firstRoundRead = roundRead;
             agent.markAnswered(roundRead);
             const roundPublished = publishedFrom(roundRead);
+            const roundParts: FinalProsePart[] = [];
+            lastRoundParts = roundParts;
+            const verbatim = !!roundContent && roundContent.length > 0;
+            if (verbatim) verbatimRounds = true;
+            lastRoundRuns = verbatim ? splitProseRuns(assistantBlocks).map((run) => run.trim()).filter((run) => run.length > 0) : [];
             const holdOpts: ProseRound = {
               routing: streamRouting,
               notice: presentsInjections ? 'now' : 'later',
               onPublished: roundPublished,
+              parts: roundParts,
             };
             // Routing publishes trimmed segments; held drafts keep the runs
             // exactly as written.
@@ -25290,6 +25349,10 @@ export class AgentFramework {
                   `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
                 );
                 this.recordProseSuppression(streamRouting, roundSegments.length);
+                const ownSilence = roundSilenceOf(calls, toolRound);
+                for (const segment of roundSegments) {
+                  roundParts.push(ownSilence === 'private' ? { kind: 'private' } : { kind: 'disabled', text: segment });
+                }
               } else if (turnProseRouting === 'hybrid') {
                 if (roundSilence === 'private' || (roundSilence && hasSameRoundPrivateThink)) {
                   const cause = roundSilence === 'private' ? 'private' : 'kept';
@@ -25308,6 +25371,8 @@ export class AgentFramework {
                   for (const seg of roundSegments) {
                     chainSpeech(routingSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, roundOpts)), 'mid-turn hybrid prose delivery failed:');
                   }
+                } else {
+                  for (const _segment of roundSegments) roundParts.push({ kind: 'private' });
                 }
               } else if (turnProseRouting === 'explicit') {
                 // Explicit mode: the segments go through the prose gateway,
@@ -25326,6 +25391,8 @@ export class AgentFramework {
                   for (const envelopes of roundAdmitted) {
                     chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...roundOpts, keepPrivate }), 'mid-turn prose delivery failed:');
                   }
+                } else {
+                  for (const _segment of roundSegments) roundParts.push({ kind: 'private' });
                 }
               } else if (roundSilence === 'private' || (roundSilence && hasSameRoundPrivateThink)
                 || (roundSilence && sendHoldAt(roundSilence, roundLocus))) {
@@ -25342,6 +25409,7 @@ export class AgentFramework {
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
                 );
+                for (const _segment of roundSegments) roundParts.push({ kind: 'private' });
               } else {
                 console.error(roundLocus === null && streamRouting.heartbeat
                   ? `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) held as drafts (a heartbeat turn)`
@@ -25942,14 +26010,16 @@ export class AgentFramework {
             // they are never routed here — which is precisely how the `think`
             // tool (and any explicit send tool) yields a silent turn.
             let closingHeld = false;
+            const finalParts: FinalProsePart[] = [];
             if (speechContent.length > 0 && this.channelRegistry) {
               const speechRuns = finalSpeechRuns;
               const speechSegments = finalSpeechSegments;
-              const textOnlyHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
+              const textOnlyHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished, parts: finalParts };
               if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
                   this.recordProseSuppression(streamRouting, speechSegments.length);
+                  for (const segment of speechSegments) finalParts.push({ kind: 'disabled', text: segment });
                 } else if (silence && turnProseRouting !== 'explicit'
                   && (turnProseRouting === 'hybrid' || silence === 'private' || sendHoldAt(silence, resolveTurnLocus()))) {
                   // Only reachable on a start that continues the turn and
@@ -26037,7 +26107,7 @@ export class AgentFramework {
                 ? silence
                 : silence === 'private' || fallbackCause === 'private' ? 'private' : turnSends;
               const trailingWhen = liveProseRouting ? 'end' : 'turn';
-              const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
+              const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished, parts: finalParts };
 
               const runs = finalRuns;
               const segments = finalSegments;
@@ -26049,6 +26119,7 @@ export class AgentFramework {
                     `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
                   );
                 }
+                for (const _segment of segments) finalParts.push({ kind: 'private' });
               };
               if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
@@ -26056,6 +26127,7 @@ export class AgentFramework {
                     `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
                   );
                   this.recordProseSuppression(streamRouting, segments.length);
+                  for (const segment of segments) finalParts.push({ kind: 'disabled', text: segment });
                 }
               } else if (turnProseRouting === 'hybrid') {
                 if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
@@ -26128,6 +26200,13 @@ export class AgentFramework {
             // NOTE: agent.reset() + onInferenceEnded() already ran above,
             // BEFORE dispatchSpeech. Locus routing is speech dispatch and
             // doesn't depend on the status field, so it correctly runs after.
+
+            const closingRuns = (hadToolCalls
+              ? allText.length > 0
+                ? splitProseRuns(verbatimRounds ? terminalContent : withoutRoundsProse(response.content, refusedWakeRounds))
+                : []
+              : finalSpeechRuns).map((run) => run.trim()).filter((run) => run.length > 0);
+            this.moduleRegistry.notifyFinalProse(agent.name, unroutedParts(closingRuns) ?? finalParts);
 
             // Logical turn end (normal completion): drop the `[delivered]`
             // receipt. Queued deliveries and holds settled before final

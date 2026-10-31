@@ -18,6 +18,7 @@ import type {
   ExternalIdRef,
   SpeechContext,
   SpeechHandlerOptions,
+  FinalProsePart,
   ProcessEvent,
   ToolResultEvent,
   TraceEventListener,
@@ -692,6 +693,24 @@ export class ModuleRegistry {
     }
     await Promise.all(promises);
     return failures;
+  }
+
+  /**
+   * Tell modules how an agent's turn's closing words ended (see
+   * Module.onFinalProse). A notice: each module is called with its own copy
+   * of the parts, nothing is awaited, and a module that throws or rejects is
+   * logged and changes nothing for the turn.
+   */
+  notifyFinalProse(agentName: string, parts: readonly FinalProsePart[]): void {
+    for (const module of this.modules.values()) {
+      if (!module.onFinalProse) continue;
+      const failed = (err: unknown): void => console.error(`[${module.name}] onFinalProse:`, err);
+      try {
+        void Promise.resolve(module.onFinalProse(agentName, parts.map((part) => ({ ...part })))).catch(failed);
+      } catch (err) {
+        failed(err);
+      }
+    }
   }
 
   /**
