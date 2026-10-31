@@ -380,6 +380,11 @@ function entryRef(event: PendingEvent): GateEntryRef {
   };
 }
 
+function withoutWrite(event: PendingEvent): PendingEvent {
+  const { after: _after, replyTo: _replyTo, ...rest } = event;
+  return rest;
+}
+
 /**
  * Default route-channel resolution when the host supplies none: a
  * channel-incoming event's channel id is already the registered composite id;
@@ -2210,6 +2215,7 @@ export class EventGate {
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
+  private isAnsweredFn?: (after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2275,6 +2281,16 @@ export class EventGate {
      *  (WakeProvenance.lines), for a fresh start of the wake's turn to decide
      *  (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
+    /** Whether the agent an event's write went to (`after`, as `evaluate`
+     *  was given it) has read and answered it now, judged as a batched
+     *  wake's drop is (WakeLine.after). Asked when a reply judge answers
+     *  reply, for each event of the batch it judged that has a write: an
+     *  event answered then keeps the wake, since the judge answered after
+     *  that answer, and only the others are handed on with their writes, for
+     *  the wake to be dropped once they're answered too. Absent, or an answer
+     *  other than `false` (a throw included): the event counts as answered
+     *  then. */
+    isAnswered?: (after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
@@ -2291,6 +2307,7 @@ export class EventGate {
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
     this.isNewestEntryFn = opts.isNewestEntry;
+    this.isAnsweredFn = opts.isAnswered;
     this.eventTypesFromFn = opts.eventTypesFrom;
     this.now = opts.now ?? (() => Date.now());
     this.judgeFn = opts.judge;
@@ -3737,7 +3754,7 @@ export class EventGate {
       routeChannelId,
       ...(typeof info.metadata?.messageId === 'string' ? { messageId: info.metadata.messageId } : {}),
       ...(typeof info.metadata?.eventId === 'string' ? { eventId: info.metadata.eventId } : {}),
-      ...(after && !judge ? { after, ...(replyTo ? { replyTo } : {}) } : {}),
+      ...(after ? { after, ...(replyTo ? { replyTo } : {}) } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -4037,7 +4054,10 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires; a judge rule's goes to the judge, so it only may).
+   * when it fires, or, where its lines go to a host with `isNewestEntry` and
+   * it has an event with a write, only may, since a batch the agent has
+   * answered starts no turn; a judge rule's goes to the judge, so it only
+   * may).
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
     const wakes: UpcomingWake[] = [];
@@ -4057,7 +4077,7 @@ export class EventGate {
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
         ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: true, what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        : { at: state.dueAt, certain: this.isNewestEntryFn === undefined || !state.events.some((e) => e.after !== undefined), what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }
@@ -4090,7 +4110,9 @@ export class EventGate {
   /**
    * Apply the judge's verdict on a batch. Reply: the batch, with any of the
    * rule's batches that fired meanwhile, is delivered as a debounce's is
-   * (held for a turn that started meanwhile, as fireDebounce holds one). Wait:
+   * (held for a turn that started meanwhile, as fireDebounce holds one),
+   * except that a judged event already answered keeps the wake
+   * (answeredWhenJudged). Wait:
    * nothing is delivered, and batches that fired meanwhile go to the judge
    * afresh. A judge that failed, timed out or answered nothing usable decides
    * by onError: "wake" delivers, "skip" doesn't. Each verdict is traced and
@@ -4159,10 +4181,21 @@ export class EventGate {
     if (this.disposed) return;
     const judge = this.currentJudge(policyName, state.judge);
     if (wake) {
-      this.deliverOrBuffer([...state.events, ...state.queued]);
+      const judged = outcome === 'reply' ? state.events.map((e) => (this.answeredWhenJudged(e) ? withoutWrite(e) : e)) : state.events;
+      this.deliverOrBuffer([...judged, ...state.queued]);
       return;
     }
     if (state.queued.length > 0) this.judgeBatch(policyName, state.queued, judge);
+  }
+
+  private answeredWhenJudged(e: PendingEvent): boolean {
+    if (!e.after) return false;
+    if (!this.isAnsweredFn) return true;
+    try {
+      return this.isAnsweredFn(e.after, e.replyTo) !== false;
+    } catch {
+      return true;
+    }
   }
 
   /** Deliver a batch now, or hold it for the agents' turns and the host's

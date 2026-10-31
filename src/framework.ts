@@ -4903,6 +4903,10 @@ export class AgentFramework {
         // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
         // to decide (placeWakeLines).
         isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
+        isAnswered: (after, replyTo) => {
+          const agent = after.agent !== undefined ? framework.agents.get(after.agent) : undefined;
+          return agent !== undefined && framework.wakeLineDone(agent, { after, replyTo });
+        },
         // What a source can send, for the rule-order notes: an MCPL server's
         // events reach the gate as its pushes and channel messages only (a
         // module's events carry a source of the module's own, such as "cli"
@@ -6132,7 +6136,9 @@ export class AgentFramework {
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
-   * request already queued for it (it runs as soon as the agent is free) and
+   * request already queued for it (it runs as soon as the agent is free, or
+   * only may, when every queued request names the messages it's for, since
+   * the scheduler drops one the agent has answered by then) and
    * turns a provider cooldown holds until its end. The reply judge is told of
    * them beside the gate's own timers, so it can weigh what waiting costs.
    */
@@ -6142,7 +6148,7 @@ export class AgentFramework {
     if (queued.length > 0) {
       const reason = queued[0]!.reason;
       wakes.push({
-        certain: true,
+        certain: queued.some((r) => r.readsDeferredWrite === undefined && r.readsStoredMessage === undefined && !r.readsWakeLines),
         what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})`,
       });
     }
@@ -31157,7 +31163,7 @@ export class AgentFramework {
     }
   }
 
-  private wakeLineDone(agent: Agent, line: WakeLine): boolean {
+  private wakeLineDone(agent: Agent, line: Pick<WakeLine, 'after' | 'replyTo'>): boolean {
     const mark = this.readsWriteFor(line.after, agent.name);
     if (mark.readsDeferredWrite !== undefined) return this.deferredWriteDone(agent, mark.readsDeferredWrite, line.replyTo);
     return mark.readsStoredMessage !== undefined && this.storedMessageDone(agent, mark.readsStoredMessage, line.replyTo);

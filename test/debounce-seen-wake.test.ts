@@ -54,7 +54,7 @@ class RateLimitedAtComplete extends MockYieldingStream {
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
-type GateState = Pick<EventGate, 'inferenceDiagnostics'> & { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>; fireDebounce(name: string): void };
+type GateState = Pick<EventGate, 'inferenceDiagnostics' | 'onInferenceStarted' | 'onInferenceEnded'> & { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>; fireDebounce(name: string): void };
 // Access the timer only to fire the long-delay cases deterministically. The
 // reproduction below uses the actual 200 ms timer, including its held path.
 function gateOf(f: Fixture) {
@@ -424,4 +424,192 @@ describe('debounced writes already read and answered', () => {
       } finally { await f.close(); }
     });
   }
+});
+
+type Verdict = { reply: boolean; reason: string };
+type Asked = { resolve: (verdict: Verdict) => void; reject: (err: unknown) => void };
+async function judged(wired: boolean, opts: { tool?: boolean } = {}) {
+  const module = new ReminderModule();
+  const f = await fixture({ framework: {
+    modules: [module],
+    errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+    gate: {
+      config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder'] }, behavior: { judge: { debounceMs: 60_000 } } }], default: 'always' },
+      judge: wired ? {} : { enabled: false },
+    },
+  } });
+  // The judge's verdicts are the test's to give, one per batch, in order.
+  const asked: Asked[] = [];
+  if (wired) (gateOf(f) as unknown as { judgeFn: unknown }).judgeFn = () => new Promise<Verdict>((resolve, reject) => asked.push({ resolve, reject }));
+  const streams: MockYieldingStream[] = [];
+  (f.membrane as unknown as { streamYielding: unknown }).streamYielding = (request: NormalizedRequest) => {
+    f.membrane.calls.push(request);
+    const stream = new MockYieldingStream(opts.tool && streams.length === 0 ? [waitCall('first'), say('answered')] : [say('answered')], true);
+    streams.push(stream);
+    return stream;
+  };
+  await registerOpen(f, 'work');
+  const verdicts: string[] = [];
+  f.framework.onTrace((event) => {
+    if (event.type === 'gate:judge-verdict') verdicts.push((event as unknown as { verdict: string }).verdict);
+  });
+  const wake = () => {
+    (f.framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+      agentName: 'agent', reason: 'test', source: 'editor', channelId: 'work', channelServerId: 'editor', timestamp: Date.now(),
+    });
+    return f.framework.runUntilIdle();
+  };
+  /** The event arrives while a turn's tool round runs; the round reads it and the turn answers. */
+  const answeredMidTurn = async () => {
+    const loop = wake();
+    await eventually(() => module.entered.has('first'), 'turn reached tool');
+    await send(f, 'module');
+    await eventually(() => deferred(f, 'new event'), 'event deferred');
+    module.release('first');
+    await loop;
+    assert.ok(heard(streams[0]!).includes('new event'), 'premise: the tool boundary carried the event');
+  };
+  /** The event arrives while the agent is idle: stored, its batch pending. */
+  const arrivesIdle = async () => {
+    await send(f, 'module');
+    await f.framework.runUntilIdle();
+    assert.equal(f.membrane.calls.length, 0, 'premise: the judge rule held the event back');
+    assert.equal(gateOf(f).debounceTimers.get('batch')?.events.length, 1, 'premise: its batch is pending');
+  };
+  const reply = () => {
+    const next = asked.shift();
+    assert.ok(next, 'a judge request is waiting');
+    next.resolve({ reply: true, reason: 'test' });
+  };
+  return { f, asked, verdicts, wake, answeredMidTurn, arrivesIdle, reply };
+}
+
+describe('judge rules and the answered-batch drop', () => {
+  it('with no judge wired, a judge rule\'s batch the agent answered starts no turn, as a debounce of its quiet period', async () => {
+    const { f, answeredMidTurn } = await judged(false, { tool: true });
+    try {
+      await answeredMidTurn();
+      fire(f);
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
+      assert.ok(!f.context().includes('[Gate:'), 'no gate line for the answered event');
+    } finally { await f.close(); }
+  });
+
+  it('a judge that fails, with onError "wake", delivers a batch the agent answered as a debounce: no turn', async () => {
+    const { f, asked, verdicts, answeredMidTurn } = await judged(true, { tool: true });
+    try {
+      await answeredMidTurn();
+      fire(f);
+      await eventually(() => asked.length === 1, 'the judge is asked');
+      asked.shift()!.reject(new Error('judge down'));
+      await eventually(() => verdicts.length === 1, 'the verdict');
+      assert.deepEqual(verdicts, ['error']);
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
+    } finally { await f.close(); }
+  });
+
+  it('a reply given with the answer already made keeps its wake: the turn starts', async () => {
+    const { f, asked, verdicts, answeredMidTurn, reply } = await judged(true, { tool: true });
+    try {
+      await answeredMidTurn();
+      fire(f);
+      await eventually(() => asked.length === 1, 'the judge is asked');
+      reply();
+      await eventually(() => verdicts.length === 1, 'the verdict');
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 2, "the judge's reply stands");
+    } finally { await f.close(); }
+  });
+
+  it('a reply given while a turn\'s start awaits its assembly is dropped once that turn answers the batch', async () => {
+    const { f, asked, verdicts, arrivesIdle, reply } = await judged(true);
+    try {
+      await arrivesIdle();
+      fire(f);
+      await eventually(() => asked.length === 1, 'the judge is asked');
+      let release!: (value: unknown) => void;
+      let rendering = false;
+      f.renderer(() => { rendering = true; return new Promise((resolve) => { release = resolve; }); });
+      await f.send('push/event', f.params('1', 'doc_edit', { deferred: true }));
+      const run = f.framework.runUntilIdle();
+      await eventually(() => rendering, "the turn's start awaits the render");
+      assert.deepEqual(f.framework.getHostModeStatus().activeTurnAgents, ['agent'], 'premise: the scheduler holds the agent');
+      assert.deepEqual(gateOf(f).inferenceDiagnostics().inferring, [], 'premise: the gate has not been told of the turn');
+      reply();
+      await eventually(() => verdicts.length === 1, 'the verdict');
+      release({ content: [{ type: 'text', text: 'rendered' }] });
+      await run;
+      await f.framework.runUntilIdle();
+      assert.ok(JSON.stringify(f.membrane.calls[0]).includes('new event'), 'premise: the turn read the event');
+      assert.equal(f.membrane.calls.length, 1, "the reply's wake starts no second turn");
+    } finally { await f.close(); }
+  });
+
+  it('a reply given while a wake is parked behind an auxiliary call is dropped once the parked turn answers the batch', async () => {
+    const { f, asked, verdicts, arrivesIdle, reply, wake } = await judged(true);
+    try {
+      await arrivesIdle();
+      fire(f);
+      await eventually(() => asked.length === 1, 'the judge is asked');
+      let releaseAux!: () => void;
+      const internal = f.framework as unknown as { withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T> };
+      const auxiliary = internal.withAuxiliaryAdmission('agent', () => new Promise<void>((resolve) => { releaseAux = resolve; }));
+      const run = wake();
+      await eventually(() => f.framework.getHostModeStatus().parkedAdmissions === 1, 'the wake parks behind the auxiliary call');
+      assert.equal(f.membrane.calls.length, 0, 'premise: parked, not started');
+      reply();
+      await eventually(() => verdicts.length === 1, 'the verdict');
+      releaseAux();
+      await auxiliary;
+      await run;
+      await eventually(() => f.membrane.calls.length >= 1, 'the parked turn runs');
+      await f.framework.runUntilIdle();
+      assert.ok(JSON.stringify(f.membrane.calls[0]).includes('new event'), 'premise: the turn read the event');
+      assert.equal(f.membrane.calls.length, 1, "the reply's wake starts no second turn");
+    } finally { await f.close(); }
+  });
+
+  it('a reply held behind another agent\'s turn is dropped once the judged agent answers the batch meanwhile', async () => {
+    const { f, asked, verdicts, arrivesIdle, reply, wake } = await judged(true);
+    try {
+      await arrivesIdle();
+      fire(f);
+      await eventually(() => asked.length === 1, 'the judge is asked');
+      // A turn of an agent that doesn't change the judged context (a fork's, a
+      // subconscious's), as the host reports it to the gate.
+      gateOf(f).onInferenceStarted('reader');
+      reply();
+      await eventually(() => verdicts.length === 1, 'the verdict');
+      assert.equal(gateOf(f).inferenceDiagnostics().bufferedEvents, 1, "premise: the reply's batch waits for the other turn");
+      await wake();
+      assert.equal(f.membrane.calls.length, 1, "premise: the judged agent's own turn ran");
+      assert.ok(JSON.stringify(f.membrane.calls[0]).includes('new event'), 'premise: that turn read the event');
+      gateOf(f).onInferenceEnded('reader');
+      await eventually(() => gateOf(f).inferenceDiagnostics().bufferedEvents === 0, 'the batch is delivered');
+      await f.framework.runUntilIdle();
+      assert.equal(f.membrane.calls.length, 1, "the reply's wake starts no second turn");
+    } finally { await f.close(); }
+  });
+});
+
+describe("what the judge is told of the framework's queued wakes", () => {
+  it('a queued wake the scheduler may drop is a maybe; one it starts is certain', async () => {
+    const { f } = await judged(true);
+    try {
+      const internal = f.framework as unknown as {
+        pendingRequests: Array<Record<string, unknown>>;
+        upcomingWakesFor(name: string): Array<{ certain: boolean; what: string }>;
+      };
+      for (const names of [{ readsWakeLines: true, wakeLines: [] }, { readsStoredMessage: 'row-1' }, { readsDeferredWrite: 'deferred-1' }]) {
+        internal.pendingRequests.length = 0;
+        internal.pendingRequests.push({ agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), ...names });
+        assert.deepEqual(internal.upcomingWakesFor('agent').map((w) => w.certain), [false], JSON.stringify(names));
+      }
+      internal.pendingRequests.push({ agentName: 'agent', reason: 'test', source: 'editor', timestamp: Date.now() });
+      assert.deepEqual(internal.upcomingWakesFor('agent').map((w) => w.certain), [true]);
+      internal.pendingRequests.length = 0;
+    } finally { await f.close(); }
+  });
 });

@@ -4,4 +4,6 @@
   wake can be dropped once the agent has answered it. `WakeLine` gains
   `content` (a quoted event's text), `after` and `replyTo`, and
   `InferenceRequest.readsWakeLines` marks a wake whose sole cause is the batch
-  its lines name.
+  its lines name. `GateOptions.isAnswered(after, replyTo)` says whether the
+  agent has answered an event's write; the gate asks it when a reply judge
+  answers reply, and an event answered then keeps the wake.

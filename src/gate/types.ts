@@ -64,7 +64,10 @@ export interface PassiveSampleConfig {
  * good time for the agent to reply. The judge reads the agent's context as one
  * document (its newest part), the agent's own `instructions` and the batch,
  * and answers reply or wait. On reply the
- * batch is delivered as a debounce's is; on wait the agent isn't woken: the
+ * batch is delivered as a debounce's is, except that an event the agent had
+ * already answered when the judge answered keeps the wake, since the judge
+ * answered after it (GateOptions.isAnswered; a host without it keeps the wake
+ * for every event); on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
  * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
@@ -283,14 +286,18 @@ export interface JudgeEventSummary {
 }
 
 /**
- * Something that will (or, for a batch going to the judge, may) wake the
- * agent with no new event: what the judge is told would happen if it answers
+ * Something that will (or, for a batch going to the judge, or one that
+ * starts no turn once the agent has answered it, may) wake the agent with no
+ * new event (`certain`): what the judge is told would happen if it answers
  * wait and nothing else arrives.
  */
 export interface UpcomingWake {
   /** When (ms), when known; absent for one due as soon as the agent is free. */
   at?: number;
-  /** False when it only may wake the agent (a judge rule's batch goes to the judge then). */
+  /** False when it only may wake the agent: a judge rule's batch goes to the
+   *  judge then, and a debounced batch whose lines are handed to the wake
+   *  with a write, or a queued wake whose requests all name the messages
+   *  they're for, starts no turn once the agent has answered them. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;

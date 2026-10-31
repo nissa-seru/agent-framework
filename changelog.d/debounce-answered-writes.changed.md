@@ -6,3 +6,7 @@
   residents who share its slot still wake, and find no line. The lines one
   start is handed are written as one `[Gate: N events matched]` line, each
   channel's messages counted together, where each was written on its own.
+- The reply judge is told that a pending debounced batch with a written
+  event, and a queued wake whose requests all name the messages they're for,
+  only may wake the agent (`certain: false`), since each starts no turn once
+  the agent has answered them.

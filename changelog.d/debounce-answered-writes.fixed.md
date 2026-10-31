@@ -10,5 +10,8 @@
   what that round read; an event the host gave no message of its own keeps
   the wake. This covers module events, MCPL channel messages and pushes,
   those routed to a conversation fork included, and heartbeat ticks and
-  reminders; a reply judge's batches and a deferred render's batched wake are
-  unchanged.
+  reminders. A judge rule's batch is judged so too where no judge decided it
+  (none wired, or one that failed, timed out or made no call, with
+  `onError: "wake"`), and on a reply verdict, except for an event the agent
+  had already answered when the judge answered: the judge answered after it,
+  so its reply stands. A deferred render's batched wake is unchanged.
