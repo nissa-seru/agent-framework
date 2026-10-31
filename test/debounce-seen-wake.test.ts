@@ -434,11 +434,10 @@ async function judged(wired: boolean, opts: { tool?: boolean } = {}) {
     modules: [module],
     errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
     gate: {
-      config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder'] }, behavior: { judge: { debounceMs: 60_000 } } }], default: 'always' },
+      config: { policies: [{ name: 'batch', match: { scope: ['clock:reminder', 'mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 60_000 } } }], default: 'always' },
       judge: wired ? {} : { enabled: false },
     },
   } });
-  // The judge's verdicts are the test's to give, one per batch, in order.
   const asked: Asked[] = [];
   if (wired) (gateOf(f) as unknown as { judgeFn: unknown }).judgeFn = () => new Promise<Verdict>((resolve, reject) => asked.push({ resolve, reject }));
   const streams: MockYieldingStream[] = [];
@@ -459,7 +458,6 @@ async function judged(wired: boolean, opts: { tool?: boolean } = {}) {
     });
     return f.framework.runUntilIdle();
   };
-  /** The event arrives while a turn's tool round runs; the round reads it and the turn answers. */
   const answeredMidTurn = async () => {
     const loop = wake();
     await eventually(() => module.entered.has('first'), 'turn reached tool');
@@ -469,7 +467,6 @@ async function judged(wired: boolean, opts: { tool?: boolean } = {}) {
     await loop;
     assert.ok(heard(streams[0]!).includes('new event'), 'premise: the tool boundary carried the event');
   };
-  /** The event arrives while the agent is idle: stored, its batch pending. */
   const arrivesIdle = async () => {
     await send(f, 'module');
     await f.framework.runUntilIdle();
@@ -481,7 +478,7 @@ async function judged(wired: boolean, opts: { tool?: boolean } = {}) {
     assert.ok(next, 'a judge request is waiting');
     next.resolve({ reply: true, reason: 'test' });
   };
-  return { f, asked, verdicts, wake, answeredMidTurn, arrivesIdle, reply };
+  return { f, module, asked, verdicts, wake, answeredMidTurn, arrivesIdle, reply };
 }
 
 describe('judge rules and the answered-batch drop', () => {
@@ -496,18 +493,58 @@ describe('judge rules and the answered-batch drop', () => {
     } finally { await f.close(); }
   });
 
-  it('a judge that fails, with onError "wake", delivers a batch the agent answered as a debounce: no turn', async () => {
-    const { f, asked, verdicts, answeredMidTurn } = await judged(true, { tool: true });
+  for (const [how, error, traced] of [
+    ['fails', new Error('judge down'), ['error']],
+    ['makes no call, its admission refused', Object.assign(new Error('admission deferred'), { providerAdmission: 'deferred' }), []],
+  ] as const) {
+    it(`a judge that ${how}, with onError "wake", delivers a batch the agent answered as a debounce: no turn`, async () => {
+      const { f, asked, verdicts, answeredMidTurn } = await judged(true, { tool: true });
+      try {
+        await answeredMidTurn();
+        fire(f);
+        await eventually(() => asked.length === 1, 'the judge is asked');
+        asked.shift()!.reject(error);
+        await eventually(() => (gateOf(f) as unknown as { judging: Map<string, unknown> }).judging.size === 0, "the judge's outcome is settled");
+        assert.deepEqual(verdicts, traced);
+        await f.framework.runUntilIdle();
+        assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
+      } finally { await f.close(); }
+    });
+  }
+
+  it("a reply given while the turn's answer awaits publication keeps its wake: the judge had the answer in view", async () => {
+    const { f, module, asked, verdicts, wake, reply } = await judged(true, { tool: true });
+    const registry = (f.framework as unknown as {
+      channelRegistry: { routeSpeech: (...args: unknown[]) => Promise<unknown> };
+    }).channelRegistry;
+    const original = registry.routeSpeech.bind(registry);
+    let publishing = false;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    registry.routeSpeech = async (...args) => {
+      if (!publishing) {
+        publishing = true;
+        await held;
+      }
+      return original(...args);
+    };
     try {
-      await answeredMidTurn();
+      const loop = wake();
+      await eventually(() => module.entered.has('first'), 'turn reached tool');
+      await send(f, 'channel');
+      await eventually(() => deferred(f, 'new event'), 'event deferred');
       fire(f);
-      await eventually(() => asked.length === 1, 'the judge is asked');
-      asked.shift()!.reject(new Error('judge down'));
+      assert.equal(asked.length, 0, 'premise: the judge waits for the turn');
+      module.release('first');
+      await eventually(() => publishing && asked.length === 1, "the judge is asked while the turn's answer awaits publication");
+      reply();
       await eventually(() => verdicts.length === 1, 'the verdict');
-      assert.deepEqual(verdicts, ['error']);
+      release();
+      await loop;
       await f.framework.runUntilIdle();
-      assert.equal(f.membrane.calls.length, 1, 'no redundant model call');
-    } finally { await f.close(); }
+      assert.ok(f.published.some((p) => p.channelId === 'work'), 'premise: the answer reached the channel');
+      assert.equal(f.membrane.calls.length, 2, "the judge's reply stands");
+    } finally { release(); await f.close(); }
   });
 
   it('a reply given with the answer already made keeps its wake: the turn starts', async () => {
@@ -577,8 +614,6 @@ describe('judge rules and the answered-batch drop', () => {
       await arrivesIdle();
       fire(f);
       await eventually(() => asked.length === 1, 'the judge is asked');
-      // A turn of an agent that doesn't change the judged context (a fork's, a
-      // subconscious's), as the host reports it to the gate.
       gateOf(f).onInferenceStarted('reader');
       reply();
       await eventually(() => verdicts.length === 1, 'the verdict');
@@ -592,6 +627,74 @@ describe('judge rules and the answered-batch drop', () => {
       assert.equal(f.membrane.calls.length, 1, "the reply's wake starts no second turn");
     } finally { await f.close(); }
   });
+});
+
+describe("the framework's answer to the gate's isAnswered", () => {
+  type Row = { id: string; sequence: number; metadata?: { deferredWriteId?: string } };
+  type AgentView = {
+    getContextManager(): { getAllMessages(): Row[]; currentBranch(): { name: string } };
+    answeredWatermark: { branch: string; sequence: number } | null;
+  };
+  type Ctx = {
+    after: Record<string, string>; agent: AgentView; row: Row;
+    internal: { deferredMessages: unknown[]; unackedDeferredWrites: unknown[]; landedCopiesById: () => unknown };
+  };
+  const write = (id: string) => ({ id, seq: 1, participant: 'editor', content: [{ type: 'text', text: id }], heldAt: Date.now() });
+  const unreadable = (c: Ctx) => { c.agent.getContextManager = () => { throw new Error('store unreadable'); }; };
+  const rows: Array<[string, boolean, (c: Ctx) => Record<string, string>]> = [
+    ['a write that a request the agent answered carried: answered', true, (c) => c.after],
+    ['the same write asked for as a stored message: answered', true, (c) => ({ agent: 'agent', messageId: c.row.id })],
+    ['a stored message no longer in the store: answered', true, () => ({ agent: 'agent', messageId: 'no-such-row' })],
+    ["a write above the answered watermark on the agent's branch: not answered", false, (c) => {
+      c.agent.answeredWatermark = { branch: c.agent.getContextManager().currentBranch().name, sequence: c.row.sequence - 1 };
+      return c.after;
+    }],
+    ['a write still queued for the agent: not answered', false, (c) => {
+      c.internal.deferredMessages.push(write('queued-1'));
+      return { agent: 'agent', deferredId: 'queued-1' };
+    }],
+    ['with no answered watermark yet: not answered', false, (c) => { c.agent.answeredWatermark = null; return c.after; }],
+    ['with the watermark on another branch: in doubt, so answered', true, (c) => {
+      c.agent.answeredWatermark = { branch: 'elsewhere', sequence: c.row.sequence };
+      return c.after;
+    }],
+    ['a write drained but not yet stored: in doubt, so answered', true, (c) => {
+      c.internal.unackedDeferredWrites.push(write('drained-1'));
+      return { agent: 'agent', deferredId: 'drained-1' };
+    }],
+    ['a store that throws reading the write: in doubt, so answered', true, (c) => { unreadable(c); return c.after; }],
+    ['a store that throws reading a stored message: in doubt, so answered', true, (c) => {
+      const messageId = c.row.id;
+      unreadable(c);
+      return { agent: 'agent', messageId };
+    }],
+    ['a write whose agent is gone: in doubt, so answered', true, (c) => ({ ...c.after, agent: 'gone' })],
+    ['a write placement that names no message: in doubt, so answered', true, () => ({ agent: 'agent' })],
+    ['a queued write whose landing the store can\'t settle: in doubt, so answered', true, (c) => {
+      c.internal.deferredMessages.push({ ...write('unsettled-1'), landing: 'unknown' });
+      c.internal.landedCopiesById = () => undefined;
+      return { agent: 'agent', deferredId: 'unsettled-1' };
+    }],
+  ];
+  for (const [what, answered, ask] of rows) {
+    it(what, async () => {
+      const { f, answeredMidTurn } = await judged(true, { tool: true });
+      const agent = f.framework.getAgent('agent') as unknown as AgentView;
+      const getContextManager = agent.getContextManager;
+      try {
+        await answeredMidTurn();
+        const after = (gateOf(f).debounceTimers.get('batch')!.events[0] as { after: Record<string, string> }).after;
+        const row = agent.getContextManager().getAllMessages().find((m) => m.metadata?.deferredWriteId === after.deferredId);
+        assert.ok(row && after.agent === 'agent', "premise: the event was written to the agent's queue and has landed");
+        const internal = f.framework as unknown as Ctx['internal'];
+        const isAnswered = (gateOf(f) as unknown as { isAnsweredFn: (after: Record<string, string>) => boolean }).isAnsweredFn;
+        assert.equal(isAnswered(ask({ after, agent, row, internal })), answered);
+      } finally {
+        agent.getContextManager = getContextManager;
+        await f.close();
+      }
+    });
+  }
 });
 
 describe("what the judge is told of the framework's queued wakes", () => {

@@ -66,13 +66,14 @@ export interface PassiveSampleConfig {
  * and answers reply or wait. On reply the
  * batch is delivered as a debounce's is, except that an event the agent had
  * already answered when the judge answered keeps the wake, since the judge
- * answered after it (GateOptions.isAnswered; a host without it keeps the wake
- * for every event); on wait the agent isn't woken: the
+ * answered after it (EventGate's `isAnswered`; a host without it keeps the
+ * wake for every event); on wait the agent isn't woken: the
  * events are in its context already, as for `defer`, and the next batch is
  * judged afresh. Rules are read in order, as ever: a mention rule placed ahead
  * of a judge rule wakes the agent without the judge. A judge that fails or
- * times out wakes the agent (fail open),
- * unless the host set its `onError` to `"skip"`.
+ * times out delivers the batch as a debounce's is (fail open: no turn if the
+ * agent has answered every event), unless the host set its `onError` to
+ * `"skip"`.
  */
 export interface JudgeConfig {
   /** Quiet period (ms) before the batch is judged, as `debounce`'s. */
@@ -502,7 +503,8 @@ export interface GatePolicyStats {
     judging: boolean;
     /** Events held for the judge until the agent's turn (or the host's quiesce) ends. */
     heldCount: number;
-    /** Verdicts so far: woke the agent, let the batch go by, and judge failures. */
+    /** Verdicts so far: reply (the batch delivered to wake the agent, as
+     *  JudgeConfig says), wait (the batch let go by), and judge failures. */
     verdicts: { reply: number; wait: number; error: number };
     /** The newest verdict. */
     last?: {

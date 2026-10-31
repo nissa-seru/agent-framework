@@ -493,7 +493,8 @@ export type TraceEvent =
       /** The reply judge's verdict on a `judge` rule's batch. `verdict`:
        *  `reply` or `wait` as the judge answered, `error` when it failed,
        *  timed out or answered nothing usable; `woke` is whether the batch
-       *  then woke the agent (an error does by the host's onError).
+       *  was then delivered to wake the agent (an error's is by the host's
+       *  onError). JudgeConfig says when such a delivery starts no turn.
        *  The judge's reason is in the agent's gate_status, not here: it's
        *  written from the agent's context. */
       type: 'gate:judge-verdict';

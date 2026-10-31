@@ -2215,7 +2215,7 @@ export class EventGate {
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isNewestEntryFn?: (entry: GateEntryRef) => boolean;
-  private isAnsweredFn?: (after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
+  private isAnsweredFn?: (after: WritePlacement) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2282,15 +2282,15 @@ export class EventGate {
      *  (WakeLine). Absent: every batched wake writes its line, as before. */
     isNewestEntry?: (entry: GateEntryRef) => boolean;
     /** Whether the agent an event's write went to (`after`, as `evaluate`
-     *  was given it) has read and answered it now, judged as a batched
-     *  wake's drop is (WakeLine.after). Asked when a reply judge answers
-     *  reply, for each event of the batch it judged that has a write: an
-     *  event answered then keeps the wake, since the judge answered after
-     *  that answer, and only the others are handed on with their writes, for
-     *  the wake to be dropped once they're answered too. Absent, or an answer
-     *  other than `false` (a throw included): the event counts as answered
-     *  then. */
-    isAnswered?: (after: WritePlacement, replyTo?: { serverId: string; channelId: string }) => boolean;
+     *  was given it) has answered a request that carried it, its answer's
+     *  publication not required: `false` only when the host knows it hasn't.
+     *  Asked when a reply judge answers reply, for each event of the batch it
+     *  judged that has a write: an event answered then keeps the wake, since
+     *  the judge answered after that answer, and only the others are handed
+     *  on with their writes, for the wake to be dropped once they're answered
+     *  too. Absent, or an answer other than `false` (a throw included): the
+     *  event counts as answered then. */
+    isAnswered?: (after: WritePlacement) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
@@ -4132,7 +4132,7 @@ export class EventGate {
       const wakes = this.judgeOnError === 'wake';
       console.error(
         `[gate] Rule ${quotedValue(policyName)}: the reply judge made no call (${errorText(err)}), so its batch of ${state.events.length} `
-        + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wakes ? 'is delivered to wake the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
       if (this.disposed) return;
       if (wakes) this.deliverOrBuffer([...state.events, ...state.queued]);
@@ -4164,7 +4164,7 @@ export class EventGate {
     if (failed) {
       console.error(
         `[gate] Rule ${quotedValue(policyName)}: the reply judge failed (${reason}), so its batch of ${state.events.length} `
-        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'wakes the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
+        + `${state.events.length === 1 ? 'event' : 'events'} ${wake ? 'is delivered to wake the agent' : "doesn't wake the agent"} (judge onError "${this.judgeOnError}")`,
       );
     }
     this.emitTrace({
@@ -4194,7 +4194,7 @@ export class EventGate {
     if (!e.after) return false;
     if (!this.isAnsweredFn) return true;
     try {
-      return this.isAnsweredFn(e.after, e.replyTo) !== false;
+      return this.isAnsweredFn(e.after) !== false;
     } catch {
       return true;
     }

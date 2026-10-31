@@ -184,6 +184,7 @@ describe('Conversation routing', () => {
         (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: fork, reason: 'test', source: 'test', timestamp: Date.now() });
         await framework.runUntilIdle();
         assert.deepEqual(turns, [fork], "premise: the fork's own turn read the message and was answered");
+        assert.ok(JSON.stringify(membrane.calls.at(-1)).includes('just chatting'), "premise: the fork's request carried the ambient message");
         const gate = (framework as unknown as {
           eventGate: { debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout> }>; fireDebounce(name: string): void };
         }).eventGate;

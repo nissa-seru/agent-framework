@@ -177,19 +177,22 @@ describe('judge rules: verdicts', () => {
   }
 
   for (const how of ['no judge wired', 'a judge that fails, onError "wake"'] as const) {
-    it(`with ${how}, a judge rule's batch hands the wake its events' writes, as a debounce's does`, async () => {
+    it(`with ${how}, a judge rule's batch hands the wake its events' writes, and the channel a reply is owed in, as a debounce's does`, async () => {
       const judge = scriptedJudge();
-      const { gate, wakes, messages } = makeGate(writeConfig('no-verdict.json', JUDGED), {
+      const { gate, wakes, messages } = makeGate(writeConfig('no-verdict.json', {
+        policies: [{ name: 'addressed', match: { scope: ['mcpl:channel-incoming'] }, behavior: { judge: { debounceMs: 100 } } }],
+      }), {
         ...(how === 'no judge wired' ? {} : { judge: judge.fn }), isNewestEntry: () => false, isAnswered: () => true,
       });
-      gate.evaluate(chat('is anyone around?'), { agent: 'agent', messageId: 'row-1' });
+      gate.evaluate(chat('is anyone around?', { eventType: 'mcpl:channel-incoming', tags: ['chat:addressed'] }), { agent: 'agent', messageId: 'row-1' });
       if (how !== 'no judge wired') {
         await until(() => judge.waiting() === 1, 'the judge is asked');
         judge.fail(new Error('judge down'));
       }
       await until(() => wakes.length === 1, 'the wake');
       assert.strictEqual(messages.length, 0, 'the line is left to the wake');
-      assert.deepStrictEqual((wakes[0]!.lines as Array<{ after?: WritePlacement }>).map((line) => line.after), [{ agent: 'agent', messageId: 'row-1' }]);
+      assert.deepStrictEqual((wakes[0]!.lines as Array<{ after?: WritePlacement; replyTo?: unknown }>).map(({ after, replyTo }) => ({ after, replyTo })),
+        [{ after: { agent: 'agent', messageId: 'row-1' }, replyTo: { serverId: 'discord', channelId: 'c1' } }]);
       gate.dispose();
     });
   }

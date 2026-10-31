@@ -4903,9 +4903,9 @@ export class AgentFramework {
         // `[Gate: …]` line to the wake, for a fresh start of the wake's turn
         // to decide (placeWakeLines).
         isNewestEntry: (entry) => framework.isNewestContextEntry(entry),
-        isAnswered: (after, replyTo) => {
+        isAnswered: (after) => {
           const agent = after.agent !== undefined ? framework.agents.get(after.agent) : undefined;
-          return agent !== undefined && framework.wakeLineDone(agent, { after, replyTo });
+          return agent === undefined || framework.wakeLineDone(agent, { after }, true);
         },
         // What a source can send, for the rule-order notes: an MCPL server's
         // events reach the gate as its pushes and channel messages only (a
@@ -31129,38 +31129,39 @@ export class AgentFramework {
    *  included) nor the store's current branch: removed, or left on a
    *  branch the agent has switched from, where a turn now would find
    *  nothing of it (switching back brings it back unread, with no wake, as
-   *  main's wake spent on this branch leaves it). Any doubt keeps the
-   *  wake, such as a watermark that a branch switch or an undo left on
-   *  another branch, or a store that can't be read: a turn that finds
-   *  nothing new costs less than a write no wake brings the agent to read
-   *  or answer. */
-  private deferredWriteDone(agent: Agent, writeId: string, to: PublishDestination | undefined): boolean {
+   *  main's wake spent on this branch leaves it). Any doubt answers
+   *  `unsure`, by default false, which keeps the wake, such as a watermark
+   *  that a branch switch or an undo left on another branch, or a store
+   *  that can't be read: a turn that finds nothing new costs less than a
+   *  write no wake brings the agent to read or answer. */
+  private deferredWriteDone(agent: Agent, writeId: string, to: PublishDestination | undefined, unsure = false): boolean {
     // Settled first, so a write that landed is judged by its stored row; one
     // still a doubt stays queued, which keeps the wake.
     this.settleUnknownLandings((m) => m.id === writeId);
-    if (this.deferredMessages.some((m) => m.id === writeId)) return false;
+    const queued = this.deferredMessages.find((m) => m.id === writeId);
+    if (queued) return queued.landing === 'unknown' ? unsure : false;
     try {
       const cm = agent.getContextManager();
       const row = this.landedRow(cm, writeId);
       // No row yet for a write drained from the queue and still to be stored
       // (un-acked); one stored and awaiting a sync is judged by its row.
-      if (!row) return !this.unackedDeferredWrites.some((m) => m.id === writeId);
-      return this.writeAnswered(agent, cm, row, to);
+      if (!row) return this.unackedDeferredWrites.some((m) => m.id === writeId) ? unsure : true;
+      return this.writeAnswered(agent, cm, row, to, unsure);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether deferred write ${writeId} was read, so its wake stays:`, error);
-      return false;
+      return unsure;
     }
   }
 
-  private storedMessageDone(agent: Agent, messageId: string, to: PublishDestination | undefined): boolean {
+  private storedMessageDone(agent: Agent, messageId: string, to: PublishDestination | undefined, unsure = false): boolean {
     try {
       const cm = agent.getContextManager();
       const row = cm.getMessage(messageId);
       if (!row) return true;
-      return this.writeAnswered(agent, cm, row, to);
+      return this.writeAnswered(agent, cm, row, to, unsure);
     } catch (error) {
       console.error(`[wake] ${agent.name}: could not read whether stored message ${messageId} was read, so its wake stays:`, error);
-      return false;
+      return unsure;
     }
   }
 
@@ -31174,16 +31175,19 @@ export class AgentFramework {
     return r.readsDeferredWrite !== undefined || r.readsStoredMessage !== undefined;
   }
 
-  private wakeLineDone(agent: Agent, line: Pick<WakeLine, 'after' | 'replyTo'>): boolean {
+  private wakeLineDone(agent: Agent, line: Pick<WakeLine, 'after' | 'replyTo'>, unsure = false): boolean {
     const mark = this.readsWriteFor(line.after, agent.name);
-    if (mark.readsDeferredWrite !== undefined) return this.deferredWriteDone(agent, mark.readsDeferredWrite, line.replyTo);
-    return mark.readsStoredMessage !== undefined && this.storedMessageDone(agent, mark.readsStoredMessage, line.replyTo);
+    if (mark.readsDeferredWrite !== undefined) return this.deferredWriteDone(agent, mark.readsDeferredWrite, line.replyTo, unsure);
+    if (mark.readsStoredMessage !== undefined) return this.storedMessageDone(agent, mark.readsStoredMessage, line.replyTo, unsure);
+    return unsure;
   }
 
-  private writeAnswered(agent: Agent, cm: ContextManager, row: StoredMessage, to: PublishDestination | undefined): boolean {
+  private writeAnswered(agent: Agent, cm: ContextManager, row: StoredMessage, to: PublishDestination | undefined, unsure = false): boolean {
     const watermark = agent.getAnsweredWatermark();
     const branch = cm.currentBranch().name;
-    if (!watermark || watermark.branch !== branch || row.sequence > watermark.sequence) return false;
+    if (!watermark) return false;
+    if (watermark.branch !== branch) return unsure;
+    if (row.sequence > watermark.sequence) return false;
     return to === undefined || agent.publishedAfterReading(destinationKey(to), branch, row.sequence);
   }
 
