@@ -595,21 +595,44 @@ describe('judge rules and the answered-batch drop', () => {
 });
 
 describe("what the judge is told of the framework's queued wakes", () => {
-  it('a queued wake the scheduler may drop is a maybe; one it starts is certain', async () => {
+  type Internal = {
+    pendingRequests: Array<Record<string, unknown>>;
+    upcomingWakesFor(name: string): Array<{ certain: boolean; what: string }>;
+  };
+  const line = (after?: Record<string, string>) => ({ policyNames: ['batch'], at: 0, ...(after ? { after } : {}) });
+  const told = (internal: Internal, queued: Array<Record<string, unknown>>) => {
+    internal.pendingRequests.length = 0;
+    for (const reads of queued) internal.pendingRequests.push({ agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), ...reads });
+    const certain = internal.upcomingWakesFor('agent').map((w) => w.certain);
+    internal.pendingRequests.length = 0;
+    return certain;
+  };
+
+  it('a queued wake the scheduler could drop once the agent has answered it is a maybe', async () => {
     const { f } = await judged(true);
     try {
-      const internal = f.framework as unknown as {
-        pendingRequests: Array<Record<string, unknown>>;
-        upcomingWakesFor(name: string): Array<{ certain: boolean; what: string }>;
-      };
-      for (const names of [{ readsWakeLines: true, wakeLines: [] }, { readsStoredMessage: 'row-1' }, { readsDeferredWrite: 'deferred-1' }]) {
-        internal.pendingRequests.length = 0;
-        internal.pendingRequests.push({ agentName: 'agent', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), ...names });
-        assert.deepEqual(internal.upcomingWakesFor('agent').map((w) => w.certain), [false], JSON.stringify(names));
-      }
-      internal.pendingRequests.push({ agentName: 'agent', reason: 'test', source: 'editor', timestamp: Date.now() });
-      assert.deepEqual(internal.upcomingWakesFor('agent').map((w) => w.certain), [true]);
-      internal.pendingRequests.length = 0;
+      const internal = f.framework as unknown as Internal;
+      for (const reads of [
+        { readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' })] },
+        { readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' }), line({ agent: 'agent', deferredId: 'deferred-1' })] },
+        { readsStoredMessage: 'row-1' },
+        { readsDeferredWrite: 'deferred-1' },
+      ]) assert.deepEqual(told(internal, [reads]), [false], JSON.stringify(reads));
+    } finally { await f.close(); }
+  });
+
+  it('a queued wake the scheduler can never drop is certain', async () => {
+    const { f } = await judged(true);
+    try {
+      const internal = f.framework as unknown as Internal;
+      const maybe = { readsStoredMessage: 'row-1' };
+      for (const queued of [
+        [{ readsWakeLines: true, wakeLines: [] }],
+        [{ readsWakeLines: true, wakeLines: [line({ agent: 'agent', messageId: 'row-1' }), line()] }],
+        [{ readsWakeLines: true, wakeLines: [line({ agent: 'other', messageId: 'row-1' })] }],
+        [{}],
+        [maybe, {}],
+      ]) assert.deepEqual(told(internal, queued), [true], JSON.stringify(queued));
     } finally { await f.close(); }
   });
 });

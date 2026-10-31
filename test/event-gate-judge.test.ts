@@ -757,16 +757,29 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.dispose();
   });
 
-  it('tells the judge a debounced batch with a written event only may wake the agent where its lines go to the wake, since an answered batch starts no turn', () => {
-    for (const [handed, certain] of [[true, false], [false, true]] as const) {
+  const toAgent = { agent: 'agent', messageId: 'row-1' };
+  for (const [what, handed, writes, woken, certain] of [
+    ['its one event written to the agent it wakes only may wake it, since an answered batch starts no turn', true, [toAgent], ['agent'], false],
+    ['each of its events written to the agent it wakes only may wake it', true, [toAgent, { agent: 'agent', messageId: 'row-2' }], ['agent'], false],
+    ['where its lines are written when it fires, it wakes the agent', false, [toAgent], ['agent'], true],
+    ['with an event given no write, it wakes the agent, which can never have answered that one', true, [toAgent, undefined], ['agent'], true],
+    ["with an event written to another agent's window, it wakes the agent", true, [{ agent: 'other', messageId: 'row-1' }], ['agent'], true],
+    ['with a write that names no agent, it wakes the agent', true, [{ messageId: 'row-1' }], ['agent'], true],
+    ["it wakes a co-resident, whom the delivery agent's answer doesn't take it from", true, [toAgent], ['agent', 'other'], true],
+  ] as const) {
+    it(`tells the judge of a pending debounced batch: ${what}`, () => {
       const { gate } = makeGate(writeConfig('upcoming-written.json', {
         policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
       }), handed ? { isNewestEntry: () => false } : {});
-      gate.evaluate({ content: 'notes.md', eventType: 'workspace:modified', serverId: '', channelId: '' }, { agent: 'agent', messageId: 'row-1' });
-      assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => [w.what, w.certain]), [['rule "files"\'s debounced batch of 1 event', certain]], `handed: ${handed}`);
+      writes.forEach((after: WritePlacement | undefined, i) => {
+        gate.evaluate({ content: `notes-${i}.md`, eventType: 'workspace:modified', serverId: '', channelId: '' }, after);
+      });
+      const n = writes.length;
+      assert.deepStrictEqual(gate.upcomingWakes([...woken]).map((w) => [w.what, w.certain]),
+        [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]]);
       gate.dispose();
-    }
-  });
+    });
+  }
 
   it("counts a batch's due time on the gate's clock", () => {
     let clock = 1_000_000;

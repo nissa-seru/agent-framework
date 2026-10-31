@@ -6,7 +6,10 @@
   residents who share its slot still wake, and find no line. The lines one
   start is handed are written as one `[Gate: N events matched]` line, each
   channel's messages counted together, where each was written on its own.
-- The reply judge is told that a pending debounced batch with a written
-  event, and a queued wake whose requests all name the messages they're for,
-  only may wake the agent (`certain: false`), since each starts no turn once
-  the agent has answered them.
+- The reply judge is told that a pending debounced batch whose lines are
+  handed to the wake, and the requests queued for the agent, only may wake
+  it (`certain: false`) when every message each names was written to that
+  agent's window, since such a wake starts no turn once the agent has
+  answered them. An event given no write or written to another agent's
+  window, or a queued request that names no message, keeps it certain, and
+  so does a batch that wakes more than one agent.

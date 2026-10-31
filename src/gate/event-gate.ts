@@ -4054,9 +4054,11 @@ export class EventGate {
    * the judge to weigh what waiting costs: each agent's pending self-wake
    * (skip_reply's wake_in_seconds), the end of a sleep, and the pending
    * batches of rules other than `exceptPolicy` (a debounce's wakes the agent
-   * when it fires, or, where its lines go to a host with `isNewestEntry` and
-   * it has an event with a write, only may, since a batch the agent has
-   * answered starts no turn; a judge rule's goes to the judge, so it only
+   * when it fires, or only may, where its lines go to a host with
+   * `isNewestEntry` and each of its events was written to the window of each
+   * of `agentNames`, since a batch starts no turn for an agent that has
+   * answered every event in it, and an event counts as answered only by the
+   * agent its write went to; a judge rule's goes to the judge, so it only
    * may).
    */
   upcomingWakes(agentNames: string[], exceptPolicy?: string): UpcomingWake[] {
@@ -4077,7 +4079,7 @@ export class EventGate {
       const batch = `${n} ${n === 1 ? 'event' : 'events'}`;
       wakes.push(state.judge
         ? { at: state.dueAt, certain: false, what: `rule ${quotedValue(name)}'s batch of ${batch} goes to the judge` }
-        : { at: state.dueAt, certain: this.isNewestEntryFn === undefined || !state.events.some((e) => e.after !== undefined), what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
+        : { at: state.dueAt, certain: this.isNewestEntryFn === undefined || !state.events.every((e) => agentNames.every((agent) => e.after?.agent === agent)), what: `rule ${quotedValue(name)}'s debounced batch of ${batch}` });
     }
     return wakes.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
   }

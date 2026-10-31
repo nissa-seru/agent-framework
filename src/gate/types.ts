@@ -295,9 +295,11 @@ export interface UpcomingWake {
   /** When (ms), when known; absent for one due as soon as the agent is free. */
   at?: number;
   /** False when it only may wake the agent: a judge rule's batch goes to the
-   *  judge then, and a debounced batch whose lines are handed to the wake
-   *  with a write, or a queued wake whose requests all name the messages
-   *  they're for, starts no turn once the agent has answered them. */
+   *  judge then, and a debounced batch whose lines are handed to the wake, or
+   *  a queued wake, starts no turn once the agent has answered every message
+   *  it names. Only a message written to that agent's window can count as
+   *  answered, so one with no write, or one written to another agent's
+   *  window, keeps the wake, and so does a wake that names none. */
   certain: boolean;
   /** What it is, as the judge is told ("its own skip_reply timer"). */
   what: string;
