@@ -14,6 +14,11 @@ type Framework = {
 const waiting = (answer: Answer): { waiting?: unknown; note?: string; cancelled?: unknown } =>
   (answer.data ?? {}) as { waiting?: unknown; note?: string; cancelled?: unknown };
 
+const FOCUS_WAIT_NOTE = 'The focus is still in force. This close requested its release while writes were held. '
+  + 'The host may run or retry that request after the affected store resumes writes. '
+  + 'A release can fail. If the host stops before the release succeeds, the pending request is lost. '
+  + 'After writes resume, call channel_close for this channel again to request release if the focus remains active.';
+
 function saysWhatItWaitsFor(note: string): void {
   assert.match(note, /an operator's change to the store/, `names a surgery's hold: ${note}`);
   assert.match(note, /refuses writes until the host re-initializes it/, `names a refusing context: ${note}`);
@@ -109,15 +114,14 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       assert.equal(result.success, false);
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
       assert.doesNotMatch(result.error ?? '', /ended all the same|was delivered/, result.error);
-      assert.match(result.error ?? '', /The close cancels the all-except hold that excepts it\. Not cancelled yet: /, result.error);
-      saysWhatItWaitsFor(result.error ?? '');
+      assert.ok((result.error ?? '').includes(FOCUS_WAIT_NOTE), result.error);
       assert.doesNotMatch(result.error ?? '', /Nothing you can do/, result.error);
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
     } finally { release(); again(); await f.close(); }
   });
 
-  for (const already of [false, true]) it(`a close of the excepted channel${already ? ', closed already,' : ''} during a surgery's hold is answered ${already ? 'already closed' : 'closed'} and told the focus ends once the hold is over`, async () => {
+  for (const already of [false, true]) it(`a close of the excepted channel${already ? ', closed already,' : ''} during a surgery's hold is answered ${already ? 'already closed' : 'closed'} and told the pending release can be lost or retried`, async () => {
     const { f, coordinator, release } = await heldDuringSurgery();
     let again = (): void => {};
     try {
@@ -136,12 +140,36 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
       const data = (result.data ?? {}) as { status?: string; note?: string };
       assert.equal(data.status, already ? 'already closed' : 'closed');
       assert.ok(coordinator.getAllExcept(), 'premise: the hold is still in force');
-      assert.match(data.note ?? '', /^The close cancels the all-except hold that excepts it\. Not cancelled yet: /,
-        `the answer says the hold's end waits, not only that the channel is closed: ${JSON.stringify(data)}`);
-      saysWhatItWaitsFor(data.note ?? '');
+      assert.equal(data.note, FOCUS_WAIT_NOTE, 'the answer says the pending focus release is conditional and retryable');
       assert.doesNotMatch(data.note ?? '', /ended|was delivered/, data.note);
       again();
       assert.equal(coordinator.getAllExcept(), null, 'ended at the release');
+    } finally { release(); again(); await f.close(); }
+  });
+
+  it('a pending focus release lost at stop can be requested again by closing the recorded-closed channel', async () => {
+    const { f, coordinator, release } = await heldDuringSurgery();
+    let again = (): void => {};
+    try {
+      release();
+      assert.ok(coordinator.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      assert.ok(coordinator.enterAllExcept({ serverId: 'editor', channelId: 'work' }, { durationSeconds: 120 }, 'agent-tool').ok);
+      const close = (id: string): Promise<Answer> =>
+        f.framework.executeToolCall({ id, name: 'channel_close', input: { channelId: 'work' }, callerAgentName: 'agent' } as never) as Promise<Answer>;
+      again = (f.framework as unknown as Framework).reserveStoreForSurgery('roll back', 'agent');
+      const pending = await close('c1');
+      assert.ok(pending.success, pending.error);
+      assert.equal(waiting(pending).note, FOCUS_WAIT_NOTE);
+      assert.ok(coordinator.getAllExcept(), 'the focus remains active until its release');
+      assert.equal(internals(f).channelRegistry.getDesiredState('editor', 'work'), 'closed', 'the close decision was recorded');
+      coordinator.stop();
+      again();
+      assert.ok(coordinator.getAllExcept(), 'the in-memory release request was lost at stop');
+      const retried = await close('c2');
+      assert.ok(retried.success, retried.error);
+      assert.equal(waiting(retried).note, 'The focus on it ended, and what the other channels held was delivered.');
+      assert.equal((retried.data as { status?: string }).status, 'already closed');
+      assert.equal(coordinator.getAllExcept(), null, 'repeating the close released the focus');
     } finally { release(); again(); await f.close(); }
   });
 });
