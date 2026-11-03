@@ -34021,12 +34021,11 @@ export class AgentFramework {
             throw new Error(`The close wasn't recorded: ${err instanceof Error ? err.message : String(err)}`);
           }
           if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
-          // A cancel that waits is told as the tune-out tools tell one
-          // (cancelWaitsNote): what it waits for, that asking again doesn't
-          // end the wait sooner, that its length isn't known, and that a stop
-          // before it runs loses it.
           return released.deferred
-            ? `The close cancels the all-except hold that excepts it. ${cancelWaitsNote('The all-except hold')}`
+            ? 'The focus is still in force. This close requested its release while writes were held. '
+              + 'The host may run or retry that request after the affected store resumes writes. '
+              + 'A release can fail. If the host stops before the release succeeds, the pending request is lost. '
+              + 'After writes resume, call channel_close for this channel again to request release if the focus remains active.'
             : 'The focus on it ended, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
