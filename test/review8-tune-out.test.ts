@@ -77,6 +77,24 @@ test('65: a deferred cancel whose release is not made durable at the release sta
   }
 });
 
+test('65: after a failed deferred release, a new cancel can end the same hold before its retry timer', () => {
+  const { coordinator, state } = deferredSetup();
+  const errors = mock.method(console, 'error', () => {});
+  try {
+    assert.deepEqual(coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'test'), { ok: true, deferred: true });
+    state.held = false;
+    coordinator.runDeferredCancels();
+    assert.ok(state.inForce, 'first attempt failed after writes resumed');
+    state.durable = true;
+    const repeated = coordinator.cancel('disc', 'disc:guild:a', 'agent-tool', 'try again');
+    assert.ok(repeated.ok, 'another cancel can request an immediate attempt');
+    assert.equal(state.inForce, false, 'the same hold ended without waiting for its timer');
+  } finally {
+    coordinator.stop();
+    errors.mock.restore();
+  }
+});
+
 test('65: with no later release, one retry timer runs the waiting cancel again; stop clears it', () => {
   mock.timers.enable({ apis: ['setTimeout'] });
   const errors = mock.method(console, 'error', () => {});

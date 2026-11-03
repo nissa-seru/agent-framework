@@ -41,10 +41,11 @@
   has none; otherwise its note is dropped, logged, and the answer adds `noteDropped: true`. The tools say so to the
   agent, where they answered `cancelled`: the resident's `tune_out` cancel answers `waiting` (the channel's name, or
   `'all-except'`) and the subconscious's `cancel_tuneout` `waiting: true` (with `scope: 'all-except'` for that
-  hold), each with a `note`: not cancelled yet, since an operator's change to the store is in progress or a context
-  the cancel writes to refuses writes until the host re-initializes it; cancelling again doesn't end the wait
-  sooner; the tune-out stays in force until then, and what it held is delivered when it ends; and a host that stops
-  first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed.
+  hold), each with a `note` saying the same hold remains in force while cancellation waits for held writes,
+  a repeat cannot pass held writes, and the host may run or retry that request once writes resume. A stop before
+  cancellation succeeds loses the pending request, including one awaiting a retry after failure. At startup,
+  the host tries an elapsed end time. If the same hold remains after writes resume, and the caller can still
+  use its cancel tool, it can request a fresh attempt; neither its success nor its release time is guaranteed.
   `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A `channel_close` of the
   channel an all-except hold excepts carries what became of the focus, whatever became of the close (`note` on a
   success, where it said nothing, and after the error on a failure): that the focus ended, or that it remains in
