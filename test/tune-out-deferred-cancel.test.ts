@@ -14,9 +14,10 @@ type Framework = {
 const waiting = (answer: Answer): { waiting?: unknown; note?: string; cancelled?: unknown } =>
   (answer.data ?? {}) as { waiting?: unknown; note?: string; cancelled?: unknown };
 
-const FOCUS_WAIT_NOTE = 'The focus is still in force: this close requested its release while writes were held. '
-  + 'The pending release may run when the affected store takes writes again, but a host stop first loses it and a release can fail. '
-  + 'When writes resume, check the focus with tune_out (mode: check). If it remains, call channel_close for this channel again or cancel the all-except focus.';
+const FOCUS_WAIT_NOTE = 'The focus is still in force. This close requested its release while writes were held. '
+  + 'The host may run that request after the affected store resumes writes, but a release can fail. '
+  + 'If the host stops before it runs, the request is lost. '
+  + 'After writes resume, call channel_close for this channel again to request release if the focus remains active.';
 
 function saysWhatItWaitsFor(note: string): void {
   assert.match(note, /an operator's change to the store/, `names a surgery's hold: ${note}`);
