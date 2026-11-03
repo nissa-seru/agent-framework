@@ -44,9 +44,11 @@
   first loses the cancel, so the tune-out is still in force after the restart unless its end time has passed.
   `cancel_tuneout`'s note says too when the caller's note isn't delivered (`noteDropped`). A `channel_close` of the
   channel an all-except hold excepts carries what became of the focus, whatever became of the close (`note` on a
-  success, where it said nothing, and after the error on a failure): that the focus ended, or that it ends once the
-  wait is over. A crash before the cancel
-  runs leaves the tune-out in force for the next boot, which cancels one whose end time passed. The
+  success, where it said nothing, and after the error on a failure): that the focus ended, or that its
+  release was requested while writes were held and may fail or be lost before it runs. After writes resume, the
+  agent can check whether the focus remains and repeat `channel_close` (even if the channel is already closed) or
+  cancel the all-except focus. A crash before a pending release runs can leave the focus in force at the next boot;
+  an expired scope is then retried. The
   `store-held-long` alert says so: a restart loses the writes the hold keeps in memory and those kept
   for a manager refusing its work, where 0.28.0's said writes still queued at exit survive in a persisted deferral
   queue. `stop()` names what it leaves unstored: for each agent with writes still kept in memory, those kept while

@@ -33461,7 +33461,9 @@ export class AgentFramework {
           }
           if (!released.ok) throw new Error(`The close wasn't recorded: ${released.error}`);
           return released.deferred
-            ? 'The focus on it ends once an operator\'s change to the store is over, or a context that refuses writes is re-initialized by the host, and what the other channels held is delivered then.'
+            ? 'The focus is still in force: this close requested its release while writes were held. '
+              + 'The pending release may run when the affected store takes writes again, but a host stop first loses it and a release can fail. '
+              + 'When writes resume, check the focus with tune_out (mode: check). If it remains, call channel_close for this channel again or cancel the all-except focus.'
             : 'The focus on it ended, and what the other channels held was delivered.';
         },
         focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,

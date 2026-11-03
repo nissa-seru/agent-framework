@@ -120,7 +120,7 @@ describe("a cancel that waits for the held writes says so to its caller", () => 
     } finally { release(); again(); await f.close(); }
   });
 
-  for (const already of [false, true]) it(`a close of the excepted channel${already ? ', closed already,' : ''} during a surgery's hold is answered ${already ? 'already closed' : 'closed'} and told the focus ends once the hold is over`, async () => {
+  for (const already of [false, true]) it(`a close of the excepted channel${already ? ', closed already,' : ''} during a surgery's hold is answered ${already ? 'already closed' : 'closed'} and told the pending release can be lost or retried`, async () => {
     const { f, coordinator, release } = await heldDuringSurgery();
     let again = (): void => {};
     try {
