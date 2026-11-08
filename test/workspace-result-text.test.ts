@@ -250,9 +250,9 @@ test('edit and edit_many answer their counts and notes, the files edit_many chan
 test("an edit's receipt is held to the call's limit as its text measures it", async () => {
   await withWorkspace(async ({ call, synced }) => {
     // Lines JSON writes at twice their length: the region fits as text, and wouldn't as JSON.
-    const line = (n: number) => `${n} ${'"\\'.repeat(150)}`;
+    const line = (n: number) => `${n} ${'"\\'.repeat(45)}`;
     await synced('q.txt', `${Array.from({ length: 9 }, (_, i) => line(i + 1)).join('\n')}\n`);
-    const edit = await call('edit', { path: 'work/q.txt', oldString: '5 "', newString: 'five "' }, 2_000);
+    const edit = await call('edit', { path: 'work/q.txt', oldString: '5 "', newString: `five "${'"\\'.repeat(450)}` }, 2_000);
     const text = textOf(edit);
     assert.ok(text.length <= 2_000, `the receipt's text, ${text.length}, fits 2,000`);
     assert.ok(JSON.stringify(fields(edit)).length > 2_000, 'as JSON the same receipt would pass the limit');
