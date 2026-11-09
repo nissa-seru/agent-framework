@@ -1,4 +1,4 @@
-/** The newest row of the conversation in an agent's view, named from its metadata alone, never its content. */
+/** The newest row of the conversation in an agent's view, named from its metadata, and from its content's block types to tell a tool result, never its text. */
 export interface NewestRow {
   /** Its author, where its metadata names one. */
   sender?: string;

@@ -1,8 +1,9 @@
 - A turn whose compile selects none of the conversation the agent's window
   holds, injections aside, ends before anything is sent. Its
   `[inference-failed]` notice says the turn wasn't sent, names the newest
-  message by its author and channel from metadata, never its content, and
-  says what follows if that message is too large for the context. The
+  message by its author and channel from its metadata, or as a tool result
+  from its content's block types, never its text, and says what follows if
+  that message is too large for the context. The
   `context-refusal` ops alert, raised at once, gives the operator the
   budget's figures and what to change. It was sent anyway: in
   native mode the provider refused an empty message list with a 400

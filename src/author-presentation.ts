@@ -18,6 +18,8 @@
  */
 import type { ContentBlock, MessageMetadata } from '@animalabs/membrane';
 import { suppliedValue } from './supplied-text.js';
+import { qualifiedChannelName } from './mcpl/channel-name.js';
+import type { NewestRow } from './empty-compile.js';
 
 /** The participant the framework stores channel traffic under: a role, not a name. */
 export const ANONYMOUS_PARTICIPANT = 'user';
@@ -28,6 +30,18 @@ type TextBlock = Extract<ContentBlock, { type: 'text' }>;
 export function authorNamed(metadata: Record<string, unknown> | MessageMetadata | undefined): string | undefined {
   const name = (metadata?.author as { name?: unknown } | undefined)?.name;
   return typeof name === 'string' && name.length > 0 ? name : undefined;
+}
+
+/** A stored row named as an empty compile's notice names the newest one: from its metadata, its author (`authorNamed`, else `authorName` or `external.authorName`) and channel, or, from its content's block types, that it's a tool result. Never from its content's text. */
+export function rowNamed(row: { content: readonly ContentBlock[]; metadata?: unknown }): NewestRow {
+  if (row.content.some((b) => b.type === 'tool_result')) return { toolResult: true };
+  const md = (row.metadata ?? {}) as Record<string, unknown> & { authorName?: unknown; serverId?: unknown; channelId?: unknown; external?: { authorName?: unknown; channelId?: unknown } };
+  const text = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+  const sender = authorNamed(md) ?? text(md.authorName) ?? text(md.external?.authorName);
+  const channelId = text(md.channelId) ?? text(md.external?.channelId);
+  const serverId = text(md.serverId);
+  const channel = channelId && serverId ? qualifiedChannelName({ serverId, channelId }) : channelId;
+  return { ...(sender ? { sender } : {}), ...(channel ? { channel } : {}) };
 }
 
 /** Whether `text` already begins with the author's own line: `Name:` then a space or the end. */

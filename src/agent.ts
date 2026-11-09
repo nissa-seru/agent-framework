@@ -6,8 +6,8 @@ import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { managerSees } from './context-options.js';
-import { EmptyCompileError, type NewestRow } from './empty-compile.js';
-import { qualifiedChannelName } from './mcpl/channel-registry.js';
+import { EmptyCompileError } from './empty-compile.js';
+import { rowNamed } from './author-presentation.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
@@ -179,17 +179,6 @@ function wireDigest(value: unknown): string {
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_COMPILE_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT_BUDGET_TOKENS, reserveForResponse: 4_000 };
 
-/** A row named from its metadata alone, as an empty compile's notice names the newest one: its author and channel, or that it's a tool result. */
-function rowNamed(row: StoredMessage): NewestRow {
-  if (row.content.some((b) => b.type === 'tool_result')) return { toolResult: true };
-  const md = (row.metadata ?? {}) as { author?: { name?: unknown }; authorName?: unknown; serverId?: unknown; channelId?: unknown; external?: { authorName?: unknown; channelId?: unknown } };
-  const text = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
-  const sender = text(md.author?.name) ?? text(md.authorName) ?? text(md.external?.authorName);
-  const channelId = text(md.channelId) ?? text(md.external?.channelId);
-  const serverId = text(md.serverId);
-  const channel = channelId && serverId ? qualifiedChannelName({ serverId, channelId }) : channelId;
-  return { ...(sender ? { sender } : {}), ...(channel ? { channel } : {}) };
-}
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
