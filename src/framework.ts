@@ -27455,6 +27455,7 @@ export class AgentFramework {
     agent.takeStopWithoutStream();
     const checkWindow: CheckWindow = { abandoned: false };
     this.checkAhead.set(agent, checkWindow);
+    const streamAtStart = this.activeStreams.get(agent.name);
     let tokenHandedOff = false;
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
@@ -27495,6 +27496,7 @@ export class AgentFramework {
         this.activeTurnTriggers.delete(agent.name);
       }
       if (!tokenHandedOff && ownsProviderGate && !checkWindow.gateReleased) this.releasePrimaryProviderGate(agent.name);
+      if (!tokenHandedOff && this.activeStreams.get(agent.name) === streamAtStart) this.activeStreams.delete(agent.name);
       // A start that ends before its stream exists is its turn's end: what
       // arrived during it enters its window, as at a stream's teardown,
       // unless its turn lives on (a retry on its way). Left out, it would
