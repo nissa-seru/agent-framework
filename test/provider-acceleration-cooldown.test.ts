@@ -7,6 +7,7 @@ import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, InferenceRequest, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
+import { withAudience } from '../src/dendrite/audience.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { bindAsConversationFork } from './helpers/dendrite.js';
 
@@ -199,6 +200,11 @@ test('a resident waiting behind auxiliary work does not block another resident',
     withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
     startAgentStream(agent: unknown): Promise<void>;
   };
+  // Residents share a slot: each needs a row of its own, or its compile holds none of the other's and is refused before it's sent.
+  for (const name of ['resident', 'other']) {
+    const cm = framework.getAgent(name)!.getContextManager();
+    cm.presentRows([cm.addMessage('user', [{ type: 'text', text: `zz-for-${name}` }], withAudience(undefined, [name]))]);
+  }
   let finish!: () => void;
   const auxiliary = internal.withAuxiliaryAdmission('resident', () => new Promise<void>((resolve) => {
     finish = resolve;

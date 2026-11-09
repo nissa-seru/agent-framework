@@ -20,6 +20,7 @@ import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverB
 // import of either would fail this package's load there before create()
 // could name the release it needs.
 import { WriteLandedError, WriteOutcomeUnknownError } from './context-manager-errors.js';
+import { EmptyCompileError } from './empty-compile.js';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import {
@@ -37,7 +38,7 @@ import {
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
-import { residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
+import { managerSees, recordManagerView, recordedManagerView, residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
 import type {
   MessageId,
@@ -2917,6 +2918,7 @@ export class DefaultErrorPolicy implements ErrorPolicy {
   }
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
+    if (error instanceof EmptyCompileError) return { retry: false };
     if (isDeadlineExpiry(error)) {
       const decision = retryDecision(this.settings.deadline ? 'deadline' : 'retryable', attempt + 1, undefined, this.settings);
       return decision.retry ? { retry: true, delayMs: decision.delayMs } : { retry: false };
@@ -3067,6 +3069,8 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
+/** Failures of a context that can't be fitted: while it can't, each one's marker only adds to it, so a streak leaves one. */
+const UNFITTING_FAILURES: ReadonlySet<string> = new Set(['empty_compile', 'over_budget']);
 const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
   '(e.g. drop an oversized attachment or an unsupported setting).';
 const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
@@ -4866,7 +4870,6 @@ export class AgentFramework {
   // closes, before an owned store, each one alive.
   private readonly openManagers = new Set<WeakRef<ContextManager>>();
   private readonly openManagerRefs = new WeakMap<ContextManager, WeakRef<ContextManager>>();
-  private readonly storeSees = new WeakMap<ContextManager, (metadata: unknown) => boolean>();
   private readonly collectedManagers = new FinalizationRegistry<WeakRef<ContextManager>>((ref) => this.openManagers.delete(ref));
   /** The coalescing commit in flight, if any (see commitCoalescingDurable). */
   private coalescingCommit: Promise<void> | null = null;
@@ -11486,7 +11489,7 @@ export class AgentFramework {
           membrane: this.ephemeralAuxiliaryMembraneFor(config.name, release),
           debugLogContext: !!process.env.DEBUG_CONTEXT,
         });
-        this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
+        recordManagerView(contextManager, (metadata) => !isReasoningLoss(metadata));
         ownSlot = { namespace };
       }
       // Either manager is the run's to release (main's manager release), the derived one included.
@@ -12118,12 +12121,12 @@ export class AgentFramework {
     // the fork's own injections were hidden from its compile while its
     // parent's showed (#291; Weft's eleventh note, on the real compile path).
     // The composed predicate goes to derive, so the first compile already
-    // reads through it, and is recorded beside the manager (storeSees), so
+    // reads through it, and is recorded beside the manager (recordManagerView), so
     // main's checks of whether an agent sees a row (agentSees: a tool
     // boundary's injection, an arrival, a reader of an unread message) ask
     // what its compile shows. The global legacy-notice exclusion applies
     // even when the source has no additional view recorded.
-    const sourceSees = this.storeSees.get(source);
+    const sourceSees = recordedManagerView(source);
     const sees = (metadata: unknown): boolean => !isReasoningLoss(metadata)
       && (!sourceSees || sourceSees(metadata) || isOwnInjection(metadata, config.name));
     const contextManager = await source.derive({
@@ -12138,7 +12141,7 @@ export class AgentFramework {
       viewFilter: (message) => sees(message.metadata),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
-    this.storeSees.set(contextManager, sees);
+    recordManagerView(contextManager, sees);
     const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
     return {
       contextManager,
@@ -18088,7 +18091,7 @@ export class AgentFramework {
     // (residentViewFilter: held rows out, read by heldFromResidents,
     // suppressed rows out, read by suppressedRow, and another agent's stored
     // context injections out). Main's boundary and arrival checks read the
-    // same predicate (storeSees, agentSees, #853), recorded below, so they
+    // same predicate (recordManagerView, agentSees, #853), recorded below, so they
     // and the compiled view agree.
     const options = residentContextOptions(config.name);
     // Create context manager for this agent
@@ -20169,7 +20172,7 @@ export class AgentFramework {
       });
       release.manager = contextManager;
       this.trackManager(contextManager);
-      this.storeSees.set(contextManager, (metadata) => !isReasoningLoss(metadata));
+      recordManagerView(contextManager, (metadata) => !isReasoningLoss(metadata));
 
       // Seed with the template's compiled context, renaming the template
       // participant so the fork reads its inheritance as its own history.
@@ -25068,15 +25071,14 @@ export class AgentFramework {
   }
 
   private agentSees(agent: Agent, metadata: unknown): boolean {
-    const sees = this.storeSees.get(agent.getContextManager());
-    return !isReasoningLoss(metadata) && (!sees || sees(metadata));
+    return managerSees(agent.getContextManager(), metadata);
   }
 
   /**
    * Record `view`, the filter `contextManager` was opened with
    * (context-options.ts: residentViewFilter, subconsciousViewFilter, or
    * liveViewFilterOf's choice for an agent's record), as what its agent sees
-   * (storeSees), so main's checks of whether an agent sees a row (agentSees,
+   * (recordManagerView), so main's checks of whether an agent sees a row (agentSees,
    * #853: a tool boundary's injection, an arrival, an unread message's
    * readers, the newest-row check, the recent-image scan) ask the predicate
    * its compiles read. Both views read a row's metadata alone. A manager
@@ -25084,7 +25086,7 @@ export class AgentFramework {
    * every row, as its compiles do. Returns the manager.
    */
   private recordView<T extends ContextManager>(contextManager: T, view: ((message: StoredMessage) => boolean) | undefined): T {
-    if (view) this.storeSees.set(contextManager, (metadata) => view({ metadata } as StoredMessage));
+    if (view) recordManagerView(contextManager, (metadata) => view({ metadata } as StoredMessage));
     return contextManager;
   }
 
@@ -34667,6 +34669,7 @@ export class AgentFramework {
         {
           httpStatus: event.httpStatus as number | undefined,
           providerErrorCode: event.providerErrorCode as string | undefined,
+          operatorNote: event.operatorNote as string | undefined,
         },
       );
     } else if (event.type === 'inference:completed') {
@@ -35112,7 +35115,7 @@ export class AgentFramework {
    * can be reworded without warning.
    */
   private classifyInferenceError(err: Error): {
-    retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string;
+    retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string; operatorNote?: string;
   } {
     // From either copy of membrane (isMembraneError). The fields are read as
     // data, and the type is bounded like describeFailure's, for every sink the
@@ -35131,6 +35134,9 @@ export class AgentFramework {
     }
     if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
+    }
+    if (err instanceof EmptyCompileError) {
+      return { retryable: false, errorType: 'empty_compile', operatorNote: err.operatorNote };
     }
     // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
     // 2026-07-26): a compile REFUSES rather than shipping a context with
@@ -35153,12 +35159,21 @@ export class AgentFramework {
     this.opsAlert(kind, agentName, message, { data });
   }
 
+  /** Whether the newest row in the agent's window is its own marker for a failure of this kind: for a failure whose marker can't fit (UNFITTING_FAILURES), a repeat adds none, so a streak leaves one. */
+  private newestIsFailureMarker(agent: Agent, errorType: string | undefined): boolean {
+    const cm = agent.getContextManager() as Partial<ContextManager>;
+    if (typeof cm.getPresentedMessages !== 'function') return false;
+    const newest = cm.getPresentedMessages().at(-1);
+    const metadata = newest?.metadata as { kind?: unknown; errorType?: unknown } | undefined;
+    return newest !== undefined && isOwnRowOf(newest.metadata, agent.name) && metadata?.kind === 'inference-failed' && metadata.errorType === errorType;
+  }
+
   private noteInferenceExhausted(
     agentName: string,
     rawReason: string,
     retryable?: boolean,
     rawErrorType?: string,
-    detail?: { httpStatus?: number; providerErrorCode?: string },
+    detail?: { httpStatus?: number; providerErrorCode?: string; operatorNote?: string },
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
@@ -35219,7 +35234,7 @@ export class AgentFramework {
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
-    if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+    if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1' && (ended || !UNFITTING_FAILURES.has(errorType ?? '') || !this.newestIsFailureMarker(agent, errorType))) {
       const timedOut = errorType === 'timeout';
       const causeParts = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
@@ -35230,8 +35245,9 @@ export class AgentFramework {
           'user',
           [{
             type: 'text',
-            text:
-              (ended
+            text: !ended && errorType === 'empty_compile'
+              ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn wasn't sent: ${failureShown(markerReason)}.`
+              : (ended
                 ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
                   `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
                   `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
@@ -35333,6 +35349,13 @@ export class AgentFramework {
         `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${drainState}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
+        { skipLog: true },
+      );
+    } else if (errorType === 'empty_compile') {
+      this.opsAlert(
+        'context-refusal',
+        agentName,
+        `compile refused (empty_compile), nothing sent: ${boundFailureText(detail?.operatorNote ?? wholeReason, FAILURE_SUMMARY_MAX_CHARS)}.`,
         { skipLog: true },
       );
     }
@@ -40954,14 +40977,14 @@ export class AgentFramework {
 
   /**
    * Whether `agent`'s view leaves suppressed rows out, asked of the view
-   * itself (storeSees): every resident's, the subconscious's and a view
+   * itself (recordManagerView): every resident's, the subconscious's and a view
    * derived from one does. An isolated agent's own view excludes legacy
    * reasoning-loss notices, not suppressed rows, so a suppressed row stamped
    * there would render.
    */
   private viewHidesSuppressed(agent: Agent | undefined): boolean {
     if (!agent) return false;
-    const sees = this.storeSees.get(agent.getContextManager());
+    const sees = recordedManagerView(agent.getContextManager());
     return !!sees && !sees(SUPPRESSED_PROBE);
   }
 

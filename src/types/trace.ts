@@ -155,6 +155,8 @@ export type TraceEvent =
       httpStatus?: number;
       /** The provider's own error code, when it sent one (at most 128 characters). */
       providerErrorCode?: string;
+      /** For the operator, beside `error`, which is written for the agent: the figures and what to change (an `empty_compile`'s). */
+      operatorNote?: string;
     })
 
   // Streaming inference lifecycle

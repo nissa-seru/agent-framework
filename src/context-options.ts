@@ -57,6 +57,25 @@ export function residentViewFilter(messageOrName: Pick<StoredMessage, 'metadata'
     && !isReasoningLoss(message.metadata);
 }
 
+/** What the agent of each manager sees: the view its compiles read, recorded where the manager is opened. */
+const managerViews = new WeakMap<object, (metadata: unknown) => boolean>();
+
+/** Record `sees` as what the agent of `manager` sees, the predicate its compiles read (#853). */
+export function recordManagerView(manager: object, sees: (metadata: unknown) => boolean): void {
+  managerViews.set(manager, sees);
+}
+
+/** The view recorded for `manager`, if any. */
+export function recordedManagerView(manager: object): ((metadata: unknown) => boolean) | undefined {
+  return managerViews.get(manager);
+}
+
+/** Whether the agent of `manager` sees a row with this metadata: never a legacy notice, and otherwise as its recorded view says, or every row where none was recorded, as its compiles do. */
+export function managerSees(manager: object, metadata: unknown): boolean {
+  const sees = managerViews.get(manager);
+  return !isReasoningLoss(metadata) && (!sees || sees(metadata));
+}
+
 /** The subconscious includes held traffic, but not suppressed rows, foreign injections or legacy notices. */
 export function subconsciousViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
 export function subconsciousViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;

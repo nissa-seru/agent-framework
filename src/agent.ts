@@ -5,6 +5,9 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { managerSees } from './context-options.js';
+import { EmptyCompileError, type NewestRow } from './empty-compile.js';
+import { qualifiedChannelName } from './mcpl/channel-registry.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
@@ -132,6 +135,7 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  StoredMessage,
   ThinkingStrip,
 } from '@animalabs/context-manager';
 import type {
@@ -173,6 +177,19 @@ function wireDigest(value: unknown): string {
 }
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+const DEFAULT_COMPILE_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT_BUDGET_TOKENS, reserveForResponse: 4_000 };
+
+/** A row named from its metadata alone, as an empty compile's notice names the newest one: its author and channel, or that it's a tool result. */
+function rowNamed(row: StoredMessage): NewestRow {
+  if (row.content.some((b) => b.type === 'tool_result')) return { toolResult: true };
+  const md = (row.metadata ?? {}) as { author?: { name?: unknown }; authorName?: unknown; serverId?: unknown; channelId?: unknown; external?: { authorName?: unknown; channelId?: unknown } };
+  const text = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+  const sender = text(md.author?.name) ?? text(md.authorName) ?? text(md.external?.authorName);
+  const channelId = text(md.channelId) ?? text(md.external?.channelId);
+  const serverId = text(md.serverId);
+  const channel = channelId && serverId ? qualifiedChannelName({ serverId, channelId }) : channelId;
+  return { ...(sender ? { sender } : {}), ...(channel ? { channel } : {}) };
+}
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
@@ -680,8 +697,36 @@ export class Agent {
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
     // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    const base = resolved ?? DEFAULT_COMPILE_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+  }
+
+  /**
+   * Refuses a compile that selected none of the conversation the agent's
+   * window holds. An injection, placed or stored, isn't the conversation, and
+   * a window that holds none of it (an empty store, a resident with no row of
+   * its own in a shared slot) is sent as it was.
+   */
+  private refuseEmptyCompile(compiled: CompileResult, budget?: TokenBudget): void {
+    const conversation = (i: number) => compiled.provenance?.messages[i]?.kind !== 'injection' && !this.isStoredInjectionRow(compiled, i);
+    if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
+    const newest = this.newestConversationRow();
+    if (!newest) return;
+    const at = this.compileBudget(budget) ?? DEFAULT_COMPILE_BUDGET;
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, rowNamed(newest));
+  }
+
+  /** The newest row in the agent's window that it sees and isn't a stored injection. A manager that can list neither its window nor its rows holds none. */
+  private newestConversationRow(): StoredMessage | undefined {
+    const cm = this.contextManager as Partial<ContextManager>;
+    const rows = typeof cm.getPresentedMessages === 'function' ? cm.getPresentedMessages()
+      : typeof cm.getAllMessages === 'function' ? cm.getAllMessages()
+      : [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const m = rows[i]!;
+      if (hasRenderedContent(m.content) && storedInjectionMarkOf(m.metadata) === undefined && managerSees(this.contextManager, m.metadata)) return m;
+    }
+    return undefined;
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
@@ -1925,6 +1970,7 @@ export class Agent {
       const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
+      this.refuseEmptyCompile(compiled, budget);
       const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
@@ -2176,6 +2222,7 @@ export class Agent {
     messages = withoutTokenEstimates(messages);
 
     messages = this.presentOwnTurns(messages);
+    if (!options.dryRun) this.refuseEmptyCompile(compiledResult, budget);
 
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first

@@ -17,6 +17,7 @@ import { AgentFramework } from '../src/index.js';
 import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
+import { withAudience } from '../src/dendrite/audience.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import { jsonLines } from './helpers/json-lines.js';
@@ -931,6 +932,9 @@ describe('held prose drafts, end to end', () => {
       ], 'scout', 'request');
       const [mine] = h.drafts('scout');
       assert.ok(mine);
+      // Every stored row is scout's, so other needs one of its own for its request to hold anything.
+      const otherCm = h.framework.getAgent('other')!.getContextManager();
+      otherCm.presentRows([otherCm.addMessage('user', [{ type: 'text', text: 'list and resend' }], withAudience(undefined, ['other']))]);
       await h.turn([
         createMockResponse([drafts('o1', { action: 'list' })], 'tool_use'),
         createMockResponse([drafts('o2', { action: 'resend', draftIds: [mine.id], destination: ROOM })], 'tool_use'),
