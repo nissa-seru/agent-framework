@@ -703,7 +703,8 @@ export class Agent {
     const newest = this.newestConversationRow();
     if (!newest) return;
     const at = this.compileBudget(budget) ?? DEFAULT_COMPILE_BUDGET;
-    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, rowNamed(newest));
+    const strategy = (this.contextManager as Partial<ContextManager>).getStrategy?.().name;
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, rowNamed(newest, this.name), strategy);
   }
 
   /** The newest row in the agent's window that it sees and isn't a stored injection. A manager that can list neither its window nor its rows holds none. */

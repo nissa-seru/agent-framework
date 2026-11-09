@@ -164,7 +164,7 @@ import type {
   RegistrySnapshot,
 } from './dendrite/index.js';
 import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
-import { markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, suppliedValue } from './supplied-text.js';
+import { cutToFit, markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, suppliedValue } from './supplied-text.js';
 import { NOTICE_TAG } from './notice-tags.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
@@ -36017,10 +36017,17 @@ export class AgentFramework {
         { skipLog: true },
       );
     } else if (errorType === 'empty_compile') {
+      // The note is the framework's own words and the row's metadata names,
+      // never a provider's text, so it gets the webhook's whole room.
+      const head = 'compile refused (empty_compile), nothing sent: ';
+      const note = detail?.operatorNote;
+      const room = OPS_WEBHOOK_MESSAGE_MAX_CHARS - head.length;
       this.opsAlert(
         'context-refusal',
         agentName,
-        `compile refused (empty_compile), nothing sent: ${boundFailureText(detail?.operatorNote ?? wholeReason, FAILURE_SUMMARY_MAX_CHARS)}.`,
+        note === undefined ? `${head}${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)}.`
+          : note.length <= room ? head + note
+          : `${head}${cutToFit(note, room - 1)}…`,
         { skipLog: true },
       );
     }

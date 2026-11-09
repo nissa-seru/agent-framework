@@ -20,6 +20,7 @@ import type { ContentBlock, MessageMetadata } from '@animalabs/membrane';
 import { suppliedValue } from './supplied-text.js';
 import { qualifiedChannelName } from './mcpl/channel-name.js';
 import type { NewestRow } from './empty-compile.js';
+import { isOwnRowOf } from './dendrite/audience.js';
 
 /** The participant the framework stores channel traffic under: a role, not a name. */
 export const ANONYMOUS_PARTICIPANT = 'user';
@@ -32,9 +33,20 @@ export function authorNamed(metadata: Record<string, unknown> | MessageMetadata 
   return typeof name === 'string' && name.length > 0 ? name : undefined;
 }
 
-/** A stored row named as an empty compile's notice names the newest one: from its metadata, its author (`authorNamed`, else `authorName` or `external.authorName`) and channel, or, from its content's block types, that it's a tool result. Never from its content's text. */
-export function rowNamed(row: { content: readonly ContentBlock[]; metadata?: unknown }): NewestRow {
+/**
+ * A stored row named as an empty compile's notice names the newest one, never
+ * from its content's text: from its content's block types, that it's a tool
+ * result; then, where it's `agent`'s own round (its own row, `isOwnRowOf`,
+ * stored under `agent`'s name), that `agent` wrote it, and whether it's a
+ * tool call; otherwise, from its metadata, its author (`authorNamed`, else
+ * `authorName` or `external.authorName`) and channel. A tool result carries
+ * its agent's own-row stamp too, so it's told first.
+ */
+export function rowNamed(row: { participant?: string; content: readonly ContentBlock[]; metadata?: unknown }, agent: string): NewestRow {
   if (row.content.some((b) => b.type === 'tool_result')) return { toolResult: true };
+  if (row.participant === agent && isOwnRowOf(row.metadata, agent)) {
+    return { own: row.content.some((b) => b.type === 'tool_use') ? 'tool-call' : 'message' };
+  }
   const md = (row.metadata ?? {}) as Record<string, unknown> & { authorName?: unknown; serverId?: unknown; channelId?: unknown; external?: { authorName?: unknown; channelId?: unknown } };
   const text = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
   const sender = authorNamed(md) ?? text(md.authorName) ?? text(md.external?.authorName);

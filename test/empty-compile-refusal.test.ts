@@ -7,7 +7,8 @@ import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework, DefaultErrorPolicy, EmptyCompileError } from '../src/index.js';
-import { withAudience } from '../src/dendrite/audience.js';
+import { storeOwnRow, withAudience } from '../src/dendrite/audience.js';
+import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 // A message the context can't hold at a 12,000-token budget.
@@ -77,12 +78,12 @@ async function until(check: () => boolean, what: string, boundMs = 10_000): Prom
 
 type Trace = { type: string; kind?: string; message?: string; errorType?: string; agentName?: string };
 
-async function harness(contextBudgetTokens: number, names: readonly string[] = ['resident'], extraModules: readonly Module[] = []) {
+async function harness(contextBudgetTokens: number, names: readonly string[] = ['resident'], extraModules: readonly Module[] = [], strategy?: unknown) {
   const dir = mkdtempSync(join(tmpdir(), 'af-empty-compile-'));
   const membrane = new ProviderLikeMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: names.map((name) => ({ name, model: 'zz-model', systemPrompt: 'system', contextBudgetTokens })),
+    agents: names.map((name) => ({ name, model: 'zz-model', systemPrompt: 'system', contextBudgetTokens, ...(strategy ? { strategy } : {}) })),
     modules: [new InputModule(), ...extraModules], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   } as never);
   const traces: Trace[] = [];
@@ -122,12 +123,12 @@ test('a newest message the budget can\'t hold ends its turn with no request, and
     assert.equal(exhausted.at(-1)!.errorType, 'empty_compile');
     const notice = h.rows().at(-1)!;
     assert.match(notice, /^\[inference-failed\]/);
-    assert.equal(notice, "[inference-failed] Your previous turn wasn't sent: none of your conversation fit in your context. " +
+    assert.equal(notice, "[inference-failed] Your previous turn wasn't sent: none of your conversation reached your context. " +
       'If the newest message in your conversation is too large for your context, it and everything before it stay out of what you see until an operator raises your budget, ' +
       'and you can ask for it in smaller parts.', 'its own frame, the reason alone, no figures and no general advice');
     const alert = h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-refusal').at(-1)!;
-    assert.ok(alert.message!.includes('the 7904 tokens a 12000-token budget leaves after 4096 reserved for the reply'), alert.message);
-    assert.ok(alert.message!.includes('until the budget can hold it: raise contextBudgetTokens'), alert.message);
+    assert.ok(alert.message!.includes("the passthrough strategy selected none of the agent's conversation; 7904 of a 12000-token budget is usable after 4096 reserved for the reply."), alert.message);
+    assert.ok(alert.message!.includes('If the newest message in its conversation is larger than 7904 tokens, it and everything before it stay out of every compile until the budget can hold it: raise contextBudgetTokens.'), alert.message);
 
     h.wake();
     await until(() => h.settled() === 3, 'the wake after the failure');
@@ -159,7 +160,7 @@ test('a budget that leaves no room for any message fails every wake with that re
     assert.ok(h.stderr.some((l) => l.startsWith('[inference-hard-down]')), 'from the third failure the agent is reported hard-down');
     const alerts = h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-refusal');
     assert.ok(alerts.length >= 1, 'the operator is alerted at once');
-    assert.ok(alerts[0]!.message!.includes('contextBudgetTokens (4000) leaves no room once 4096 tokens are reserved for the reply: raise contextBudgetTokens'), alerts[0]!.message);
+    assert.ok(alerts[0]!.message!.includes('compile refused (empty_compile), nothing sent: contextBudgetTokens (4000) leaves no room once 4096 tokens are reserved for the reply: raise contextBudgetTokens.'), alerts[0]!.message);
     const notice = h.rows().find((r) => r.startsWith('[inference-failed]'))!;
     assert.equal(notice, "[inference-failed] Your previous turn wasn't sent: the context budget leaves no room for any of your conversation once the reply's share is set aside, and only an operator can raise the budget.");
   } finally { await h.close(); }
@@ -271,8 +272,8 @@ for (const [form, metadata, content, named] of [
   ['its author and channel', { author: { name: 'Alice' }, serverId: 'discord', channelId: 'general' }, [{ type: 'text', text: 'zz-hi '.repeat(50) }], 'The newest message in your conversation is from Alice in discord:general. If that message'],
   ['its author alone', { authorName: 'Alice' }, [{ type: 'text', text: 'zz-hi '.repeat(50) }], 'The newest message in your conversation is from Alice. If that message'],
   ['its channel alone', { channelId: 'general' }, [{ type: 'text', text: 'zz-hi '.repeat(50) }], 'The newest message in your conversation is in general. If that message'],
-  ['a tool result', { author: { name: 'Alice' } }, [{ type: 'tool_result', toolUseId: 'zz-t', content: [{ type: 'text', text: 'zz-out '.repeat(50) }] }], 'none of your conversation fit in your context. The newest message in your conversation is a tool result. If that message is too large for your context, it and everything before it stay out of what you see until an operator raises your budget, and you can call for less of it.'],
-  ['nothing its metadata names', {}, [{ type: 'text', text: 'zz-hi '.repeat(50) }], 'none of your conversation fit in your context. If the newest message in your conversation'],
+  ['a tool result', { author: { name: 'Alice' } }, [{ type: 'tool_result', toolUseId: 'zz-t', content: [{ type: 'text', text: 'zz-out '.repeat(50) }] }], 'none of your conversation reached your context. The newest message in your conversation is a tool result. If that message is too large for your context, it and everything before it stay out of what you see until an operator raises your budget, and you can call for less of it.'],
+  ['nothing its metadata names', {}, [{ type: 'text', text: 'zz-hi '.repeat(50) }], 'none of your conversation reached your context. If the newest message in your conversation'],
 ] as const) {
   test(`the notice names the newest row by ${form}, from its metadata alone`, async () => {
     // 4 tokens left for the window: a row of fifty words can't fit.
@@ -291,6 +292,50 @@ for (const [form, metadata, content, named] of [
   });
 }
 
+for (const [form, strategy, budget, participant, content, reason] of [
+  ['its own tool call with no result, under the autobiographical strategy',
+    () => new AutobiographicalStrategy({ headWindowTokens: 0, recentWindowTokens: 200 }), 50_000, 'resident',
+    [{ type: 'tool_use', id: 'zz-call', name: 'zz_look', input: {} }],
+    'none of your conversation reached your context. The newest message in your conversation is your own tool call. If that message is too large for your context, it and everything before it stay out of what you see until an operator raises your budget.'],
+  ['a round it wrote too large for its context, under passthrough', undefined, 4_100, 'resident',
+    [{ type: 'text', text: 'zz-mine '.repeat(50) }],
+    'none of your conversation reached your context. The newest message in your conversation is one you wrote. If that message is too large for your context, it and everything before it stay out of what you see until an operator raises your budget.'],
+  ['a tool result stamped as its own row, under passthrough', undefined, 4_100, 'user',
+    [{ type: 'tool_result', toolUseId: 'zz-t', content: [{ type: 'text', text: 'zz-out '.repeat(50) }] }],
+    'none of your conversation reached your context. The newest message in your conversation is a tool result. If that message is too large for your context, it and everything before it stay out of what you see until an operator raises your budget, and you can call for less of it.'],
+] as const) {
+  test(`the notice names the newest row as ${form}`, async () => {
+    const h = await harness(budget, ['resident'], [], strategy?.());
+    try {
+      const agent = h.framework.getAgent('resident')!;
+      storeOwnRow(agent, participant, content as never);
+      h.wake();
+      await until(() => h.settled() === 1, 'the wake');
+      await sleep(50);
+      assert.equal(h.membrane.sent.length, 0, 'nothing is sent');
+      const notice = h.rows().find((r) => r.startsWith('[inference-failed]'))!;
+      assert.equal(notice, `[inference-failed] Your previous turn wasn't sent: ${reason}`);
+    } finally { await h.close(); }
+  });
+}
+
+test('the alert keeps the operator note\'s condition whole and cuts a long name instead', async () => {
+  const h = await harness(4_100);
+  try {
+    const cm = h.framework.getAgent('resident')!.getContextManager();
+    const name = `zz-name-${'x'.repeat(600)}`;
+    cm.presentRows([cm.addMessage('user', [{ type: 'text', text: 'zz-hi '.repeat(50) }], { author: { name }, channelId: 'general' } as never)]);
+    h.wake();
+    await until(() => h.settled() === 1, 'the wake');
+    await sleep(50);
+    const alert = h.traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-refusal').at(-1)!;
+    assert.ok(alert.message!.length <= 500, `the webhook's room: ${alert.message!.length}`);
+    assert.ok(alert.message!.includes("the passthrough strategy selected none of the agent's conversation; 4 of a 4100-token budget is usable after 4096 reserved for the reply. " +
+      'If the newest message in its conversation is larger than 4 tokens, it and everything before it stay out of every compile until the budget can hold it: raise contextBudgetTokens.'), alert.message);
+    assert.ok(!alert.message!.includes(name) && alert.message!.includes('is from zz-name-') && alert.message!.endsWith('…'), 'the name is cut at the end, not dropped');
+  } finally { await h.close(); }
+});
+
 test('the direct API refuses a compile that selects nothing, though tool results would be appended to it', async () => {
   const h = await harness(12_000);
   try {
@@ -305,8 +350,8 @@ test('the direct API refuses a compile that selects nothing, though tool results
     const sentBefore = h.membrane.sent.length;
     await assert.rejects(agent.runInference(h.framework.getAllTools()), (err: unknown) => {
       assert.ok(err instanceof EmptyCompileError, String(err));
-      assert.match((err as Error).message, /^none of your conversation fit in your context/);
-      assert.match((err as EmptyCompileError).operatorNote, /the 4 tokens a 4100-token budget leaves after 4096 reserved for the reply/);
+      assert.match((err as Error).message, /^none of your conversation reached your context/);
+      assert.match((err as EmptyCompileError).operatorNote, /^the passthrough strategy selected none of the agent's conversation; 4 of a 4100-token budget is usable after 4096 reserved for the reply\./);
       return true;
     });
     assert.equal(h.membrane.sent.length, sentBefore, 'its results go nowhere without their call');
@@ -322,7 +367,7 @@ test('the direct API rejects a compile that selects nothing before it sends', as
     await assert.rejects(agent.runInference(h.framework.getAllTools()), (err: unknown) => {
       assert.ok(err instanceof EmptyCompileError, String(err));
       assert.equal((err as EmptyCompileError).retryable, false);
-      assert.match((err as Error).message, /^none of your conversation fit in your context/);
+      assert.match((err as Error).message, /^none of your conversation reached your context/);
       return true;
     });
     assert.equal(h.membrane.sent.length, 0);
