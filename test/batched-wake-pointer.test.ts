@@ -9,9 +9,7 @@
  * BATCH_ROWS) writes one line naming the wake's messages its window holds,
  * as its own row, when a row a reply could be meant for follows them there:
  * none for a turn that merges a wake that isn't a batch's, and in a window
- * still in legacy mode, only the delivery agent's start. The scan reads the
- * window's last 32 rows: where every one of them is a row it leaves aside,
- * such as a clock row or a stored context injection, it writes the line.
+ * still in legacy mode, only the delivery agent's start.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -117,6 +115,10 @@ const storeDm = (b: Bare, eventId: string, text: string): string =>
   b.internals.addMessage('antra', [{ type: 'text', text }], { serverId: 'discord', eventId, channelId: 'discord:dm:1' });
 const storeChatter = (b: Bare, text = 'unrelated chatter'): string =>
   b.internals.addMessage('someone', [{ type: 'text', text }], { serverId: 'discord', channelId: 'discord:g1:general', messageId: `m-${text}` });
+const storeClockRows = (b: Bare, count: number): void => {
+  const cm = b.framework.getAgent('scout')!.getContextManager() as unknown as { addMessage(participant: string, content: unknown[], metadata: unknown): unknown };
+  for (let i = 0; i < count; i++) cm.addMessage('user', [{ type: 'text', text: `[clock row ${i}]` }], { system: true, kind: CLOCK_ROW_KIND, clock: { at: Date.now() } });
+};
 const rowText = (m: { content: Array<{ type: string; text?: string }> }): string => m.content.map((x) => (x.type === 'text' ? x.text ?? '' : '')).join('');
 const texts = (b: Bare, name = 'scout'): string[] => b.framework.getAgent(name)!.getContextManager().getAllMessages().map(rowText);
 /** The rows of `name`'s presented window, as the start's request holds them. */
@@ -495,22 +497,19 @@ describe("a batched wake's line is written once per wake", () => {
     } finally { await done(b); }
   });
 
-  for (const [clockRows, line] of [[31, false], [32, true]] as const) {
-    it(`a DM followed by ${clockRows} clock rows: ${line ? 'past the 32 newest rows the start reads, so the line' : 'within the 32 newest rows the start reads, so no line'}`, async () => {
-      const b = await bare(['scout']);
-      try {
-        const dm = storeDm(b, 'ev-1', 'are you there?');
-        const cm = b.framework.getAgent('scout')!.getContextManager() as unknown as { addMessage(participant: string, content: unknown[], metadata: unknown): unknown };
-        for (let i = 0; i < clockRows; i++) cm.addMessage('user', [{ type: 'text', text: `[clock row ${i}]` }], { system: true, kind: CLOCK_ROW_KIND, clock: { at: Date.now() } });
-        b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
-        b.internals.pendingRequests.push(wake([dm]));
-        await b.framework.runUntilIdle();
-        assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
-        assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
-        assert.equal(linesOf(b).length, line ? 1 : 0);
-      } finally { await done(b); }
-    });
-  }
+  it('a DM followed by 100 clock rows: the DM is still the newest row that counts, so no line', async () => {
+    const b = await bare(['scout']);
+    try {
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      storeClockRows(b, 100);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
+      assert.deepEqual(linesOf(b), []);
+    } finally { await done(b); }
+  });
 
   it('the line gives the age of the oldest of its messages, as of the start', async () => {
     const b = await bare(['scout']);
@@ -760,6 +759,21 @@ describe("a batched wake's line in a window still in legacy mode", () => {
       assert.equal(b.membrane.calls.length, 2, 'premise: both turns ran');
       assert.deepEqual(linesOf(b, 'mira'), [], "the co-resident's start places nothing in the shared record");
       assert.equal(linesOf(b, 'scout').length, 1, "the delivery agent's start writes the slot's line");
+    } finally { await done(b); }
+  });
+
+  it('a DM followed by 100 clock rows: the DM is still the newest row that counts, so no line', async () => {
+    const b = await legacy(['scout']);
+    try {
+      assert.equal(b.framework.getAgent('scout')!.getContextManager().windowMode(), 'legacy', 'premise: the window is the record');
+      const dm = storeDm(b, 'ev-1', 'are you there?');
+      storeClockRows(b, 100);
+      b.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+      b.internals.pendingRequests.push(wake([dm]));
+      await b.framework.runUntilIdle();
+      assert.equal(b.membrane.calls.length, 1, 'premise: the turn ran');
+      assert.ok(inRequest(b, 'are you there?'), "premise: the start's request holds the batch's message");
+      assert.deepEqual(linesOf(b), []);
     } finally { await done(b); }
   });
 
