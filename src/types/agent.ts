@@ -198,9 +198,13 @@ export interface AgentConfig {
    * and the current system text, and leaves the agent's own change rows out
    * of its request, since its head already holds what they declare. Under
    * `'entries'` it carries a host's change rows as the agent's requests do;
-   * on its head it carries none. Its compile binds thinking under the current
-   * head, so on an `'entries'` agent whose recorded head differs, the next
-   * request the agent makes sets aside the thinking before it.
+   * on its head it carries none. With `thinkingBinding.binds: true`, its
+   * compile binds thinking under the current head, so on an `'entries'`
+   * agent whose recorded head differs, the next request the agent makes sets
+   * aside the thinking before it. With `binds` left out, the direct request
+   * carries the agent's thinking under the current head: with `dropBlock`
+   * the provider drops it, and without it an account that enforces the
+   * binding refuses the request, and one that doesn't decides for itself.
    *
    * Turning it on is a choice from those records, not a runtime toggle, so
    * it isn't one of the agent's runtime settings.
@@ -379,9 +383,10 @@ export interface AgentConfig {
      * or for dropping messages no summary covers, with changes kept, it
      * consolidates anyway. With `true`, the compile for the new head leaves
      * that thinking out. Left out, the request still carries it, under a
-     * prefix it wasn't signed under: a provider that drops such thinking
-     * itself sets it aside, and one that refuses it refuses each request that
-     * carries it. The host's model records carry `binds`, beside "takes
+     * prefix it wasn't signed under. With `dropBlock`, the provider drops it
+     * from each request that carries it. Without it, an account that enforces
+     * the binding refuses each such request, and one that doesn't decides for
+     * itself. The host's model records carry `binds`, beside "takes
      * entries".
      */
     binds?: boolean;
