@@ -223,6 +223,7 @@ it('strips signed thinking minted under the legacy notice prefix before sending 
   assert.ok(!request.messages.some(m => m.content.some(b => b.type === 'thinking')));
   assert.ok(!JSON.stringify(request.messages).includes(notice));
   assert.equal(strips.length, 1);
+  assert.ok(seen.length > 0, 'the sent-context observer saw the compile');
   assert.ok(!JSON.stringify(seen).includes(notice), 'sent-context observer sees the same filtered compile');
   assert.ok(legacy.getAllMessages().some(m => m.content.some(b => b.type === 'thinking')), 'stored signed blocks remain untouched');
 });
@@ -511,6 +512,7 @@ it('migration: reopening legacy summaries preserves setup and stored history', a
   const compiled = await agent.compileContext();
   const contents = compiled.messages.flatMap(m => m.content).filter(b => b.type === 'text').map(b => b.text);
   assert.ok(contents.includes(summaries[0]!.content), 'the old summary is still selected');
+  assert.ok(contents.includes('newer raw message'), 'the newer message is selected');
   const summaryPrecedesNewer = contents.indexOf(summaries[0]!.content) < contents.indexOf('newer raw message');
   const overviewCount = agent.getContextManager().getSummariesInRange({}).length;
   await t.test('canary: the installed context-manager still has the hidden-endpoint defect', () => {
