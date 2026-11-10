@@ -285,7 +285,7 @@ describe('toolDeclarations in the framework', () => {
     const wide = { ...tool('b'), description: 'b does a thing. '.repeat(2000) };
     const hasThinking = (messages: readonly NormalizedMessage[]) => messages.some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
     for (const [binding, clause] of [
-      [undefined, /: one whole write, and the thinking the request held set aside if its model binds it$/],
+      [undefined, /: one whole write, and the thinking the request held set aside if its model binds it and its provider drops such thinking itself; a provider that refuses such thinking refuses each request that carries it; thinkingBinding\.binds: true has the framework set it aside$/],
       [{ binds: true, dropBlock: true }, /: one whole write, and the thinking the request held set aside$/],
     ] as const) {
       await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
@@ -317,7 +317,7 @@ describe('toolDeclarations in the framework', () => {
   });
 
   it("raises an operator line for a move forced past a fifth, naming no thinking for a model whose `binds` is false, and one for a move forced by the budget", async () => {
-    for (const [binding, clause] of [[{ binds: false }, /: one whole write$/], [undefined, /set aside if its model binds it$/]] as const) {
+    for (const [binding, clause] of [[{ binds: false }, /: one whole write$/], [undefined, /set aside if its model binds it and its provider drops such thinking itself; a provider that refuses such thinking refuses each request that carries it; thinkingBinding\.binds: true has the framework set it aside$/]] as const) {
       await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });

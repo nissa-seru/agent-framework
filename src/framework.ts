@@ -18918,7 +18918,7 @@ export class AgentFramework {
 
   private thinkingSetAside(agent: Agent, said: string): string {
     if (!agent.mayBindThinking) return '';
-    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it`;
+    return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} if its model binds it and its provider drops such thinking itself; a provider that refuses such thinking refuses each request that carries it; thinkingBinding.binds: true has the framework set it aside`;
   }
 
   private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean, stream?: YieldingStream): boolean {

@@ -373,11 +373,16 @@ export interface AgentConfig {
      * `toolDeclarations: 'entries'`: a model that may bind consolidates for
      * free only where no thinking sits before the compile's `firstChanged`
      * (the first message that compile renders differently from the last
-     * one; thinking from there on is set aside by the compile's own change).
+     * one; the compile's own change already moved the prefix of everything
+     * from there on, so a move adds no loss of its own there).
      * Past a fifth of the request, or when a compile is refused over budget,
      * or for dropping messages no summary covers, with changes kept, it
-     * consolidates anyway, setting that thinking
-     * aside. The host's model records carry `binds`, beside "takes entries".
+     * consolidates anyway. With `true`, the compile for the new head leaves
+     * that thinking out. Left out, the request still carries it, under a
+     * prefix it wasn't signed under: a provider that drops such thinking
+     * itself sets it aside, and one that refuses it refuses each request that
+     * carries it. The host's model records carry `binds`, beside "takes
+     * entries".
      */
     binds?: boolean;
   };
