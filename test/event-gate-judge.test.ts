@@ -57,7 +57,7 @@ function scriptedJudge() {
   };
 }
 
-function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[]; isAnswered?: (after: WritePlacement) => boolean } = {}) {
+function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: number; judgeOnError?: 'wake' | 'skip'; now?: () => number; residents?: string[]; recipients?: string[]; isAnswered?: (after: WritePlacement) => boolean } = {}) {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
   const wakes: Array<{ agentName: string; reason: string; writes?: WakeWrite[]; lineRows?: unknown }> = [];
@@ -66,7 +66,7 @@ function makeGate(configPath: string, opts: { judge?: JudgeFn; judgeTimeoutMs?: 
     emitTrace: (e) => traces.push(e as { type: string }),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
     requestInference: (a, r, _s, p) => wakes.push({ agentName: a, reason: r, ...(p?.writes ? { writes: p.writes } : {}), ...(p && BATCH_LINE_ROWS in p ? { lineRows: (p as Record<symbol, unknown>)[BATCH_LINE_ROWS] } : {}) }),
-    getAgentNames: () => ['agent'],
+    getAgentNames: () => opts.recipients ?? ['agent'],
     ...(opts.judge ? { judge: opts.judge } : {}),
     ...(opts.judgeTimeoutMs !== undefined ? { judgeTimeoutMs: opts.judgeTimeoutMs } : {}),
     ...(opts.judgeOnError ? { judgeOnError: opts.judgeOnError } : {}),
@@ -963,13 +963,14 @@ describe('judge rules: what waiting leaves the agent with', () => {
     it(`tells the judge of a pending debounced batch: ${what}`, () => {
       const { gate } = makeGate(writeConfig('upcoming-written.json', {
         policies: [{ name: 'files', match: { scope: ['workspace:modified'] }, behavior: { debounce: 60000 } }],
-      }));
+      }), { recipients: [...woken] });
       writes.forEach((after: WritePlacement | undefined, i) => {
         gate.evaluate({ content: `notes-${i}.md`, eventType: 'workspace:modified', serverId: '', channelId: '' }, after);
       });
       const n = writes.length;
-      assert.deepStrictEqual(gate.upcomingWakes([...woken]).map((w) => [w.what, w.certain]),
-        [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]]);
+      const last = woken[woken.length - 1]!;
+      assert.deepStrictEqual(gate.upcomingWakes([...woken]).filter((w) => (w as { agents?: string[] }).agents?.includes(last)).map((w) => [w.what, w.certain]),
+        [[`rule "files"'s debounced batch of ${n} ${n === 1 ? 'event' : 'events'}`, certain]], `the wake for ${last}`);
       gate.dispose();
     });
   }
@@ -1001,7 +1002,8 @@ describe('judge rules: what waiting leaves the agent with', () => {
     gate.evaluate({ content: 'a.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['agent'] }, { agent: 'agent', messageId: 'row-1' });
     gate.evaluate({ content: 'b.md', eventType: 'workspace:modified', serverId: '', channelId: '', recipients: ['other'] });
     assert.deepStrictEqual(gate.upcomingWakes(['agent']).map((w) => w.certain), [false]);
-    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => w.certain), [true]);
+    assert.deepStrictEqual(gate.upcomingWakes(['agent', 'other']).map((w) => [(w as { agents?: string[] }).agents, w.certain]), [[['other'], true], [['agent'], false]],
+      'a wake per agent where certainty differs');
     gate.dispose();
   });
 
