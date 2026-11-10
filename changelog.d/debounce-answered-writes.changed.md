@@ -29,8 +29,7 @@
   a stored context injection, a row the agent's view leaves out, the batch's
   own line quoting its other events and an unobserved co-resident's own round
   don't count; an observed co-resident's round owed to the agent does, and so
-  does the agent's own row, such as its reply in another channel. Past the
-  window's 32 newest rows that don't count, the line is written. Each agent
+  does the agent's own row, such as its reply in another channel. Each agent
   the batch wakes decides its own line by its own window, once per wake, and
   none is written while the host is quiesced. A window still in legacy mode
   reads its slot's shared record, where only the delivery agent's start

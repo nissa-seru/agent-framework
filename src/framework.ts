@@ -4820,8 +4820,6 @@ export class AgentFramework {
    *  where the liveness watchdog starts, or would if it isn't enabled, and
    *  leaves in stop() where the watchdog stops. */
   private static readonly diagnosed = new Set<AgentFramework>();
-  /** How many of a window's newest rows batchIsNewest reads. */
-  private static readonly NEWEST_SCAN_ROWS = 32;
   private static diagnosticsListenerInstalled = false;
 
   // MCPL subsystems (null when no mcplServers configured)
@@ -35178,22 +35176,23 @@ export class AgentFramework {
   /** Whether the newest row of `agent`'s window a reply could be meant for
    *  is one of `rows`, as the start's request will hold it: clock rows,
    *  stored context injections and the batch's own gate line, which the
-   *  start's line can't name, aside. Past NEWEST_SCAN_ROWS rows, it answers
-   *  no. A presented window is the request's own: the start has presented
-   *  what arrived (an observed co-resident's round among it), and what
-   *  arrives from here waits for the next request. A window still in legacy
-   *  mode (its write-down failed) is the slot's record, read from its newest
-   *  row, through the agent's view (agentSees). */
+   *  start's line can't name, aside. A presented window is the request's
+   *  own: the start has presented what arrived (an observed co-resident's
+   *  round among it), and what arrives from here waits for the next
+   *  request. A window still in legacy mode (its write-down failed) is the
+   *  slot's record, read from its newest row, through the agent's view
+   *  (agentSees). */
   private batchIsNewest(agent: Agent, rows: readonly string[]): boolean {
     const cm = agent.getContextManager();
     const presented = cm.windowMode() === 'presented';
-    const tail = presented
-      ? cm.getPresentedMessages().slice(-AgentFramework.NEWEST_SCAN_ROWS).reverse()
-      : cm.queryMessages({ limit: AgentFramework.NEWEST_SCAN_ROWS, reverse: true }).messages;
-    const newest = tail.find((m) => (m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND
-      && !storedInjectionMarkOf(m.metadata) && (presented || this.agentSees(agent, m.metadata))
-      && !(isGateLine(m) && rows.includes(m.id)));
-    return newest !== undefined && rows.includes(newest.id);
+    const listing = presented ? cm.getPresentedMessages() : cm.getAllMessages();
+    for (let i = listing.length - 1; i >= 0; i--) {
+      const m = listing[i]!;
+      if ((m.metadata as { kind?: unknown } | undefined)?.kind !== CLOCK_ROW_KIND
+        && !storedInjectionMarkOf(m.metadata) && (presented || this.agentSees(agent, m.metadata))
+        && !(isGateLine(m) && rows.includes(m.id))) return rows.includes(m.id);
+    }
+    return false;
   }
 
   /** Whether the start's request holds row `id`: in a presented window, or
