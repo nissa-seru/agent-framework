@@ -35997,7 +35997,7 @@ export class AgentFramework {
         agentName,
         `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${drainState}; ` +
-        `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
+        `if this persists, raise contextBudgetTokens.`,
         { skipLog: true },
       );
     }

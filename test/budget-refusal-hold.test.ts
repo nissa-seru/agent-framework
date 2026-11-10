@@ -388,6 +388,21 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
+  it("names contextBudgetTokens as the only setting to raise in the failure's own alert", async () => {
+    await withCompression({ fitAt: Infinity, readyAt: 0 }, async () => {
+      const t = await resident();
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.alerts('context-refusal').length === 1));
+        const message = String(t.alerts('context-refusal')[0]?.message);
+        assert.match(message, /; if this persists, raise contextBudgetTokens\.$/, message);
+        assert.doesNotMatch(message, /overBudgetGraceRatio/, message);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('leaves an ephemeral run refused while compression is pending to its error policy, as before', async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: Infinity }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
