@@ -104,6 +104,15 @@ describe('unstick-fix-11-16: the notes that agent-framework 0.33.1 and earlier w
       assert.equal(rewritten(failed(note(cause))), '[inference-failed] Your previous turn did not complete: the model call ' +
         `failed and produced no response, so nothing was sent. ${FAILURE_ADVICE}`);
     }
+    assert.equal(rewritten(failed(note('custom (safety), HTTP 400'))), '[inference-failed] Your previous turn did not complete: ' +
+      `the model call failed (custom (safety), HTTP 400) and produced no response, so nothing was sent. ${FAILURE_ADVICE}`,
+    'a cause that only holds "(safety)" keeps it');
+  });
+
+  it('U23: a cause that holds " Reason: " is kept, and the cut is at the reason that follows the sentence\'s end', () => {
+    const head = '[inference-failed] Your previous turn did not complete: it failed (bad Reason: setting, HTTP 400). Its earlier ' +
+      'rounds ran, and their tool calls ran as their results show.';
+    assert.equal(rewritten(failed(`${head} Reason: ${PROVIDER}. ${FAILURE_ADVICE}`)), `${head} ${FAILURE_ADVICE}`);
   });
 
   it('U8: a failed-turn note for a turn that ended partway, 0.28.0 to 0.33.1, keeps what ran and loses the reason and safety', () => {
@@ -153,6 +162,9 @@ describe('unstick-fix-11-16: what it leaves', () => {
     assert.equal(rewritten(failed('[inference-failed] Your previous turn did not complete: it failed (invalid_request, ' +
       'HTTP 400). Its earlier rounds ran, and their tool calls ran as their results show.',
     { ...FAILED_STAMPS, errorType: 'invalid_request', httpStatus: 400 })), null);
+    assert.equal(rewritten(failed('[inference-failed] Your previous turn did not complete: it failed (bad Reason: setting, HTTP ' +
+      '400). Its earlier rounds ran, and their tool calls ran as their results show.',
+    { ...FAILED_STAMPS, errorType: 'bad Reason: setting', httpStatus: 400 })), null, 'a cause that holds " Reason: " is no reason');
   });
 
   describe('a failed-turn note whose reason agent-framework 0.33.3 writes itself, whichever release wrote it', () => {
@@ -173,6 +185,9 @@ describe('unstick-fix-11-16: what it leaves', () => {
       const later = '[inference-failed] Your previous turn did not complete: its last call timed out. Its earlier rounds ' +
         `ran, and their tool calls ran as their results show. Reason: ${flat}. ${TIMEOUT_ADVICE}`;
       assert.equal(rewritten(note(later, { reason: flat, errorType: 'timeout', retryable: false })), null);
+      const other = 'Request timed out';
+      assert.equal(rewritten(note(later.replace(flat, other), { reason: other, errorType: 'timeout', retryable: false })), null,
+        'a cut of another wording, known by its fields: a timeout that is not retryable');
     });
 
     it('U16: a compile that context-manager refused, in 0.33.3\'s form and as 0.33.1 wrote it', () => {
@@ -205,6 +220,10 @@ describe('unstick-fix-11-16: what it leaves', () => {
       const noReason = `${FAILED} (over_budget) and produced no response, so nothing was sent. Reason: ${PROVIDER}. ${FAILURE_ADVICE}`;
       assert.equal(rewritten(note(noReason, { errorType: 'unknown' })),
         `${FAILED} (over_budget) and produced no response, so nothing was sent. ${FAILURE_ADVICE}`);
+      const retried = '[inference-failed] Your previous turn did not complete: the model call timed out and produced no response, ' +
+        `so nothing was sent. Reason: Request timed out. ${TIMEOUT_ADVICE}`;
+      assert.equal(rewritten(note(retried, { reason: 'Request timed out', errorType: 'timeout', retryable: true })),
+        `[inference-failed] Your previous turn did not complete: the model call timed out and produced no response, so nothing was sent. ${TIMEOUT_ADVICE}`);
       const bare = `[inference-failed] Your previous turn did not complete: it failed. Reason: ${BOUND}. ${FAILURE_ADVICE}`;
       assert.equal(rewritten(note(bare, {})), `[inference-failed] Your previous turn did not complete: it failed. ${FAILURE_ADVICE}`);
     });
@@ -217,7 +236,17 @@ describe('unstick-fix-11-16: what it leaves', () => {
     assert.equal(rewritten(body(OLD_FAILED, { kind: 'inference-failed', reason: PROVIDER })), null);
     assert.equal(rewritten(body(OLD_REWIND, { kind: 'refusal-rewind', category: 'zq-cat' })), null);
     assert.equal(rewritten(body(OLD_FAILED, { system: true, kind: 'other' })), null);
+    assert.equal(rewritten(body(OLD_FAILED, { system: true })), null);
     assert.equal(rewritten(body(OLD_FAILED, { system: 'true', kind: 'inference-failed' })), null);
+  });
+
+  it('U24: a body with both stamps whose text doesn\'t open as the old note does is left', () => {
+    assert.equal(rewritten(body('My report is complete.', REWIND_STAMPS)), null);
+    assert.equal(rewritten(body('[refusal-rewind] Rewound (content filter: [refusal-rewind] The 42 most recent turn(s) were set aside ' +
+      'because zq).', REWIND_STAMPS)), null, 'an old opening quoted inside other text is no opening');
+    assert.equal(rewritten(body(`[turns-set-aside] The 2 most recent turn(s) were set aside because the model refused on them. ${CLEAR}`, REWIND_STAMPS)), null);
+    assert.equal(rewritten(body(`My report. Reason: ${PROVIDER}. ${FAILURE_ADVICE}`, FAILED_STAMPS)), null);
+    assert.equal(rewritten(body(`I quote it: ${OLD_FAILED}`, FAILED_STAMPS)), null);
   });
 
   it('U20: a stamped body that holds a block other than one text is left, since the framework wrote no such note', () => {
@@ -242,12 +271,12 @@ class Surface implements Module {
   }
 }
 
-class ToolRoundThenError implements YieldingStream {
+class ToolRoundThen implements YieldingStream {
   isCancelled = false;
   toolDepth = 0;
   private waiting = true;
   private resume?: () => void;
-  constructor(private readonly error: Error) {}
+  constructor(private readonly last: StreamEvent) {}
   get isWaitingForTools() { return this.waiting; }
   get pendingToolCallIds() { return this.waiting ? ['zq-call'] : []; }
   provideToolResults(): void { this.waiting = false; this.toolDepth = 1; this.resume?.(); }
@@ -258,11 +287,18 @@ class ToolRoundThenError implements YieldingStream {
       roundContent: [{ type: 'tool_use', ...call }], supportsInjectedMessages: true } } as StreamEvent;
     if (this.waiting) await new Promise<void>((resolve) => { this.resume = resolve; });
     if (this.isCancelled) return;
-    yield { type: 'error', error: this.error } as StreamEvent;
+    yield this.last;
   }
 }
 
-type Step = 'ok' | 'refuse' | 'fail';
+const CUT = 'No content within 0.3s of the send';
+const LAST_EVENTS = {
+  fail: { type: 'error', error: new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, rawError: undefined, message: PROVIDER }) },
+  cut: { type: 'aborted', reason: 'timeout', message: CUT },
+  abort: { type: 'aborted', reason: 'error' },
+} as unknown as Record<'fail' | 'cut' | 'abort', StreamEvent>;
+
+type Step = 'ok' | 'refuse' | keyof typeof LAST_EVENTS;
 
 class ScriptedMembrane extends MockMembrane {
   readonly script: Step[] = [];
@@ -270,9 +306,7 @@ class ScriptedMembrane extends MockMembrane {
   override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
     this.requests.push(structuredClone(request));
     const step = this.script.shift() ?? 'ok';
-    if (step === 'fail') {
-      return new ToolRoundThenError(new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, rawError: undefined, message: PROVIDER }));
-    }
+    if (step !== 'ok' && step !== 'refuse') return new ToolRoundThen(LAST_EVENTS[step]);
     const response: NormalizedResponse = step === 'refuse'
       ? { ...createMockResponse([], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'zq-cat' } } } } as unknown as NormalizedResponse
       : createMockResponse([text('answers')]);
@@ -289,6 +323,7 @@ async function residentWithNotes() {
     agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout', refusalHandling: { autoRewind: true, maxRewinds: 3 } }],
     modules: [new Surface()],
     errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+    exhaustedTurnRearmMs: false,
     syncIntervalMs: 0, maintenanceIntervalMs: 0,
   } as never);
   const quiet = console.error;
@@ -306,6 +341,10 @@ async function residentWithNotes() {
     await say('second question', ['refuse', 'ok'], 3);
     await say('third question', ['fail'], 4);
     await say('fourth question', ['ok'], 5);
+    await say('a question its stream cuts', ['cut'], 6);
+    await say('a question between failures', ['ok'], 7);
+    await say('a question its stream aborts', ['abort'], 8);
+    await say('a question after the failures', ['ok'], 9);
     const cm = framework.getAgent('scout')!.getContextManager();
     const rows = () => cm.getAllMessages();
     const kindOf = (row: StoredMessage) => row.metadata?.kind;
@@ -353,10 +392,13 @@ describe('unstick-fix-11-16 through the framework', () => {
     const r = await residentWithNotes();
     try {
       const kinds = r.native.map((row) => row.metadata?.kind).sort();
-      assert.deepEqual(kinds, ['inference-failed', 'refusal-rewind'], 'premise: this framework wrote one note of each kind');
+      assert.deepEqual(kinds, ['inference-failed', 'inference-failed', 'inference-failed', 'refusal-rewind'], 'premise: this framework wrote a rewind note and three failed-turn notes');
       const nativeBefore = r.native.map((row) => r.textAt(row.id));
-      assert.ok(nativeBefore.some((t) => t.startsWith('[turns-set-aside] The 1 most recent turn(s)')), nativeBefore.join('\n'));
-      assert.ok(nativeBefore.some((t) => t.startsWith('[inference-failed] Your previous turn did not complete: it failed (invalid_request, HTTP 400).')), nativeBefore.join('\n'));
+      const said = nativeBefore.join('\n');
+      assert.ok(nativeBefore.some((t) => t.startsWith('[turns-set-aside] The 1 most recent turn(s)')), said);
+      assert.ok(nativeBefore.some((t) => t.startsWith('[inference-failed] Your previous turn did not complete: it failed (invalid_request, HTTP 400).') && !t.includes('Reason:')), said);
+      assert.ok(nativeBefore.some((t) => t.includes(`. Reason: ${CUT}`)), `premise: a cut's note gives its reason: ${said}`);
+      assert.ok(nativeBefore.some((t) => t.includes('. Reason: Stream aborted: error')), `premise: an abort's note gives its reason: ${said}`);
       const person = r.rows().find((row) => r.textAt(row.id).startsWith('first question.'));
       assert.ok(person, 'premise: the person\'s message is stored');
       const personBefore = r.textAt(person.id);

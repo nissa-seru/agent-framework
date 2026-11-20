@@ -7,18 +7,21 @@ const REWIND_REST = `were set aside ${SET_ASIDE}. Their content isn't shown here
 const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
   '(e.g. drop an oversized attachment or an unsupported setting).';
 const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
-const REWIND_OPENING = /^\[[^\]]+\] (?:The (\d+) most recent turn\(s\)|Some recent turns) were set aside /;
-const REASON = ' Reason: ';
-const SAFETY_CAUSE = / \(safety(?:, HTTP \d+)?\)/;
+const REWIND_OPENING = /^\[[^\]]+\] (?:The \d+ most recent turn\(s\)|Some recent turns) were set aside /;
+const OLD_REWIND_OPENING = /^\[refusal-rewind\] (?:The (\d+) most recent turn\(s\)|Turns|Some recent turns) were set aside because /;
+const FAILED_OPENING = '[inference-failed] Your previous turn did not complete: ';
+const REASON = '. Reason: ';
+const SAFETY_CAUSE = /(failed|timed out) \(safety(?:, HTTP \d+)?\)/;
 const COMPILE_REFUSALS = new Set(['over_budget', 'context_refusal']);
 const BOUND_CUT = /^(?:No content within |No provider event within |No provider progress within |The provider made no progress within the call's bound)/;
 
 function reasonOfItsOwn(metadata: MessageMetadata): boolean {
-  const { reason, errorType } = metadata;
+  const { reason, errorType, retryable } = metadata;
   if (typeof reason !== 'string') return false;
   if (typeof errorType === 'string' && COMPILE_REFUSALS.has(errorType)) return true;
   if (errorType === undefined) return reason.startsWith('Stream aborted: ');
-  return errorType === 'timeout' && BOUND_CUT.test(reason);
+  if (errorType !== 'timeout') return false;
+  return BOUND_CUT.test(reason) || retryable === false;
 }
 
 function noteText(body: SweepBody): string | null {
@@ -28,16 +31,19 @@ function noteText(body: SweepBody): string | null {
 
 function mendedText(metadata: MessageMetadata, text: string): string | null {
   if (metadata.kind === 'refusal-rewind') {
-    const opening = REWIND_OPENING.exec(text);
-    if (opening !== null && text.startsWith(SET_ASIDE, opening[0].length)) return null;
-    const told = opening?.[1];
+    const current = REWIND_OPENING.exec(text);
+    if (current !== null && text.startsWith(SET_ASIDE, current[0].length)) return null;
+    const old = OLD_REWIND_OPENING.exec(text);
+    if (old === null) return null;
+    const told = old[1];
     const count = told === undefined ? 'Some recent turns' : `The ${told} most recent turn(s)`;
     return `[refusal-rewind] ${count} ${REWIND_REST}`;
   }
   if (metadata.kind === 'inference-failed') {
+    if (!text.startsWith(FAILED_OPENING)) return null;
     const at = text.indexOf(REASON);
     if (at < 0 || reasonOfItsOwn(metadata)) return null;
-    const head = text.slice(0, at).replace(SAFETY_CAUSE, '');
+    const head = text.slice(0, at + 1).replace(SAFETY_CAUSE, '$1');
     const advice = [FAILURE_ADVICE, TIMEOUT_ADVICE].find((each) => text.endsWith(each));
     return advice === undefined ? head : `${head} ${advice}`;
   }
