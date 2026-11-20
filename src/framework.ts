@@ -18286,10 +18286,11 @@ export class AgentFramework {
    * records that its compression would fold again, and the estimated
    * tokens of the rows that render raw until it has. Writes nothing.
    * Refused (OperatorActionError 'unknown-agent') for an agent that isn't
-   * live.
+   * live, and ('invalid') for a name that is no entry of this framework's
+   * and that the store never took.
    */
   oldSummaryCost(name: string, agentName: string): OldSummaryCost {
-    return this.liveContextOf(agentName).oldSummaryCost(name);
+    return this.secondActContextOf(name, agentName).oldSummaryCost(name);
   }
 
   /**
@@ -18301,7 +18302,9 @@ export class AgentFramework {
    * the agent's budget, its turn waits for the room. Made under the
    * store's reservation, as a suppression is: refused
    * (OperatorActionError 'agent-busy') while any agent's turn is alive, and
-   * no turn starts until it is done. Written to the operator log as a
+   * no turn starts until it is done. Refused ('invalid'), and nothing
+   * written to the store, for a name that is no entry of this framework's
+   * and that the store never took. Written to the operator log as a
    * `sweep-summaries`.
    */
   async dropOldSummaries(name: string, agentName: string, opts?: { requester?: OperatorRequester; note?: string }): Promise<OldSummaryCost> {
@@ -18314,6 +18317,7 @@ export class AgentFramework {
       params: { sweep: name },
     };
     try {
+      this.secondActContextOf(name, agentName);
       const release = this.reserveStoreForSurgery('drop old summaries', agentName);
       try {
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
@@ -18332,8 +18336,20 @@ export class AgentFramework {
   private sweepEntryOf(name: string): SweepEntry {
     const entry = this.sweepEntries.get(name);
     if (entry) return entry;
+    throw new OperatorActionError('invalid', this.noSweepNamed(name));
+  }
+
+  private noSweepNamed(name: string): string {
     const known = [...this.sweepEntries.keys()];
-    throw new OperatorActionError('invalid', `No sweep is named "${name}": ${known.length > 0 ? `this framework's sweeps are ${known.join(', ')}` : 'this framework has none'}`);
+    return `No sweep is named "${name}": ${known.length > 0 ? `this framework's sweeps are ${known.join(', ')}` : 'this framework has none'}`;
+  }
+
+  private secondActContextOf(name: string, agentName: string): ContextManager {
+    const cm = this.liveContextOf(agentName);
+    if (!this.sweepEntries.has(name) && cm.sweepReceipt(name).take === null) {
+      throw new OperatorActionError('invalid', `${this.noSweepNamed(name)}, and the store took none of that name`);
+    }
+    return cm;
   }
 
   private liveContextOf(agentName: string): ContextManager {

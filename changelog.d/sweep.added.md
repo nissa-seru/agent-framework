@@ -10,8 +10,10 @@
   it. `sweepReceipt(name)` says where it stands. `oldSummaryCost(name,
   agent)` and `dropOldSummaries(name, agent)` are the second act: one agent's
   strategy drops its old summaries over the rewritten rows, under the same
-  reservation. The framework also applies an owed sweep at its start, after
-  each branch move, and as an agent whose context already held rows is
+  reservation. Both take a sweep that the store took after its entry left
+  the code, and refuse a name that is neither an entry nor ever taken. The
+  framework also applies an owed sweep at its start, after each branch
+  move, and as an agent whose context already held rows is
   taken on for a run. The removed shards of a long note leave every window
   (`presentation:retracted`, reason `sweep`). The history module's semantic
   index sends a rewritten body again, and deletes a removed shard where the

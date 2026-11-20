@@ -868,6 +868,24 @@ describe('sweeps through the framework', () => {
     assert.throws(() => framework.oldSummaryCost(NAME, 'nobody'), (e: unknown) => e instanceof OperatorActionError && e.code === 'unknown-agent');
     assert.deepEqual(framework.listSweeps(), [{ name: NAME, line: rewords().line }]);
   });
+
+  it('T24: the second act refuses a name that is no entry and that the store never took, and writes nothing; it takes one that the store took after its entry left the code', async () => {
+    let framework = await boot();
+    const store = () => cmOf(framework, 'mira').getStore();
+    const before = sweepsApplied(store()).length;
+    const unknown = (e: unknown) => e instanceof OperatorActionError && e.code === 'invalid';
+    assert.throws(() => framework.oldSummaryCost('nothing', 'mira'), unknown);
+    await assert.rejects(framework.dropOldSummaries('nothing', 'mira'), unknown);
+    assert.equal(sweepsApplied(store()).length, before, 'the refused act wrote nothing to the applied list');
+
+    note(cmOf(framework, 'mira'), `a note with ${OLD}`);
+    presentAll(framework, 'mira');
+    assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
+    framework = await restart(framework, { sweeps: [] });
+    assert.deepEqual(framework.listSweeps(), [], 'premise: the entry left the code');
+    assert.deepEqual(framework.oldSummaryCost(NAME, 'mira').summaries.map((level) => level.count).filter((count) => count > 0), []);
+    await framework.dropOldSummaries(NAME, 'mira');
+  });
 });
 
 interface Item { id: string; text: string; kind: string; cursor?: number }
