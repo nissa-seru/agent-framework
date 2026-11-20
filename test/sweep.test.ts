@@ -11,6 +11,7 @@ import { AgentFramework, AutobiographicalStrategy, OperatorActionError, Passthro
 import type { FrameworkConfig, Module, OperatorLogEntry, TraceEvent } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
 import { SemanticIndexClient, SemanticIndexer, type SyncCursors } from '../src/modules/history/semantic.js';
+import { UNSTICK_FIX_11_16 } from '../src/sweep-unstick-fix-11-16.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 
@@ -866,7 +867,10 @@ describe('sweeps through the framework', () => {
     assert.throws(() => framework.showSweep('nothing'), (e: unknown) => e instanceof OperatorActionError && e.code === 'invalid');
     await assert.rejects(framework.takeSweep('nothing'), (e: unknown) => e instanceof OperatorActionError && e.code === 'invalid');
     assert.throws(() => framework.oldSummaryCost(NAME, 'nobody'), (e: unknown) => e instanceof OperatorActionError && e.code === 'unknown-agent');
-    assert.deepEqual(framework.listSweeps(), [{ name: NAME, line: rewords().line }]);
+    assert.deepEqual(framework.listSweeps(), [
+      { name: UNSTICK_FIX_11_16.name, line: UNSTICK_FIX_11_16.line },
+      { name: NAME, line: rewords().line },
+    ], 'the framework\'s own entries, then the host\'s');
   });
 
   it('T24: the second act refuses a name that is no entry and that the store never took, and writes nothing; it takes one that the store took after its entry left the code', async () => {
@@ -882,7 +886,7 @@ describe('sweeps through the framework', () => {
     presentAll(framework, 'mira');
     assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
     framework = await restart(framework, { sweeps: [] });
-    assert.deepEqual(framework.listSweeps(), [], 'premise: the entry left the code');
+    assert.ok(!framework.listSweeps().some((entry) => entry.name === NAME), 'premise: the entry left the code');
     assert.deepEqual(framework.oldSummaryCost(NAME, 'mira').summaries.map((level) => level.count).filter((count) => count > 0), []);
     await framework.dropOldSummaries(NAME, 'mira');
   });

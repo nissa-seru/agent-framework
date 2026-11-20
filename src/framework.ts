@@ -18341,7 +18341,7 @@ export class AgentFramework {
 
   private noSweepNamed(name: string): string {
     const known = [...this.sweepEntries.keys()];
-    return `No sweep is named "${name}": ${known.length > 0 ? `this framework's sweeps are ${known.join(', ')}` : 'this framework has none'}`;
+    return `No sweep is named "${name}": this framework's sweeps are ${known.join(', ')}`;
   }
 
   private secondActContextOf(name: string, agentName: string): ContextManager {

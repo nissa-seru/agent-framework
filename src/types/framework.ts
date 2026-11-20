@@ -315,10 +315,12 @@ export interface FrameworkConfig {
 
   /**
    * The host's sweeps (context-manager's SweepEntry): each mends stored rows
-   * that a faulty writer of the host's wrote. An operator takes one with
+   * that a faulty writer of the host's wrote. The framework's own entries,
+   * for rows that it wrote, come with it. An operator takes one with
    * takeSweep, and the framework applies it to every live agent's slot, at
    * the take, at each start and after each branch move. Each name names one
-   * entry: two entries with one name refuse create().
+   * entry: two entries with one name, or a host's entry with the name of one
+   * of the framework's, refuse create().
    */
   sweeps?: SweepEntry[];
 

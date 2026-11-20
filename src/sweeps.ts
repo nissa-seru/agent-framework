@@ -7,6 +7,9 @@ import type {
   SweepPassReport,
   SweepTake,
 } from '@animalabs/context-manager';
+import { UNSTICK_FIX_11_16 } from './sweep-unstick-fix-11-16.js';
+
+const FRAMEWORK_SWEEPS: readonly SweepEntry[] = [UNSTICK_FIX_11_16];
 
 /** The old summaries of one agent's strategy, at each level (ContextManager.oldSummaryCost). */
 export interface AgentOldSummaries {
@@ -68,9 +71,12 @@ export type FrameworkSweepWrite =
   | { outcome: 'failed'; name: string; took: SweepTake | null; passes: AgentSweepPass[]; failed: SweepFailure[]; threw: SweepPassThrew[]; oldSummaries: AgentOldSummaries[] }
   | { outcome: 'held'; name: string; took: SweepTake | null; refusal: string };
 
-export function sweepEntriesByName(entries: readonly SweepEntry[]): ReadonlyMap<string, SweepEntry> {
-  const byName = new Map<string, SweepEntry>();
-  for (const entry of entries) {
+export function sweepEntriesByName(hostEntries: readonly SweepEntry[]): ReadonlyMap<string, SweepEntry> {
+  const byName = new Map<string, SweepEntry>(FRAMEWORK_SWEEPS.map((entry) => [entry.name, entry]));
+  for (const entry of hostEntries) {
+    if (FRAMEWORK_SWEEPS.some((own) => own.name === entry.name)) {
+      throw new Error(`The framework has a sweep entry named "${entry.name}": a host's entry takes another name`);
+    }
     if (byName.has(entry.name)) throw new Error(`Two sweep entries are named "${entry.name}": a sweep's name names one entry`);
     byName.set(entry.name, entry);
   }
