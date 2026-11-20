@@ -1,4 +1,5 @@
 import type { ThinkingBindingEntry } from '@animalabs/membrane';
+import type { SweepPassReport } from '@animalabs/context-manager';
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { UsageUpdatedEvent } from '../usage/types.js';
@@ -1572,7 +1573,7 @@ export type TraceEvent =
        * window only: the rows it removed leave this agent's window too, each
        * at its own place, so no other row's place moves (`hide`, `suppress` on its
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
-       * a start finished, `resume`, and a refusal rewind's shed from a
+       * a start finished, `resume`, a sweep's pass, `sweep`, and a refusal rewind's shed from a
        * window that is still the record, `rewind`), or that no live context
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
        * inference failure's shed on a presented window: the rows leave the
@@ -1587,6 +1588,26 @@ export type TraceEvent =
       agentName: string;
       messageIds: string[];
       reason: PresentationRetractReason;
+    })
+  | (TraceEventBase & {
+      /**
+       * A sweep's pass through one live agent's context (context-manager's
+       * applySweeps): at an operator's take (`take`), at the framework's
+       * start (`start`), after a branch move (`move`), or as an agent is
+       * taken on for a run (`run`). The report names bodies by id and never
+       * holds the old text.
+       */
+      type: 'sweep:pass';
+      point: SweepPoint;
+      agentName: string;
+      report: SweepPassReport;
+    })
+  | (TraceEventBase & {
+      /** A sweep's pass that threw: nothing after its throw was written, and what it owes stays owed for the next point. */
+      type: 'sweep:pass-failed';
+      point: SweepPoint;
+      agentName: string;
+      error: string;
     })
   | (TraceEventBase & {
       /** An undo or a redo on the presentation index, counted in bodies.
@@ -1629,7 +1650,10 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'sweep' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
+
+/** Where the framework asked for a sweep's pass. */
+export type SweepPoint = 'take' | 'start' | 'move' | 'run';
 
 /**
  * Listener for trace events.

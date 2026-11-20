@@ -46,6 +46,7 @@ function store(ties?: number, channel = 'c1', id = 'm1'): ContextManager {
   const page = (all: StoredMessage[], args: { limit?: number; offset?: number }) =>
     all.slice(args.offset ?? 0, (args.offset ?? 0) + (args.limit ?? all.length));
   return {
+    getStore: () => ({ getStateLen: () => null }),
     getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
     getMessageCount: () => messages.length,
     getMessageWindow: (start: number, n: number) => ({ messages: messages.slice(start, start + n) }),

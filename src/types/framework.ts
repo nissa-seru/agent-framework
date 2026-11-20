@@ -1,4 +1,5 @@
 import type { JsStore } from '@animalabs/chronicle';
+import type { SweepEntry } from '@animalabs/context-manager';
 import type { Membrane } from '@animalabs/membrane';
 import type { Module, EventResponse } from './module.js';
 import type { AgentConfig, InferenceRequest } from './agent.js';
@@ -311,6 +312,15 @@ export interface FrameworkConfig {
 
   /** Or existing store (app-owned) */
   store?: JsStore;
+
+  /**
+   * The host's sweeps (context-manager's SweepEntry): each mends stored rows
+   * that a faulty writer of the host's wrote. An operator takes one with
+   * takeSweep, and the framework applies it to every live agent's slot, at
+   * the take, at each start and after each branch move. Each name names one
+   * entry: two entries with one name refuse create().
+   */
+  sweeps?: SweepEntry[];
 
   /** Membrane instance for LLM calls */
   membrane: Membrane;

@@ -97,6 +97,7 @@ function msg(id: string, ms: number, content: ContentBlock[] | string, metadata?
 class StubCm {
   listeners = new Set<Listener>();
   constructor(public messages: StoredMessage[], public summaries: Array<Record<string, unknown>> = []) {}
+  getStore() { return { getStateLen: () => null }; }
   queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number; offset?: number }) {
     const all = this.messages
       .filter((m) => (o.fromMs === undefined || m.timestamp.getTime() >= o.fromMs) && (o.toMs === undefined || m.timestamp.getTime() <= o.toMs))

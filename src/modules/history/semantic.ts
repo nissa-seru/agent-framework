@@ -32,7 +32,7 @@
  * log and back off; `semantic_search` returns a clean tool error.
  */
 
-import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
+import { sweepsApplied, type ContextManager, type StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { safeSlice } from '../../safe-slice.js';
 import { speechOf } from '../../send-tools.js';
@@ -413,9 +413,11 @@ export interface PendingChanges { edited: string[]; removed: string[] }
 /**
  * A branch's sync cursors for one index: the creation time through which its
  * summaries are sent under their keys, and the time through which its
- * messages are sent. Null where nothing is sent yet.
+ * messages are sent. Null where nothing is sent yet. `sweeps`: how many items
+ * of the branch's applied list of sweeps (context-manager's sweepsApplied)
+ * a pass has read; none read where it is absent.
  */
-export interface SyncCursors { namespace: string; summaries: number | null; messages: number | null }
+export interface SyncCursors { namespace: string; summaries: number | null; messages: number | null; sweeps?: number }
 
 /**
  * Where the sync cursors are kept. HistoryModule keeps them in module state,
@@ -474,7 +476,9 @@ export class SemanticIndexer {
    * `restorePending` (HistoryModule keeps them in module state), so edits
    * made during an embed-service outage survive a restart. Events that land
    * while the module is detached are not replayed (removals are still hidden
-   * at search time by the current-branch check in HistoryModule).
+   * at search time by the current-branch check in HistoryModule). A sweep's
+   * rewrites and removals reach the index whether or not it was attached:
+   * each pass reads them from the branch's applied list.
    */
   private readonly editedIds = new Set<string>();
   private readonly removedIds = new Set<string>();
@@ -512,14 +516,16 @@ export class SemanticIndexer {
    * another namespace, as before the host's index setting changed, are none
    * here.
    */
-  private syncCursors(): { summaries: number | null; messages: number | null } {
+  private syncCursors(): { summaries: number | null; messages: number | null; sweeps: number } {
     const c = this.cursorStore ? this.cursorStore.read() : this.ownCursors.get(this.branchId()) ?? null;
-    return c && c.namespace === this.cfg.namespace ? c : { summaries: null, messages: null };
+    return c && c.namespace === this.cfg.namespace
+      ? { summaries: c.summaries, messages: c.messages, sweeps: c.sweeps ?? 0 }
+      : { summaries: null, messages: null, sweeps: 0 };
   }
 
   /** Writes the current branch's cursors, which must be `branch`'s. */
-  private setSyncCursors(c: { summaries: number | null; messages: number | null }, branch: string): void {
-    const cursors: SyncCursors = { namespace: this.cfg.namespace, summaries: c.summaries, messages: c.messages };
+  private setSyncCursors(c: { summaries: number | null; messages: number | null; sweeps: number }, branch: string): void {
+    const cursors: SyncCursors = { namespace: this.cfg.namespace, summaries: c.summaries, messages: c.messages, sweeps: c.sweeps };
     this.ownCursors.set(branch, cursors);
     this.cursorStore?.write(cursors);
   }
@@ -541,6 +547,24 @@ export class SemanticIndexer {
       }
       throw e;
     }
+  }
+
+  private queueSweptRows(from: number): number {
+    const { items, length } = sweepsApplied(this.cm.getStore(), from);
+    let queued = false;
+    for (const item of items) {
+      if (item.kind !== 'listed') continue;
+      for (const body of item.bodies) {
+        for (const shard of body.laterShards) {
+          this.editedIds.delete(shard);
+          if (!this.deleteUnsupported) this.removedIds.add(shard);
+        }
+        if (!this.removedIds.has(body.id)) this.editedIds.add(body.id);
+        queued = true;
+      }
+    }
+    if (queued) this.pendingChanged();
+    return length;
   }
 
   pendingSnapshot(): PendingChanges { return { edited: [...this.editedIds], removed: [...this.removedIds] }; }
@@ -635,9 +659,11 @@ export class SemanticIndexer {
       // that fails partway through sending everything again still finds them
       // over.
       if (noIndex && (kept.summaries !== null || kept.messages !== null)) {
-        kept = { summaries: null, messages: null };
+        kept = { ...kept, summaries: null, messages: null };
         this.setSyncCursors(kept, branch);
       }
+      const sweepsNext = this.queueSweptRows(kept.sweeps);
+      reading();
       // A branch's cursor is its own while the index holds what it sent, and
       // the index's when it doesn't. Every branch's items are in the one
       // index, so an index whose newest item of a kind is older than the
@@ -873,8 +899,8 @@ export class SemanticIndexer {
       // another branch's. A pass that moves neither cursor writes no state.
       const msgNext = msgThrough ?? msgWm;
       const left = strayed || this.branchId() !== branch;
-      if ((sumNext !== kept.summaries || msgNext !== kept.messages) && !left) {
-        this.setSyncCursors({ summaries: sumNext, messages: msgNext }, branch);
+      if ((sumNext !== kept.summaries || msgNext !== kept.messages || sweepsNext !== kept.sweeps) && !left) {
+        this.setSyncCursors({ summaries: sumNext, messages: msgNext, sweeps: sweepsNext }, branch);
       }
       if (notStats && report.more) throw notStats;
       // The current branch may then have items this pass didn't send, and

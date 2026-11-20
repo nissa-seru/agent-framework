@@ -64,6 +64,7 @@ function msg(id: string, ms: number, content: ContentBlock[], channelId?: string
 }
 function stubCm(messages: StoredMessage[], summaries: Array<Record<string, unknown>> = [], offBranch: Set<string> = new Set()): ContextManager {
   return {
+    getStore: () => ({ getStateLen: () => null }),
     // Branch-scoped like the real store: getMessage/getSummary answer null for
     // anything not on the current branch (see MessageStore.lookupIndex).
     getMessage(id: string) { return offBranch.has(id) ? null : (messages.find((m) => m.id === id) ?? null); },

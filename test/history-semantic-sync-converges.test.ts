@@ -78,6 +78,7 @@ function msg(id: string, ms: number, text: string): StoredMessage {
 /** Stub CM with the real queryByTime contract: inclusive bounds, oldest first, `limit` = first N. */
 function stubCm(messages: StoredMessage[]): ContextManager {
   return {
+    getStore: () => ({ getStateLen: () => null }),
     queryMessagesByTime(o: { fromMs?: number; toMs?: number; limit?: number }) {
       const all = messages
         .filter((m) => (o.fromMs === undefined || m.timestamp.getTime() >= o.fromMs) && (o.toMs === undefined || m.timestamp.getTime() <= o.toMs))

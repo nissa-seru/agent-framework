@@ -354,6 +354,7 @@ it('a pass whose budget runs out inside a millisecond stops there, and the next 
   const sums = [1, 2, 3].map((i) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T, endMs: T + 1, firstSequence: 0, lastSequence: 1, createdMs: T + 5 }));
   for (const s of sums) svc.items.set(`sum:${s.id}`, { id: `sum:${s.id}`, text: s.content, kind: 'summary', cursor: s.createdMs });
   const cm = {
+    getStore: () => ({ getStateLen: () => null }),
     getSummariesInRange: () => sums,
     getSummary: (id: string) => { const s = sums.find((x) => x.id === id); return s ? { ...s, created: s.createdMs } : null; },
     getMessage: () => null,
@@ -378,6 +379,7 @@ it('summaries sent again at the cursor\'s millisecond cost no budget, so a pass 
   const sum = (i: number, createdMs: number) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T, endMs: T + 1, firstSequence: 0, lastSequence: 1, createdMs });
   const sums = [sum(1, T + 5)];
   const cm = {
+    getStore: () => ({ getStateLen: () => null }),
     getSummariesInRange: () => sums,
     getSummary: (id: string) => { const s = sums.find((x) => x.id === id); return s ? { ...s, created: s.createdMs } : null; },
     getMessage: () => null,
@@ -419,6 +421,7 @@ it('a summary minted at the cursor\'s millisecond after the pass that wrote it i
   const sum = (i: number, createdMs: number) => ({ id: `s${i}`, level: 1, content: `summary ${i}`, tokens: 2, startMs: T, endMs: T + 1, firstSequence: 0, lastSequence: 1, createdMs });
   const sums = [sum(1, T + 5)];
   const cm = {
+    getStore: () => ({ getStateLen: () => null }),
     getSummariesInRange: () => sums,
     getSummary: (id: string) => { const s = sums.find((x) => x.id === id); return s ? { ...s, created: s.createdMs } : null; },
     getMessage: () => null,
@@ -904,6 +907,7 @@ function stubStore(messages: Array<{ id: string; ms: number }>, sums: Array<Reco
     id: m.id, sequence: i + 1, participant: 'user', content: [{ type: 'text', text: `message ${m.id}` }], timestamp: new Date(m.ms),
   })).sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
   return {
+    getStore: () => ({ getStateLen: () => null }),
     getSummariesInRange: () => sums,
     getSummary: (id: string) => { const s = sums.find((x) => x.id === id); return s ? { ...s, created: s.createdMs } : null; },
     getMessage: (id: string) => stored.find((m) => m.id === id) ?? null,
