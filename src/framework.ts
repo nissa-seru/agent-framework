@@ -4634,7 +4634,7 @@ export class AgentFramework {
     resume?: boolean;
     /** The incarnation it resumes: the new one is past it, though the registry's counter for an aged-out name is gone. */
     after?: number;
-    heldRows: boolean;
+    openedWithRows: boolean;
   }> = new WeakMap();
   private sweepEntries: ReadonlyMap<string, SweepEntry> = new Map();
   /**
@@ -12227,7 +12227,7 @@ export class AgentFramework {
       this.ephemeralCandidates.set(agent, {
         contextManager,
         config,
-        heldRows: contextManager.getMessageCount() > 0,
+        openedWithRows: contextManager.getMessageCount() > 0,
         spec: spec
           ? {
               ...spec,
@@ -12597,7 +12597,7 @@ export class AgentFramework {
 
     this.usedEphemeralAgentNames.set(name, 'run'); // a resumed job is an ephemeral run: no global fallback (takesGlobalFallback)
     this.ephemeralAgents.add(agent); // and its usage counts in the shared ephemeral entry (#558)
-    this.ephemeralCandidates.set(agent, { contextManager, config: fullConfig, resume: true, after: record.incarnation, spec, heldRows: contextManager.getMessageCount() > 0 });
+    this.ephemeralCandidates.set(agent, { contextManager, config: fullConfig, resume: true, after: record.incarnation, spec, openedWithRows: contextManager.getMessageCount() > 0 });
     this.managerReleases.set(agent, release);
     this.resumesPending.set(name, agent);
     const cleanup = () => {
@@ -14236,7 +14236,7 @@ export class AgentFramework {
     this.adoptPresentation(agent);
     this.configureForeignRounds(agent, candidate.config, registered.inherit?.from);
     this.applyForeignRounds(agent);
-    if (candidate.heldRows) this.applyOwedSweeps('run', [agent]);
+    if (candidate.openedWithRows) this.applyOwedSweeps('run', [agent]);
     // Kept while the run is live so the agent can itself be derived from.
     this.agentConfigs.set(agent.name, candidate.config);
     // A spawner that ended after creating it: it registered as that
@@ -21325,7 +21325,7 @@ export class AgentFramework {
       // request an unanswered call: the passthrough strategies have no
       // pairing pass, and an adaptive template's compile has been through its
       // own.
-      const heldRows = contextManager.getMessageCount() > 0;
+      const openedWithRows = contextManager.getMessageCount() > 0;
       const { messages: existing } = await contextManager.compile(undefined, undefined, { dryRun: true });
       if (existing.length === 0) {
         // The copy is the fork's own, and the template's annotation edits only
@@ -21375,7 +21375,7 @@ export class AgentFramework {
       this.adoptPresentation(agent);
       this.configureForeignRounds(agent, config, router.templateAgent);
       this.applyForeignRounds(agent);
-      if (heldRows) this.applyOwedSweeps('run', [agent]);
+      if (openedWithRows) this.applyOwedSweeps('run', [agent]);
       this.agentConfigs.set(name, config);
       return agent;
     } catch (error) {
