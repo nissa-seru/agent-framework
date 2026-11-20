@@ -467,16 +467,16 @@ describe('sweeps through the framework', () => {
     const { framework } = await foldedPair();
     assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
     const before = sequenceOf(framework);
-    const cost = framework.oldSummaryCost('mira', NAME);
+    const cost = framework.oldSummaryCost(NAME, 'mira');
     assert.equal(sequenceOf(framework), before, 'the cost report writes nothing');
     assert.ok(total(cost.summaries) > 0 && cost.records > 0 && cost.rawTokens > 0, 'premise: there is something to drop');
 
     busy(framework, 'oren', true);
-    await assert.rejects(framework.dropOldSummaries('mira', NAME), (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy');
+    await assert.rejects(framework.dropOldSummaries(NAME, 'mira'), (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy');
     busy(framework, 'oren', false);
-    assert.deepEqual(framework.oldSummaryCost('mira', NAME), cost, 'the refusal dropped nothing');
+    assert.deepEqual(framework.oldSummaryCost(NAME, 'mira'), cost, 'the refusal dropped nothing');
 
-    const dropped = await framework.dropOldSummaries('mira', NAME, { requester: { via: 'test', name: 'op' }, note: 'drop' });
+    const dropped = await framework.dropOldSummaries(NAME, 'mira', { requester: { via: 'test', name: 'op' }, note: 'drop' });
     assert.deepEqual(dropped, cost, 'it drops what the cost report named');
     assert.ok(!(await compiledText(cmOf(framework, 'mira'), true)).includes(OLD), 'mira\'s next compile holds none of the dropped summaries');
     assert.match(await compiledText(cmOf(framework, 'oren')), new RegExp(`\\[summary \\d+ ${OLD}`), 'oren keeps its own');
@@ -486,7 +486,7 @@ describe('sweeps through the framework', () => {
     assert.deepEqual(entry.requester, { via: 'test', name: 'op' });
     assert.deepEqual(entry.params, { sweep: NAME });
     assert.deepEqual(entry.result, { summaries: cost.summaries, records: cost.records, rawTokens: cost.rawTokens });
-    assert.equal(total((await framework.dropOldSummaries('mira', NAME)).summaries), 0, 'a second act drops nothing');
+    assert.equal(total((await framework.dropOldSummaries(NAME, 'mira')).summaries), 0, 'a second act drops nothing');
   });
 
   it('T14: an entry that throws on one body: the take names it and fails, the others are mended, and the sweep stays owed', async () => {
@@ -642,13 +642,13 @@ describe('sweeps through the framework', () => {
 
     membrane.hold = null;
     await drain(mira);
-    assert.ok(total(framework.oldSummaryCost('mira', NAME).summaries) > 0, 'premise: an old summary to drop');
+    assert.ok(total(framework.oldSummaryCost(NAME, 'mira').summaries) > 0, 'premise: an old summary to drop');
     for (let i = 0; i < 4; i++) mira.addMessage('User', [text(`more ${i} ${'words '.repeat(60)}`)]);
     presentAll(framework, 'mira');
     order.length = 0;
     release = await maintainHeld();
     try {
-      const drop = framework.dropOldSummaries('mira', NAME).then((cost) => { order.push('dropped'); return cost; });
+      const drop = framework.dropOldSummaries(NAME, 'mira').then((cost) => { order.push('dropped'); return cost; });
       release();
       assert.ok(total((await drop).summaries) > 0);
     } finally {
@@ -865,7 +865,7 @@ describe('sweeps through the framework', () => {
     const framework = await boot();
     assert.throws(() => framework.showSweep('nothing'), (e: unknown) => e instanceof OperatorActionError && e.code === 'invalid');
     await assert.rejects(framework.takeSweep('nothing'), (e: unknown) => e instanceof OperatorActionError && e.code === 'invalid');
-    assert.throws(() => framework.oldSummaryCost('nobody', NAME), (e: unknown) => e instanceof OperatorActionError && e.code === 'unknown-agent');
+    assert.throws(() => framework.oldSummaryCost(NAME, 'nobody'), (e: unknown) => e instanceof OperatorActionError && e.code === 'unknown-agent');
     assert.deepEqual(framework.listSweeps(), [{ name: NAME, line: rewords().line }]);
   });
 });

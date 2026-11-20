@@ -18288,7 +18288,7 @@ export class AgentFramework {
    * Refused (OperatorActionError 'unknown-agent') for an agent that isn't
    * live.
    */
-  oldSummaryCost(agentName: string, name: string): OldSummaryCost {
+  oldSummaryCost(name: string, agentName: string): OldSummaryCost {
     return this.liveContextOf(agentName).oldSummaryCost(name);
   }
 
@@ -18304,7 +18304,7 @@ export class AgentFramework {
    * no turn starts until it is done. Written to the operator log as a
    * `sweep-summaries`.
    */
-  async dropOldSummaries(agentName: string, name: string, opts?: { requester?: OperatorRequester; note?: string }): Promise<OldSummaryCost> {
+  async dropOldSummaries(name: string, agentName: string, opts?: { requester?: OperatorRequester; note?: string }): Promise<OldSummaryCost> {
     this.refuseOperatorAfterStop('drop old summaries');
     const logBase: OperatorLogInput = {
       kind: 'sweep-summaries',

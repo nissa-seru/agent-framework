@@ -7,8 +7,8 @@
   `finished`, or `failed` with each body that was not rewritten and each
   context whose pass threw. Where there is a take to apply and an agent's
   turn is alive, it ends `held`, and the next start or branch move applies
-  it. `sweepReceipt(name)` says where it stands. `oldSummaryCost(agent,
-  name)` and `dropOldSummaries(agent, name)` are the second act: one agent's
+  it. `sweepReceipt(name)` says where it stands. `oldSummaryCost(name,
+  agent)` and `dropOldSummaries(name, agent)` are the second act: one agent's
   strategy drops its old summaries over the rewritten rows, under the same
   reservation. The framework also applies an owed sweep at its start, after
   each branch move, and as an agent whose context already held rows is
