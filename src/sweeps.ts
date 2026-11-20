@@ -21,7 +21,7 @@ export interface AgentOldSummaries {
 export interface FrameworkSweepShow {
   name: string;
   line: string;
-  /** Each body that a pass would rewrite, once, with the live agents that hold it: in a window, or as a reader fork's framing. */
+  /** Each body that a pass would rewrite, once, with the live agents that read it: in a window, through their view, or as a reader fork's framing. */
   changes: Array<SweepChange & { agents: string[] }>;
   /** Each body that a pass would not rewrite, and why. */
   failures: SweepFailure[];
@@ -47,20 +47,27 @@ export interface AgentSweepPass {
   report: SweepPassReport;
 }
 
+/** A live agent's pass that threw before it reported, with what it threw. What it owes stays owed. */
+export interface SweepPassThrew {
+  agent: string;
+  error: string;
+}
+
 /**
  * How a sweep's write ended (AgentFramework.takeSweep). `finished`: every
  * live agent's slot on the open branch finished the newest take. `failed`:
- * a body that the entry changes was not rewritten, and `failed` names each.
- * `held`: an agent's turn was alive, or another operator's act held the
- * store, so nothing was applied: the store took the sweep (or had taken it),
- * and the next start applies it, as does the same call between turns.
+ * a slot did not: `failed` names each body that a pass reported not
+ * rewritten, and `threw` each context whose pass threw before it reported.
+ * `held`: where there was a take to apply, an agent's turn was alive, or
+ * another operator's act held the store, so nothing was applied: the store
+ * took the sweep (or had taken it), and the next start or branch move
+ * applies it, as does the same call between turns.
  */
 export type FrameworkSweepWrite =
-  | { outcome: 'finished'; name: string; took: SweepTake | null; passes: AgentSweepPass[]; oldSummaries: AgentOldSummaries[] }
-  | { outcome: 'failed'; name: string; took: SweepTake | null; passes: AgentSweepPass[]; failed: SweepFailure[]; oldSummaries: AgentOldSummaries[] }
+  | { outcome: 'finished'; name: string; took: SweepTake | null; passes: AgentSweepPass[]; threw: SweepPassThrew[]; oldSummaries: AgentOldSummaries[] }
+  | { outcome: 'failed'; name: string; took: SweepTake | null; passes: AgentSweepPass[]; failed: SweepFailure[]; threw: SweepPassThrew[]; oldSummaries: AgentOldSummaries[] }
   | { outcome: 'held'; name: string; took: SweepTake | null; refusal: string };
 
-/** The entries by name. Two entries with one name are refused. */
 export function sweepEntriesByName(entries: readonly SweepEntry[]): ReadonlyMap<string, SweepEntry> {
   const byName = new Map<string, SweepEntry>();
   for (const entry of entries) {

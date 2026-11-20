@@ -1592,10 +1592,10 @@ export type TraceEvent =
   | (TraceEventBase & {
       /**
        * A sweep's pass through one live agent's context (context-manager's
-       * applySweeps): at an operator's take (`take`), at the framework's
-       * start (`start`), after a branch move (`move`), or as an agent is
-       * taken on for a run (`run`). The report names bodies by id and never
-       * holds the old text.
+       * applySweeps) that had something to report: at an operator's take
+       * (`take`), at the framework's start (`start`), after a branch move
+       * (`move`), or as an agent is taken on for a run (`run`). The report
+       * names bodies by id and never holds the old text.
        */
       type: 'sweep:pass';
       point: SweepPoint;

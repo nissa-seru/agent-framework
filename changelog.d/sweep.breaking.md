@@ -1,0 +1,1 @@
+- **Hosts with a table or `switch` that must cover every `TraceEvent['type']` or `PresentationRetractReason`:** `TraceEvent` names 2 more types, `sweep:pass` and `sweep:pass-failed`, and `PresentationRetractReason` one more, `sweep` (under Added), so a `Record<…>` keyed on either, or a `switch` checked exhaustively with `never`, needs an entry for each.

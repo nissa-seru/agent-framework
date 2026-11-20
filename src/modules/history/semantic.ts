@@ -413,11 +413,15 @@ export interface PendingChanges { edited: string[]; removed: string[] }
 /**
  * A branch's sync cursors for one index: the creation time through which its
  * summaries are sent under their keys, and the time through which its
- * messages are sent. Null where nothing is sent yet. `sweeps`: how many items
- * of the branch's applied list of sweeps (context-manager's sweepsApplied)
- * a pass has read; none read where it is absent.
+ * messages are sent. Null where nothing is sent yet. `sweeps`: where the
+ * passes have read the branch's applied list of sweeps (context-manager's
+ * sweepsApplied) to, by item and by body within it; from its start where it
+ * is absent.
  */
-export interface SyncCursors { namespace: string; summaries: number | null; messages: number | null; sweeps?: number }
+export interface SyncCursors { namespace: string; summaries: number | null; messages: number | null; sweeps?: SweepCursor }
+
+/** A place in a branch's applied list of sweeps: an item's index, and a body within it. */
+export interface SweepCursor { item: number; body: number }
 
 /**
  * Where the sync cursors are kept. HistoryModule keeps them in module state,
@@ -477,8 +481,9 @@ export class SemanticIndexer {
    * made during an embed-service outage survive a restart. Events that land
    * while the module is detached are not replayed (removals are still hidden
    * at search time by the current-branch check in HistoryModule). A sweep's
-   * rewrites and removals reach the index whether or not it was attached:
-   * each pass reads them from the branch's applied list.
+   * rewrites, and its removals where the service deletes, reach the index
+   * whether or not it was attached: each pass reads them from the branch's
+   * applied list, within its budget.
    */
   private readonly editedIds = new Set<string>();
   private readonly removedIds = new Set<string>();
@@ -516,15 +521,15 @@ export class SemanticIndexer {
    * another namespace, as before the host's index setting changed, are none
    * here.
    */
-  private syncCursors(): { summaries: number | null; messages: number | null; sweeps: number } {
+  private syncCursors(): { summaries: number | null; messages: number | null; sweeps: SweepCursor } {
     const c = this.cursorStore ? this.cursorStore.read() : this.ownCursors.get(this.branchId()) ?? null;
     return c && c.namespace === this.cfg.namespace
-      ? { summaries: c.summaries, messages: c.messages, sweeps: c.sweeps ?? 0 }
-      : { summaries: null, messages: null, sweeps: 0 };
+      ? { summaries: c.summaries, messages: c.messages, sweeps: c.sweeps ?? { item: 0, body: 0 } }
+      : { summaries: null, messages: null, sweeps: { item: 0, body: 0 } };
   }
 
   /** Writes the current branch's cursors, which must be `branch`'s. */
-  private setSyncCursors(c: { summaries: number | null; messages: number | null; sweeps: number }, branch: string): void {
+  private setSyncCursors(c: { summaries: number | null; messages: number | null; sweeps: SweepCursor }, branch: string): void {
     const cursors: SyncCursors = { namespace: this.cfg.namespace, summaries: c.summaries, messages: c.messages, sweeps: c.sweeps };
     this.ownCursors.set(branch, cursors);
     this.cursorStore?.write(cursors);
@@ -549,22 +554,29 @@ export class SemanticIndexer {
     }
   }
 
-  private queueSweptRows(from: number): number {
-    const { items, length } = sweepsApplied(this.cm.getStore(), from);
-    let queued = false;
-    for (const item of items) {
-      if (item.kind !== 'listed') continue;
-      for (const body of item.bodies) {
-        for (const shard of body.laterShards) {
-          this.editedIds.delete(shard);
-          if (!this.deleteUnsupported) this.removedIds.add(shard);
-        }
-        if (!this.removedIds.has(body.id)) this.editedIds.add(body.id);
-        queued = true;
+  private readSwept(from: SweepCursor, budget: number): { upsert: IndexItem[]; remove: string[]; next: SweepCursor; spent: number } {
+    const { items, length, unreadable } = sweepsApplied(this.cm.getStore(), from.item);
+    const skipped = new Set(unreadable);
+    const at: number[] = [];
+    for (let i = from.item; i < length; i++) if (!skipped.has(i)) at.push(i);
+    const upsert: IndexItem[] = [];
+    const remove: string[] = [];
+    let spent = 0;
+    for (let k = 0; k < items.length; k++) {
+      const item = items[k]!;
+      const bodies = item.kind === 'listed' ? item.bodies : [];
+      for (let b = at[k] === from.item ? from.body : 0; b < bodies.length; b++) {
+        if (spent >= budget) return { upsert, remove, next: { item: at[k]!, body: b }, spent };
+        const body = bodies[b]!;
+        for (const shard of body.laterShards) if (this.cm.getMessage(shard as never) === null) remove.push(`msg:${shard}`);
+        const m = this.cm.getMessage(body.id as never);
+        if (!m) continue;
+        spent++;
+        const indexed = messageToItem(m, this.cfg);
+        if (indexed) upsert.push(indexed); else remove.push(`msg:${body.id}`);
       }
     }
-    if (queued) this.pendingChanged();
-    return length;
+    return { upsert, remove, next: { item: length, body: 0 }, spent };
   }
 
   pendingSnapshot(): PendingChanges { return { edited: [...this.editedIds], removed: [...this.removedIds] }; }
@@ -662,8 +674,6 @@ export class SemanticIndexer {
         kept = { ...kept, summaries: null, messages: null };
         this.setSyncCursors(kept, branch);
       }
-      const sweepsNext = this.queueSweptRows(kept.sweeps);
-      reading();
       // A branch's cursor is its own while the index holds what it sent, and
       // the index's when it doesn't. Every branch's items are in the one
       // index, so an index whose newest item of a kind is older than the
@@ -781,6 +791,37 @@ export class SemanticIndexer {
           this.warn(`edit re-upsert failed, ${edited.length} edit(s) re-queued: ${msg}`);
         }
         this.pendingChanged();
+      }
+
+      let sweepsNext = kept.sweeps;
+      {
+        const newestMessage = stats?.by_kind.message?.max_cursor ?? null;
+        const restored = kept.messages !== null && newestMessage !== null && newestMessage < kept.messages;
+        const from = restored ? { item: 0, body: 0 } : kept.sweeps;
+        const swept = this.readSwept(from, budget);
+        reading();
+        budget -= swept.spent;
+        const fresh = swept.next.item !== from.item || swept.next.body !== from.body || restored;
+        if (fresh) {
+          try {
+            if (swept.remove.length > 0 && !noIndex && !this.deleteUnsupported && this.branchId() === branch) {
+              for (let i = 0; i < swept.remove.length; i += batchSize) {
+                const missing = await this.deleteIds(swept.remove.slice(i, i + batchSize), stats);
+                if (missing !== null) this.warn(`/delete answered 404, so the service lacks that route; a sweep's removed rows stay in the index: ${missing}`);
+              }
+            }
+            for (let i = 0; i < swept.upsert.length; i += batchSize) {
+              const chunk = swept.upsert.slice(i, i + batchSize);
+              const r = await this.client.upsert(chunk);
+              report.pushed += chunk.length; report.inserted += r.inserted; report.updated += r.updated; report.unchanged += r.unchanged;
+            }
+            sweepsNext = swept.next;
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            phaseErrors.push(msg);
+            this.warn(`a sweep's rewrites failed to reach the index, and the next pass sends them again: ${msg}`);
+          }
+        }
       }
 
       // Summaries before messages: they are few, and a message backlog that

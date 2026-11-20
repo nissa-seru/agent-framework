@@ -55,7 +55,7 @@ import type {
   TokenBudget,
   WindowStatus,
 } from '@animalabs/context-manager';
-import { sweepEntriesByName, type AgentOldSummaries, type AgentSweepPass, type FrameworkSweepReceipt, type FrameworkSweepShow, type FrameworkSweepWrite } from './sweeps.js';
+import { sweepEntriesByName, type AgentOldSummaries, type AgentSweepPass, type FrameworkSweepReceipt, type FrameworkSweepShow, type FrameworkSweepWrite, type SweepPassThrew } from './sweeps.js';
 import type { SweepPoint } from './types/trace.js';
 import {
   bodyGroupRun,
@@ -18148,9 +18148,9 @@ export class AgentFramework {
    * What the sweep `name` would change on the store's open branch, and
    * writes nothing, also while a take of it waits to be applied. Each live
    * agent's context is asked (context-manager's showSweep), and each body
-   * is given once, with the live agents that hold it, in a window or as a
-   * reader fork's framing, its new text, and its old and new length, never
-   * its old text. Each agent's
+   * is given once, with the live agents that read it, in a window through
+   * their view or as a reader fork's framing, its new text, and its old and
+   * new length, never its old text. Each agent's
    * strategy counts the summaries that a pass would leave old. Refused
    * (OperatorActionError 'invalid') for a sweep the framework has no entry
    * of.
@@ -18203,18 +18203,20 @@ export class AgentFramework {
   /**
    * Take the sweep `name` and apply it (an operator's write). It takes
    * where the store never took it, and where every live agent's slot on the
-   * open branch finished its newest take and the show lists a change.
-   * Where a slot still owes the newest take, it applies that one; where
-   * every slot finished and nothing would change, it takes nothing. A take
+   * open branch finished its newest take and the show lists a change or a
+   * failure. Where a slot still owes the newest take, it applies that one;
+   * where every slot finished and the show lists neither, it takes and
+   * applies nothing, and ends `finished`. A take
    * is one record that every branch sees, so another branch is mended when
    * the store moves to it.
    *
    * It applies under the store's reservation, as a branch switch does
    * (reserveStoreForSurgery): every live agent's context makes its pass,
-   * and each window lets go of the shards that a pass removed. Where an
-   * agent's turn is alive, or another operator's act holds the store, it
-   * applies nothing and ends `held`, with the refusal: the next start
-   * applies it, as does the same call between turns. Written to the
+   * and each window lets go of the shards that a pass removed. Where there
+   * is a take to apply and an agent's turn is alive, or another operator's
+   * act holds the store, it applies nothing and ends `held`, with the
+   * refusal: the next start or branch move applies it, as does the same
+   * call between turns. A context whose pass throws is named in `threw`. Written to the
    * operator log as a `sweep`. Refused (OperatorActionError 'invalid') for
    * a sweep the framework has no entry of, and where no live agent's
    * context is open on the store's branch.
@@ -18236,11 +18238,12 @@ export class AgentFramework {
       const before = this.sweepReceipt(name);
       const owed = before.take !== null && !before.finished;
       let took: SweepTake | null = null;
-      if (before.take === null || (!owed && this.showSweep(name).changes.length > 0)) {
+      const shown = before.take === null || owed ? null : this.showSweep(name);
+      if (before.take === null || (shown !== null && (shown.changes.length > 0 || shown.failures.length > 0))) {
         took = contexts[0]!.cm.takeSweep(name);
       } else if (!owed) {
-        this.recordOperatorAction({ ...logBase, result: { outcome: 'finished', take: null, rewritten: 0, removed: 0, failed: 0 } });
-        return { outcome: 'finished', name, took: null, passes: [], oldSummaries: before.oldSummaries };
+        this.recordOperatorAction({ ...logBase, result: { outcome: 'finished', take: null, rewritten: 0, removed: 0, failed: 0, threw: 0 } });
+        return { outcome: 'finished', name, took: null, passes: [], threw: [], oldSummaries: before.oldSummaries };
       }
       let release: () => void;
       try {
@@ -18252,7 +18255,7 @@ export class AgentFramework {
       }
       try {
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
-        const passes = this.applyOwedSweeps('take');
+        const { passes, threw } = this.applyOwedSweeps('take');
         const after = this.sweepReceipt(name);
         const outcomes = passes.flatMap(({ report }) => report.sweeps.filter((sweep) => sweep.name === name));
         const failed = [...new Map(outcomes.flatMap((sweep) => sweep.failed).map((failure) => [failure.id, failure])).values()];
@@ -18262,11 +18265,12 @@ export class AgentFramework {
           rewritten: outcomes.reduce((sum, sweep) => sum + sweep.rewritten.length, 0),
           removed: outcomes.reduce((sum, sweep) => sum + sweep.removed.length, 0),
           failed: failed.length,
+          threw: threw.length,
         };
         this.recordOperatorAction({ ...logBase, result });
         return after.finished
-          ? { outcome: 'finished', name, took, passes, oldSummaries: after.oldSummaries }
-          : { outcome: 'failed', name, took, passes, failed, oldSummaries: after.oldSummaries };
+          ? { outcome: 'finished', name, took, passes, threw, oldSummaries: after.oldSummaries }
+          : { outcome: 'failed', name, took, passes, failed, threw, oldSummaries: after.oldSummaries };
       } finally {
         release();
       }
@@ -18310,11 +18314,10 @@ export class AgentFramework {
       params: { sweep: name },
     };
     try {
-      const cm = this.liveContextOf(agentName);
       const release = this.reserveStoreForSurgery('drop old summaries', agentName);
       try {
         if (this.maintenanceRunning()) await this.settleMaintenancePass();
-        const dropped = cm.dropOldSummaries(name);
+        const dropped = this.liveContextOf(agentName).dropOldSummaries(name);
         this.recordOperatorAction({ ...logBase, result: { summaries: dropped.summaries, records: dropped.records, rawTokens: dropped.rawTokens } });
         return dropped;
       } finally {
@@ -18350,34 +18353,36 @@ export class AgentFramework {
     return (this.presentation?.holders(id) ?? []).map((holder) => holder.agent);
   }
 
-  private applyOwedSweeps(point: SweepPoint, agents: Iterable<Agent> = this.agents.values()): AgentSweepPass[] {
+  private applyOwedSweeps(point: SweepPoint, agents: Iterable<Agent> = this.agents.values()): { passes: AgentSweepPass[]; threw: SweepPassThrew[] } {
     const entries = [...this.sweepEntries.values()];
     const passes: AgentSweepPass[] = [];
+    const threw: SweepPassThrew[] = [];
     for (const agent of [...agents]) {
       const cm = agent.getContextManager();
-      if (cm.isClosed()) continue;
+      if (cm.isClosed() || this.managersRefusingWork.has(cm)) continue;
       let report: SweepPassReport;
       try {
         report = cm.applySweeps(entries);
       } catch (error) {
-        console.error(`[sweep] ${point}: ${agent.name}'s pass threw, and what it owes stays owed: ${failureDescription(error)}`);
-        this.emitTrace({ type: 'sweep:pass-failed', point, agentName: agent.name, error: failureDescription(error) });
+        const description = failureDescription(error);
+        console.error(`[sweep] ${point}: ${agent.name}'s pass threw, and what it owes stays owed: ${description}`);
+        this.emitTrace({ type: 'sweep:pass-failed', point, agentName: agent.name, error: description });
+        threw.push({ agent: agent.name, error: description });
         continue;
       }
       passes.push({ agent: agent.name, report });
       const removed = report.sweeps.flatMap((sweep) => sweep.removed);
       if (removed.length > 0) this.retractRemovedElsewhere(cm, removed, 'sweep');
       if (report.sweeps.length === 0 && report.stopped === null && report.unreadable.items.length === 0 && report.unreadable.takes.length === 0) continue;
-      for (const sweep of report.sweeps) {
-        console.error(
-          `[sweep] ${point}: ${agent.name}, ${sweep.name} on ${report.branch}: ${sweep.outcome}, ` +
-            `${sweep.rewritten.length} rewritten, ${sweep.removed.length} shard(s) removed, ${sweep.failed.length} failed` +
-            (report.stopped ? `; stopped: ${report.stopped}` : ''),
-        );
-      }
+      const sweeps = report.sweeps.map((sweep) =>
+        `${sweep.name} ${sweep.outcome}, ${sweep.rewritten.length} rewritten, ${sweep.removed.length} shard(s) removed, ${sweep.failed.length} failed`);
+      const unreadable = report.unreadable.items.length + report.unreadable.takes.length > 0
+        ? [`${report.unreadable.items.length} applied-list item(s) and ${report.unreadable.takes.length} take(s) unreadable`]
+        : [];
+      console.error(`[sweep] ${point}: ${agent.name} on ${report.branch}: ${[...sweeps, ...unreadable, ...(report.stopped ? [`stopped: ${report.stopped}`] : [])].join('; ')}`);
       this.emitTrace({ type: 'sweep:pass', point, agentName: agent.name, report });
     }
-    return passes;
+    return { passes, threw };
   }
 
   /**

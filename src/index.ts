@@ -193,7 +193,7 @@ export type {
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
 export { OperatorLog, OperatorActionError, defaultOperatorLogPath } from './operator-log.js';
-export type { AgentOldSummaries, AgentSweepPass, FrameworkSweepReceipt, FrameworkSweepShow, FrameworkSweepWrite } from './sweeps.js';
+export type { AgentOldSummaries, AgentSweepPass, FrameworkSweepReceipt, FrameworkSweepShow, FrameworkSweepWrite, SweepPassThrew } from './sweeps.js';
 export type {
   OperatorLogEntry,
   OperatorLogInput,

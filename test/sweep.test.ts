@@ -1,10 +1,3 @@
-/**
- * Sweeps through the framework (context-manager's SweepEntry): the show, the
- * take and its hold, the passes at a start and after a branch move, the
- * windows and the search index after a pass, and the second act on one
- * agent's old summaries. Real stores and real context managers; the
- * summarizer is a mock that says whether a fold read the old words.
- */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -17,6 +10,7 @@ import type { ContextStrategy, MessageId, StoredContentBlock, SweepEntry } from 
 import { AgentFramework, AutobiographicalStrategy, OperatorActionError, PassthroughStrategy, residentContextOptions } from '../src/index.js';
 import type { FrameworkConfig, Module, OperatorLogEntry, TraceEvent } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
+import { SemanticIndexClient, SemanticIndexer, type SyncCursors } from '../src/modules/history/semantic.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 
@@ -30,7 +24,6 @@ const MORE_FILLER = 'more filler for the note ';
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
 const textOf = (blocks: readonly { type: string; text?: string }[]): string => blocks.map((b) => (b.type === 'text' ? b.text ?? '' : '')).join('');
 
-/** Mends OLDWORDS in the faulty writer's rows; throws on a row that says BOOM. */
 function rewords(): SweepEntry {
   return {
     name: NAME,
@@ -46,10 +39,8 @@ function rewords(): SweepEntry {
   };
 }
 
-/** A summarizer that names, in each summary, whether the rows it folded held the old or the new words. */
 class SummaryMembrane extends MockMembrane {
   summaries = 0;
-  /** While set, each summary call waits on it. */
   hold: Promise<void> | null = null;
   override async complete(request: NormalizedRequest): Promise<NormalizedResponse> {
     this.summaries++;
@@ -87,7 +78,6 @@ function longNote(cm: ContextManager, marker: string): MessageId {
   return note(cm, `${marker} ${FILLER.repeat(120)}${OLD} in the middle ${MORE_FILLER.repeat(120)}end of ${marker}`);
 }
 
-/** The rows of the body whose first row is `id`. */
 function bodyRows(cm: ContextManager, id: MessageId): MessageId[] {
   const all = cm.getAllMessages();
   const at = all.findIndex((m) => m.id === id);
@@ -98,7 +88,6 @@ function bodyRows(cm: ContextManager, id: MessageId): MessageId[] {
   return rows;
 }
 
-/** Present each row of the residents' slot that the agent's window doesn't hold yet, as a write for an idle agent does. */
 function presentAll(framework: AgentFramework, ...agents: string[]): void {
   for (const agent of agents) {
     const cm = cmOf(framework, agent);
@@ -119,7 +108,6 @@ async function drain(cm: ContextManager): Promise<void> {
   assert.ok(cm.isReady(), 'the drain finished');
 }
 
-/** An agent mid-turn, as the scheduler marks one. */
 function busy(framework: AgentFramework, agent: string, on: boolean): void {
   (framework.getAgent(agent) as unknown as { _state: { status: string } })._state = { status: on ? 'inferring' : 'idle' };
 }
@@ -131,7 +119,6 @@ function readLog(path: string): OperatorLogEntry[] {
 
 const total = (levels: readonly { count: number }[]): number => levels.reduce((sum, each) => sum + each.count, 0);
 
-/** The store's writes of `method` to the residents' slot fail from the `from`th on, as after a stop of the host, until restored. */
 function failFrom(cm: ContextManager, method: 'editStateItem' | 'redactStateItems', from: number, slot = 'messages') {
   const target = cm.getStore() as unknown as Record<string, (...args: unknown[]) => unknown>;
   const real = target[method]!;
@@ -211,8 +198,10 @@ describe('sweeps through the framework', () => {
     assert.equal(shown.changes[0]!.newLength, `a note with ${NEW}`.length);
 
     busy(framework, 'oren', true);
-    assert.equal((await framework.takeSweep(NAME)).outcome, 'held', 'premise: the take waits');
+    const held = await framework.takeSweep(NAME);
     busy(framework, 'oren', false);
+    assert.equal(held.outcome, 'held', 'premise: the take waits');
+    assert.ok(held.took && framework.sweepReceipt(NAME).take?.take === held.took.take, 'premise: the store holds the take');
     const taken = sequenceOf(framework);
     framework.showSweep(NAME);
     assert.equal(sequenceOf(framework), taken, 'a show while the take waits writes nothing');
@@ -332,7 +321,7 @@ describe('sweeps through the framework', () => {
     const compiled = await compiledText(cmOf(framework, 'mira'));
     assert.ok(!compiled.includes(OLD) && compiled.includes(`a note with ${NEW}`), 'the start mended it before the first request');
     assert.ok(framework.sweepReceipt(NAME).finished);
-    assert.ok(logged.some((line) => line.startsWith(`[sweep] start: mira, ${NAME} `) && line.includes('finished, 1 rewritten')), 'the start\'s pass is logged');
+    assert.ok(logged.some((line) => line.startsWith('[sweep] start: mira on ') && line.includes(`${NAME} finished, 1 rewritten`)), 'the start\'s pass is logged');
   });
 
   it('T7: a take whose second rewrite fails, then a restart: the start mends the rest, and the receipt names both bodies', async () => {
@@ -397,7 +386,7 @@ describe('sweeps through the framework', () => {
       'the move\'s pass is traced');
   });
 
-  it('T9b: a branch move in a store that never took a sweep rewrites nothing, and traces no pass', async () => {
+  it('T9b: a branch move in a store that never took a sweep asks for the pass, which rewrites nothing and is not traced', async () => {
     const framework = await boot();
     const mira = cmOf(framework, 'mira');
     const id = note(mira, `a note with ${OLD}`);
@@ -408,12 +397,16 @@ describe('sweeps through the framework', () => {
     presentAll(framework, 'mira');
     const passes: TraceEvent[] = [];
     framework.onTrace((event) => { if (event.type === 'sweep:pass') passes.push(event); });
+    let asked = 0;
+    const apply = mira.applySweeps.bind(mira);
+    mira.applySweeps = (entries) => { asked++; return apply(entries); };
     await framework.rollbackToMessage('mira', { messageId: target });
+    assert.equal(asked, 1, 'the move asked the context for its pass');
     assert.ok(textOf(mira.getMessage(id)!.content).includes(OLD));
     assert.deepEqual(passes, [], 'a pass with nothing to do is not traced');
   });
 
-  it('T10: after a pass that removed shards, no window holds them at its next request: the applying resident\'s, another resident\'s, and the subconscious\'s', async () => {
+  it('T10: after a pass that removed shards, no window keeps them: the applying resident\'s, another resident\'s, and the subconscious\'s', async () => {
     const framework = await boot({ residents: ['mira', 'oren'], strategy: adaptive, subconscious: true });
     const mira = cmOf(framework, 'mira');
     const long = longNote(mira, 'LONG');
@@ -422,12 +415,12 @@ describe('sweeps through the framework', () => {
     assert.ok(later.length > 0, 'premise: sharded');
     presentAll(framework, 'mira', 'oren', 'deep');
     for (const agent of ['mira', 'oren', 'deep']) {
-      assert.ok(cmOf(framework, agent).getPresentedMessages().some((m) => later.includes(m.id)), `premise: ${agent}'s window holds a later shard`);
+      assert.ok(later.every((id) => cmOf(framework, agent).ordinalOf(id) !== undefined), `premise: ${agent}'s window holds each later shard`);
     }
     assert.equal((await framework.takeSweep(NAME)).outcome, 'finished');
     for (const agent of ['mira', 'oren', 'deep']) {
       const cm = cmOf(framework, agent);
-      assert.ok(!cm.getPresentedMessages().some((m) => later.includes(m.id)), `${agent}'s window holds no removed shard`);
+      assert.deepEqual(later.filter((id) => cm.ordinalOf(id) !== undefined), [], `${agent}'s window keeps no place for a removed shard`);
       assert.ok(!(await compiledText(cm)).includes(OLD), `${agent}'s request holds none of the old text`);
     }
   });
@@ -509,7 +502,7 @@ describe('sweeps through the framework', () => {
     assert.equal(framework.sweepReceipt(NAME).finished, false, 'owed');
   });
 
-  it('T15: after a take, history search gives the new text for a mended body and nothing for a removed shard, though the indexer was not attached during the pass', async () => {
+  it('T15: after a take, the history module\'s semantic index holds the new text for a mended body and nothing for a removed shard, though the indexer was not attached during the pass', async () => {
     const svc = new FakeEmbedService();
     await svc.start();
     try {
@@ -521,6 +514,8 @@ describe('sweeps through the framework', () => {
       const long = longNote(mira, 'LONG');
       const later = bodyRows(mira, long).slice(1);
       assert.ok(later.length > 0, 'premise: sharded');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      mira.addMessage('User', [text('LATER')]);
       presentAll(framework, 'mira');
       module.bind(mira);
       await module.syncSemanticIndex();
@@ -546,7 +541,6 @@ describe('sweeps through the framework', () => {
     }
   });
 
-  /** The text of the newest request that carried `marker`. */
   const requestWith = (marker: string): string => {
     const request = [...membrane.calls].reverse().find((call) => JSON.stringify(call.messages).includes(marker));
     assert.ok(request, `a request carried ${marker}`);
@@ -618,39 +612,49 @@ describe('sweeps through the framework', () => {
     const framework = await boot({ strategy: folding });
     framework.start();
     const mira = cmOf(framework, 'mira');
-    const id = note(mira, `first ${OLD} ${'words '.repeat(60)}`);
+    note(mira, `first ${OLD} ${'words '.repeat(60)}`);
     for (let i = 0; i < 4; i++) mira.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
     presentAll(framework, 'mira');
+    const internals = framework as unknown as { startQueuedMaintenance(): void; maintenancePass: Promise<void> | null };
     const order: string[] = [];
     framework.onTrace((event) => { if (event.type === 'sweep:pass') order.push('pass'); });
-    let release!: () => void;
-    membrane.hold = new Promise<void>((resolve) => { release = () => { order.push('released'); resolve(); }; });
-    const maintain = (): void => (framework as unknown as { startQueuedMaintenance(): void }).startQueuedMaintenance();
-    maintain();
-    await until(() => membrane.summaries > 0, 'a summary call to start');
-    const take = framework.takeSweep(NAME);
-    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(textOf(mira.getMessage(id)!.content).includes(OLD), 'the take waits');
-    release();
-    assert.equal((await take).outcome, 'finished');
-    assert.deepEqual(order.slice(0, 2), ['released', 'pass'], 'its pass came after the maintenance pass');
+    const maintainHeld = async (): Promise<() => void> => {
+      let release!: () => void;
+      membrane.hold = new Promise<void>((resolve) => { release = resolve; });
+      const calls = membrane.summaries;
+      internals.startQueuedMaintenance();
+      const pass = internals.maintenancePass;
+      assert.ok(pass, 'premise: a maintenance pass runs');
+      void pass.then(() => order.push('maintained'));
+      await until(() => membrane.summaries > calls, 'a summary call to start');
+      return release;
+    };
+
+    let release = await maintainHeld();
+    try {
+      const take = framework.takeSweep(NAME);
+      release();
+      assert.equal((await take).outcome, 'finished');
+    } finally {
+      release();
+    }
+    assert.deepEqual(order.slice(0, 2), ['maintained', 'pass'], 'the take\'s pass came after the maintenance pass ended');
 
     membrane.hold = null;
     await drain(mira);
     assert.ok(total(framework.oldSummaryCost('mira', NAME).summaries) > 0, 'premise: an old summary to drop');
     for (let i = 0; i < 4; i++) mira.addMessage('User', [text(`more ${i} ${'words '.repeat(60)}`)]);
     presentAll(framework, 'mira');
-    let opened!: () => void;
-    membrane.hold = new Promise<void>((resolve) => { opened = resolve; });
-    const calls = membrane.summaries;
-    maintain();
-    await until(() => membrane.summaries > calls, 'a second summary call to start');
-    let dropped = false;
-    const drop = framework.dropOldSummaries('mira', NAME).then((cost) => { dropped = true; return cost; });
-    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(dropped, false, 'the second act waits');
-    opened();
-    assert.ok(total((await drop).summaries) > 0);
+    order.length = 0;
+    release = await maintainHeld();
+    try {
+      const drop = framework.dropOldSummaries('mira', NAME).then((cost) => { order.push('dropped'); return cost; });
+      release();
+      assert.ok(total((await drop).summaries) > 0);
+    } finally {
+      release();
+    }
+    assert.deepEqual(order, ['maintained', 'dropped'], 'the second act came after the maintenance pass ended');
   });
 
   it('T19: the show is of the store\'s branch: a live subagent\'s own branch adds nothing to it', async () => {
@@ -679,7 +683,7 @@ describe('sweeps through the framework', () => {
     await run;
   });
 
-  it('T20: a pass that throws is traced, and the other contexts make theirs', async () => {
+  it('T20: a pass that throws is traced and named in the answer, and the other contexts make theirs', async () => {
     const framework = await boot({ residents: ['mira', 'oren'] });
     const id = note(cmOf(framework, 'mira'), `a note with ${OLD}`);
     presentAll(framework, 'mira', 'oren');
@@ -689,9 +693,170 @@ describe('sweeps through the framework', () => {
     mira.applySweeps = () => { throw new Error('test: this context can make no pass'); };
     const write = await framework.takeSweep(NAME);
     assert.equal(write.outcome, 'finished', 'oren\'s pass mended the slot that both write');
+    assert.deepEqual(write.outcome === 'finished' ? write.threw.map((each) => each.agent) : [], ['mira'], 'the answer names the context whose pass threw');
     assert.ok(textOf(cmOf(framework, 'oren').getMessage(id)!.content).includes(NEW));
     assert.deepEqual(failed.map((event) => event.type === 'sweep:pass-failed' ? [event.point, event.agentName] : []), [['take', 'mira']]);
     assert.match(failed[0]!.type === 'sweep:pass-failed' ? failed[0]!.error : '', /test: this context can make no pass/);
+  });
+
+  it('T21: a live agent whose context is closed is passed by: the show and the take read the others, and a take with no open context is refused', async () => {
+    const framework = await boot({ residents: ['mira', 'oren'] });
+    const id = note(cmOf(framework, 'mira'), `a note with ${OLD}`);
+    presentAll(framework, 'mira', 'oren');
+    const failed: TraceEvent[] = [];
+    framework.onTrace((event) => { if (event.type === 'sweep:pass-failed') failed.push(event); });
+    cmOf(framework, 'oren').close();
+    assert.deepEqual(framework.showSweep(NAME).changes.map((change) => change.id), [id]);
+    assert.equal((await framework.takeSweep(NAME)).outcome, 'finished');
+    assert.deepEqual(failed, [], 'no pass is tried through the closed context');
+    cmOf(framework, 'mira').close();
+    await assert.rejects(framework.takeSweep(NAME), (e: unknown) => e instanceof OperatorActionError && e.code === 'invalid');
+  });
+
+  it('T4b: after a finished take, a new body whose entry throws is taken again, and the take names it', async () => {
+    const framework = await boot();
+    const mira = cmOf(framework, 'mira');
+    note(mira, `a note with ${OLD}`);
+    presentAll(framework, 'mira');
+    assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
+    const boom = note(mira, `BOOM ${OLD}`);
+    presentAll(framework, 'mira');
+    const write = await framework.takeSweep(NAME);
+    assert.equal(write.outcome, 'failed');
+    assert.ok(write.took, 'a new take');
+    assert.deepEqual(write.outcome === 'failed' ? write.failed.map((f) => f.id) : [], [boom]);
+  });
+
+  it('T22: a move whose re-initialization of a context fails makes no pass through that context', async () => {
+    const framework = await boot({ residents: ['mira', 'oren'] });
+    const mira = cmOf(framework, 'mira');
+    note(mira, `a note with ${OLD}`);
+    presentAll(framework, 'mira', 'oren');
+    const target = mira.addMessage('User', [text('TARGET')]);
+    presentAll(framework, 'mira', 'oren');
+    mira.addMessage('User', [text('TAIL')]);
+    presentAll(framework, 'mira', 'oren');
+    assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
+    const oren = cmOf(framework, 'oren');
+    oren.setStrategy = async () => { throw new Error('test: this context can not follow the move'); };
+    let asked = 0;
+    const apply = oren.applySweeps.bind(oren);
+    oren.applySweeps = (entries) => { asked++; return apply(entries); };
+    await framework.rollbackToMessage('mira', { messageId: target });
+    assert.equal(asked, 0);
+  });
+
+  async function indexed(svc: FakeEmbedService, framework: AgentFramework, cursors: { value: SyncCursors | null }): Promise<SemanticIndexer> {
+    const cfg = { url: svc.url, namespace: 'ns', syncIntervalMs: 0, overlapMs: 0 };
+    const indexer = new SemanticIndexer(cmOf(framework, 'mira'), new SemanticIndexClient(cfg), cfg);
+    indexer.cursorStore = { read: () => cursors.value, write: (c) => { cursors.value = c; } };
+    return indexer;
+  }
+
+  it('T15b: a cursor written before sweeps had one reads the applied list from its start', async () => {
+    const svc = new FakeEmbedService();
+    await svc.start();
+    try {
+      const framework = await boot();
+      const mira = cmOf(framework, 'mira');
+      const one = note(mira, `a note with ${OLD}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      mira.addMessage('User', [text('LATER')]);
+      presentAll(framework, 'mira');
+      const cursors: { value: SyncCursors | null } = { value: null };
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
+      const old: SyncCursors = { ...cursors.value! };
+      delete old.sweeps;
+      cursors.value = old;
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      assert.ok(svc.items.get(`msg:${one}`)?.text.includes(NEW));
+    } finally {
+      await svc.stop();
+    }
+  });
+
+  it('T15c: an index restored to a backup older than the message cursor gets the sweep\'s rewrites again', async () => {
+    const svc = new FakeEmbedService();
+    await svc.start();
+    try {
+      const framework = await boot();
+      const mira = cmOf(framework, 'mira');
+      const one = note(mira, `a note with ${OLD}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      mira.addMessage('User', [text('LATER')]);
+      presentAll(framework, 'mira');
+      const cursors: { value: SyncCursors | null } = { value: null };
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      const backup = new Map(svc.items);
+      assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      mira.addMessage('User', [text('NEWER')]);
+      presentAll(framework, 'mira');
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      assert.ok(svc.items.get(`msg:${one}`)?.text.includes(NEW), 'premise: the rewrite reached the index');
+      svc.items = backup;
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      assert.ok(svc.items.get(`msg:${one}`)?.text.includes(NEW));
+    } finally {
+      await svc.stop();
+    }
+  });
+
+  it('T15d: a catch-up sends no more of a sweep\'s rewrites than its budget, and the next sends the rest', async () => {
+    const svc = new FakeEmbedService();
+    await svc.start();
+    try {
+      const framework = await boot();
+      const mira = cmOf(framework, 'mira');
+      const notes = [1, 2, 3].map((i) => note(mira, `note ${i} with ${OLD}`));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      mira.addMessage('User', [text('LATER')]);
+      presentAll(framework, 'mira');
+      const cursors: { value: SyncCursors | null } = { value: null };
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
+      const before = svc.sent.length;
+      const first = await (await indexed(svc, framework, cursors)).catchUp(2);
+      const sentNotes = svc.sent.slice(before).filter((id) => notes.some((note) => id === `msg:${note}`));
+      assert.equal(sentNotes.length, 2, 'two of the three rewrites');
+      assert.equal(first.more, true);
+      await (await indexed(svc, framework, cursors)).catchUp(2);
+      for (const id of notes) assert.ok(svc.items.get(`msg:${id}`)?.text.includes(NEW));
+    } finally {
+      await svc.stop();
+    }
+  });
+
+  it('T15e: a later shard that a stopped pass left in the store stays in the index until a pass removes it', async () => {
+    const svc = new FakeEmbedService();
+    await svc.start();
+    try {
+      let framework = await boot({ strategy: adaptive });
+      let mira = cmOf(framework, 'mira');
+      const long = longNote(mira, 'LONG');
+      const later = bodyRows(mira, long).slice(1);
+      assert.ok(later.length > 0, 'premise: sharded');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      mira.addMessage('User', [text('LATER')]);
+      presentAll(framework, 'mira');
+      const cursors: { value: SyncCursors | null } = { value: null };
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      assert.ok(svc.items.has(`msg:${later[0]}`), 'premise: indexed');
+      const stop = failFrom(mira, 'redactStateItems', 1);
+      await framework.takeSweep(NAME);
+      stop.restore();
+      assert.ok(mira.getMessage(later[0]!), 'premise: the shard stayed in the store');
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      assert.ok(svc.items.has(`msg:${later[0]}`), 'the index keeps a shard that the store still holds');
+      framework = await restart(framework, { strategy: adaptive });
+      mira = cmOf(framework, 'mira');
+      assert.equal(mira.getMessage(later[0]!), null, 'premise: the start removed it');
+      await (await indexed(svc, framework, cursors)).catchUp(1024);
+      for (const shard of later) assert.ok(!svc.items.has(`msg:${shard}`), 'then the index lets it go');
+    } finally {
+      await svc.stop();
+    }
   });
 
   it('T17: two entries with one name refuse the framework; a show or a take of an unknown sweep, and the cost of an unknown agent, are refused', async () => {
@@ -707,10 +872,8 @@ describe('sweeps through the framework', () => {
 
 interface Item { id: string; text: string; kind: string; cursor?: number }
 
-/** The embed service's index API, as the history module calls it. */
 class FakeEmbedService {
   items = new Map<string, Item>();
-  /** Every id an upsert carried, in order. */
   sent: string[] = [];
   private server!: Server;
   url = '';
