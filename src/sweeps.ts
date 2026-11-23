@@ -1,5 +1,6 @@
 import type {
-  OldSummaryLevel,
+  SummaryDropCost,
+  SummaryLevelCount,
   SweepChange,
   SweepEntry,
   SweepFailure,
@@ -11,7 +12,13 @@ import type {
 /** The old summaries of one agent's strategy, at each level (ContextManager.oldSummaryCost). */
 export interface AgentOldSummaries {
   agent: string;
-  summaries: OldSummaryLevel[];
+  summaries: SummaryLevelCount[];
+}
+
+/** What a pass would drop from one agent's strategy itself, where it joins a long note (ContextManager.showSweep's writeDrops). */
+export interface AgentWriteDrops {
+  agent: string;
+  drops: SummaryDropCost;
 }
 
 /**
@@ -27,6 +34,8 @@ export interface FrameworkSweepShow {
   failures: SweepFailure[];
   /** The summaries that each live agent's strategy would keep as old once a pass rewrote the changes. */
   oldSummaries: AgentOldSummaries[];
+  /** What a pass would drop from each live agent's strategy itself, where it joins a long note: never counted in oldSummaries too. */
+  writeDrops: AgentWriteDrops[];
 }
 
 /** Where a sweep stands on the open branch (AgentFramework.sweepReceipt). Never the old text. */
