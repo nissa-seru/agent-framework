@@ -449,6 +449,67 @@ describe('sweeps through the framework', () => {
     return { framework, mended };
   }
 
+  async function foldedLongNote(framework: AgentFramework): Promise<MessageId> {
+    const mira = cmOf(framework, 'mira');
+    for (let i = 0; i < 3; i++) mira.addMessage('User', [text(`before ${i}`)]);
+    const long = longNote(mira, 'LONG');
+    for (let i = 0; i < 4; i++) mira.addMessage('User', [text(`chat ${i} ${'words '.repeat(60)}`)]);
+    presentAll(framework, 'mira');
+    await drain(mira);
+    assert.ok(bodyRows(mira, long).length > 1, 'premise: the note is stored as shards');
+    return long;
+  }
+
+  it('T25: where a take joins a long note, the show gives what the resident\'s strategy would drop, and the take\'s pass reports and logs the same', async () => {
+    const framework = await boot({ strategy: adaptive });
+    await foldedLongNote(framework);
+    const shown = framework.showSweep(NAME);
+    const drops = shown.writeDrops.find((each) => each.agent === 'mira')?.drops;
+    assert.ok(drops && total(drops.summaries) > 0, 'premise: the show counts a drop');
+    const logged: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    let write;
+    try {
+      write = await framework.takeSweep(NAME);
+    } finally {
+      console.error = error;
+    }
+    assert.equal(write.outcome, 'finished');
+    const pass = write.passes.find((each) => each.agent === 'mira');
+    assert.deepEqual(pass?.report.dropped, drops, 'the pass reports what the show counted');
+    assert.ok(logged.some((line) => line.startsWith('[sweep] take: mira on ') && line.includes(`dropped ${drops.summaries.map((each) => `${each.count} L${each.level}`).join(', ')} summary(ies)`)), 'the log line names the drop');
+  });
+
+  it('T27: a take that joins a long note has every other resident of the slot drop the note\'s summaries in the same take, before any compile of its own', async () => {
+    const framework = await boot({ residents: ['mira', 'oren'], strategy: adaptive });
+    const long = await foldedLongNote(framework);
+    const rows = bodyRows(cmOf(framework, 'mira'), long);
+    presentAll(framework, 'oren');
+    await drain(cmOf(framework, 'oren'));
+    const summaries = (agent: string) => (cmOf(framework, agent) as unknown as { strategy: { summaries: Array<{ level: number; sourceIds: MessageId[] }> } }).strategy.summaries;
+    const over = (agent: string) => summaries(agent).filter((s) => s.level === 1 && s.sourceIds.some((id) => rows.includes(id)));
+    assert.ok(over('oren').some((s) => s.sourceIds.includes(long)), 'premise: oren folds the note\'s first row');
+    assert.equal((await framework.takeSweep(NAME)).outcome, 'finished');
+    assert.deepEqual(over('oren'), [], 'oren holds no summary over a piece of the note');
+  });
+
+  it('T26: a rollback whose pass joins a long note traces what that pass dropped', async () => {
+    const framework = await boot({ strategy: adaptive });
+    const mira = cmOf(framework, 'mira');
+    await foldedLongNote(framework);
+    const target = mira.addMessage('User', [text('TARGET')]);
+    presentAll(framework, 'mira');
+    mira.addMessage('User', [text('TAIL')]);
+    presentAll(framework, 'mira');
+    assert.equal((await framework.takeSweep(NAME)).outcome, 'finished', 'premise');
+    const passes: TraceEvent[] = [];
+    framework.onTrace((event) => { if (event.type === 'sweep:pass') passes.push(event); });
+    await framework.rollbackToMessage('mira', { messageId: target });
+    const move = passes.find((event) => event.type === 'sweep:pass' && event.point === 'move');
+    assert.ok(move && move.type === 'sweep:pass' && move.report.dropped && total(move.report.dropped.summaries) > 0, 'the move\'s pass says what it dropped');
+  });
+
   it('T12: after a take, each resident keeps its old summaries, and the show and the receipt count each agent\'s own', async () => {
     const { framework } = await foldedPair();
     const shown = framework.showSweep(NAME);

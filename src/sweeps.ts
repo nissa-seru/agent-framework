@@ -1,5 +1,6 @@
 import type {
-  OldSummaryLevel,
+  SummaryDropCost,
+  SummaryLevelCount,
   SweepChange,
   SweepEntry,
   SweepFailure,
@@ -14,7 +15,13 @@ const FRAMEWORK_SWEEPS: readonly SweepEntry[] = [UNSTICK_FIX_11_16];
 /** The old summaries of one agent's strategy, at each level (ContextManager.oldSummaryCost). */
 export interface AgentOldSummaries {
   agent: string;
-  summaries: OldSummaryLevel[];
+  summaries: SummaryLevelCount[];
+}
+
+/** What a pass would drop from one agent's strategy itself, where it joins a long note (ContextManager.showSweep's writeDrops). */
+export interface AgentWriteDrops {
+  agent: string;
+  drops: SummaryDropCost;
 }
 
 /**
@@ -30,6 +37,8 @@ export interface FrameworkSweepShow {
   failures: SweepFailure[];
   /** The summaries that each live agent's strategy would keep as old once a pass rewrote the changes. */
   oldSummaries: AgentOldSummaries[];
+  /** What a pass would drop from each live agent's strategy itself, where it joins a long note: never counted in oldSummaries too. */
+  writeDrops: AgentWriteDrops[];
 }
 
 /** Where a sweep stands on the open branch (AgentFramework.sweepReceipt). Never the old text. */
@@ -44,7 +53,16 @@ export interface FrameworkSweepReceipt {
   oldSummaries: AgentOldSummaries[];
 }
 
-/** One live agent's pass, as its context manager reported it. */
+/**
+ * One live agent's pass, as its context manager reported it. Its report's
+ * `dropped` counts the summaries that agent's strategy held as its own pass
+ * began and no longer holds as it ends. Where agents hold one note, an
+ * earlier agent's pass in the same take can remove the note's later shards
+ * first, and the later agent's strategy then lets go of the summaries over
+ * them before its own pass begins. Those are gone, and no report counts
+ * them, so such a report can count less than the agent's `writeDrops` in
+ * the show.
+ */
 export interface AgentSweepPass {
   agent: string;
   report: SweepPassReport;

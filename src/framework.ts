@@ -44,8 +44,8 @@ import type {
   MessageId,
   MessageMetadata,
   MessageQuery,
-  OldSummaryCost,
   StoredMessage,
+  SummaryDropCost,
   SweepChange,
   SweepEntry,
   SweepFailure,
@@ -55,7 +55,7 @@ import type {
   TokenBudget,
   WindowStatus,
 } from '@animalabs/context-manager';
-import { sweepEntriesByName, type AgentOldSummaries, type AgentSweepPass, type FrameworkSweepReceipt, type FrameworkSweepShow, type FrameworkSweepWrite, type SweepPassThrew } from './sweeps.js';
+import { sweepEntriesByName, type AgentOldSummaries, type AgentWriteDrops, type AgentSweepPass, type FrameworkSweepReceipt, type FrameworkSweepShow, type FrameworkSweepWrite, type SweepPassThrew } from './sweeps.js';
 import type { SweepPoint } from './types/trace.js';
 import {
   bodyGroupRun,
@@ -18151,7 +18151,8 @@ export class AgentFramework {
    * is given once, with the live agents that read it, in a window through
    * their view or as a reader fork's framing, its new text, and its old and
    * new length, never its old text. Each agent's
-   * strategy counts the summaries that a pass would leave old. Refused
+   * strategy counts the summaries that a pass would leave old, and what the
+   * pass would drop itself where it joins a long note (`writeDrops`). Refused
    * (OperatorActionError 'invalid') for a sweep the framework has no entry
    * of.
    */
@@ -18160,6 +18161,7 @@ export class AgentFramework {
     const changes = new Map<MessageId, SweepChange & { agents: string[] }>();
     const failures = new Map<MessageId, SweepFailure>();
     const oldSummaries: AgentOldSummaries[] = [];
+    const writeDrops: AgentWriteDrops[] = [];
     for (const { agent, cm } of this.sweepContexts()) {
       const shown = cm.showSweep(entry);
       for (const change of shown.changes) {
@@ -18167,8 +18169,9 @@ export class AgentFramework {
       }
       for (const failure of shown.failures) if (!failures.has(failure.id)) failures.set(failure.id, failure);
       oldSummaries.push({ agent, summaries: shown.oldSummaries });
+      writeDrops.push({ agent, drops: shown.writeDrops });
     }
-    return { name, line: entry.line, changes: [...changes.values()], failures: [...failures.values()], oldSummaries };
+    return { name, line: entry.line, changes: [...changes.values()], failures: [...failures.values()], oldSummaries, writeDrops };
   }
 
   /**
@@ -18289,7 +18292,7 @@ export class AgentFramework {
    * live, and ('invalid') for a name that is no entry of this framework's
    * and that the store never took.
    */
-  oldSummaryCost(name: string, agentName: string): OldSummaryCost {
+  oldSummaryCost(name: string, agentName: string): SummaryDropCost {
     return this.secondActContextOf(name, agentName).oldSummaryCost(name);
   }
 
@@ -18307,7 +18310,7 @@ export class AgentFramework {
    * and that the store never took. Written to the operator log as a
    * `sweep-summaries`.
    */
-  async dropOldSummaries(name: string, agentName: string, opts?: { requester?: OperatorRequester; note?: string }): Promise<OldSummaryCost> {
+  async dropOldSummaries(name: string, agentName: string, opts?: { requester?: OperatorRequester; note?: string }): Promise<SummaryDropCost> {
     this.refuseOperatorAfterStop('drop old summaries');
     const logBase: OperatorLogInput = {
       kind: 'sweep-summaries',
@@ -18395,7 +18398,10 @@ export class AgentFramework {
       const unreadable = report.unreadable.items.length + report.unreadable.takes.length > 0
         ? [`${report.unreadable.items.length} applied-list item(s) and ${report.unreadable.takes.length} take(s) unreadable`]
         : [];
-      console.error(`[sweep] ${point}: ${agent.name} on ${report.branch}: ${[...sweeps, ...unreadable, ...(report.stopped ? [`stopped: ${report.stopped}`] : [])].join('; ')}`);
+      const dropped = report.dropped && report.dropped.summaries.length > 0
+        ? [`dropped ${report.dropped.summaries.map((each) => `${each.count} L${each.level}`).join(', ')} summary(ies) over joined notes, ${report.dropped.records} chunk record(s) to fold again, ~${report.dropped.rawTokens} token(s) raw until then`]
+        : [];
+      console.error(`[sweep] ${point}: ${agent.name} on ${report.branch}: ${[...sweeps, ...dropped, ...unreadable, ...(report.stopped ? [`stopped: ${report.stopped}`] : [])].join('; ')}`);
       this.emitTrace({ type: 'sweep:pass', point, agentName: agent.name, report });
     }
     return { passes, threw };
