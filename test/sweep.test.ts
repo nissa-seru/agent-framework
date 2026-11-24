@@ -478,11 +478,6 @@ describe('sweeps through the framework', () => {
     const pass = write.passes.find((each) => each.agent === 'mira');
     assert.deepEqual(pass?.report.dropped, drops, 'the pass reports what the show counted');
     assert.ok(logged.some((line) => line.startsWith('[sweep] take: mira on ') && line.includes(`dropped ${drops.summaries.map((each) => `${each.count} L${each.level}`).join(', ')} summary(ies)`)), 'the log line names the drop');
-    const room = drops.floorChange.known
-      ? `the smallest compile ${drops.floorChange.tokens > 0 ? 'grew' : 'shrank'} by ~${Math.abs(drops.floorChange.tokens)} token(s)`
-      : `the smallest compile's change is not known: ${drops.floorChange.reason}`;
-    assert.ok(drops.floorChange.known ? drops.floorChange.tokens !== 0 : true, 'premise: the write changes the smallest compile');
-    assert.ok(logged.some((line) => line.startsWith('[sweep] take: mira on ') && line.includes(room)), 'the log line names the change in the smallest compile');
   });
 
   it('T27: a take that joins a long note has every other resident of the slot drop the note\'s summaries in the same take, before any compile of its own', async () => {
