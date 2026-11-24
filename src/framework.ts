@@ -119,7 +119,7 @@ import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from 
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
-import { logDetail, logValue } from './mcpl/log-value.js';
+import { logDetail, logValue, logValueRedacted } from './mcpl/log-value.js';
 import { expandCoreTags, isAmbient, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -180,7 +180,7 @@ import { markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, supplie
 import { NOTICE_TAG } from './notice-tags.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
-import { SILENCING_SENDS, bareToolName } from './send-tools.js';
+import { SILENCING_SENDS, bareToolName, isSpeechTool } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -235,7 +235,7 @@ import { CHILD_ENTRY, ChildCapacity, maxResultBytes, type ToolAnswer } from './c
 import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
-import { proseRunGroups, splitProseRuns, withoutRoundsProse } from './prose-segments.js';
+import { proseRunGroups, splitProseRuns, toolUsesOfRounds, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
@@ -349,9 +349,13 @@ const isSilencingTool = (name: string): boolean => {
  *  send, though inspecting drafts is not). */
 const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
   if (isSilencingTool(call.name)) return true;
-  return call.name === 'drafts'
-    && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
+  return isDraftsResend(call);
 };
+
+const isDraftsResend = (call: { name: string; input?: unknown }): boolean => call.name === 'drafts'
+  && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
+
+const isSendCall = (call: { name: string; input?: unknown }): boolean => isSpeechTool(call.name) || isDraftsResend(call);
 
 /** Hybrid prose envelopes: every line starting with `>>>` opens a new one.
  *  Leading whitespace before a `>>>` is dropped; blank envelopes are skipped. */
@@ -388,6 +392,8 @@ const draftsToolDescription = (sendSilencing: boolean): string =>
   'because a routing prefix bounced, or because it had no destination. ' +
   `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
   `drafts are always kept; an older one may be let go once ${Math.round(KEEP_IDLE_MS / 86_400_000)} days pass in which nothing happens to it. ` +
+  'A held draft that you leave alone for a whole turn is set aside when that turn ends, as dismiss does; one that ' +
+  'bounced, or that may already have been posted, is left open. ' +
   'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
   'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
   'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
@@ -1022,13 +1028,13 @@ import {
 import { SuppressionReview, type ReviewRuleInfo, type SuppressionReviewSummary } from './gate/suppression-review.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplNoGrantEnd, type McplNoGrantRefusal, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
 import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-presentation.js';
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
 import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
+import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern, type McpServerInfo } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import { boundedForLog, describeCause, hostStoppedWhileHandling } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
@@ -1506,6 +1512,10 @@ interface TurnRouting {
    * from another's.
    */
   turnId: number;
+  /** When the turn's routing was made: a held draft that nothing has happened to since is one the turn left alone (setAsideIdleDrafts). */
+  openedAt: number;
+  /** The drafts the turn's own `drafts` calls named (read, resend, dismiss). Something was done with them, so the turn's end sets none of them aside, though a resend refused before its attempt is journaled leaves no record on the draft. */
+  draftsNamed?: Set<string>;
   /**
    * The channel whose message triggered the turn (item-3 redux), which the
    * locus is resolved from when the turn opens, and which the channel
@@ -1611,6 +1621,7 @@ interface TurnRouting {
   unpostedSpeech?: true;
   privateEnd?: true;
   skipReplyAsked?: true;
+  skipReplyFailedCall?: true;
   silent?: true;
   liveSpeech?: true;
   speechRouting?: number;
@@ -1694,6 +1705,7 @@ function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined):
 function freshTurnRouting(): TurnRouting {
   return {
     turnId: ++lastTurnId,
+    openedAt: Date.now(),
     engaged: new Set(),
     wasIn: [],
     continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [], heard: new Map(),
@@ -1759,6 +1771,10 @@ function turnInputs(
 type SpeechPublished = (to: PublishDestination, text: string, messageId: string | undefined) => void;
 
 type SkipHeld = { held: Draft[]; target?: ChannelRef; wouldHold: boolean };
+
+type SkipVerdict = { held: SkipHeld[]; failed: string[] };
+
+type StepWait = { agent: Agent; streamId: number; sends: string[]; settle: (failed: string[]) => void };
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
@@ -3476,6 +3492,29 @@ export { suppressedRow } from './presentation.js';
  */
 export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
 
+const NO_GRANT_OLD_SERVER = {
+  declared: 'The server declares an MCPL version before 0.5. Such a server does not take that request, and it needs an update to MCPL 0.5.',
+  unknown: 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.',
+};
+
+function oldServerWords(version: unknown): string | null {
+  const parts = typeof version === 'string' ? /^(\d+)\.(\d+)/.exec(version) : null;
+  if (!parts) return NO_GRANT_OLD_SERVER.unknown;
+  return Number(parts[1]) === 0 && Number(parts[2]) < 5 ? NO_GRANT_OLD_SERVER.declared : null;
+}
+const NO_GRANT_WORDS = {
+  unanswered: { cause: "it did not answer the host's policy request", tail: '' },
+  errored: { cause: "it answered the host's policy request with an error", tail: '' },
+  refused: { cause: 'it refused the policy that the host offered', tail: "The host's log has the server's reason, if it gave one." },
+  'no-mcpl': { cause: 'it declared no MCPL in its handshake, so the host offered it no policy', tail: 'A server that sends MCPL messages must declare MCPL.' },
+  'host-error': { cause: "the host hit an error while it set up the server's policy", tail: "The host's log has the error. A restart of the server may clear it." },
+} satisfies Record<McplNoGrantEnd, { cause: string; tail: string }>;
+
+function noGrantEndOf(err: unknown): McplNoGrantEnd | null {
+  if (!(err instanceof McplRequestError)) return null;
+  return err.outcome === 'error-response' ? 'errored' : err.outcome === 'no-response' ? 'unanswered' : 'host-error';
+}
+
 /** The largest file dump_suppressed writes (bytes), under the workspace's default 5 MB file limit. */
 const DUMP_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -5103,7 +5142,8 @@ export class AgentFramework {
   /** Per agent, a round that called code_execution or sent, and waits for
    *  those calls' results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
-  private readonly skipReplyAsks = new Map<string, Promise<SkipHeld[]>>();
+  private readonly skipReplyHolds = new Map<string, { streamId: number; verdict: Promise<SkipVerdict> }>();
+  private readonly stepWaits = new Map<string, StepWait>();
   /** Each code_execution result, by the round that dispatched its call: it
    *  settles only that round, even if a newer round reuses its call id. */
   private scriptRoundOfResult: WeakMap<ToolResult, ScriptRound> = new WeakMap();
@@ -9268,7 +9308,7 @@ export class AgentFramework {
       ...(this.heartbeat?.getTools() ?? []),
       this.buildAgentSettingsTool(),
       ...(this.getWorkspaceModule()
-        ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL,
+        ? [AgentFramework.SAVE_IMAGE_TOOL, this.readImageTool(),
            AgentFramework.FETCH_REFERENCE_TOOL]
         : []),
       ...(this.eventGate && this.getWorkspaceModule() ? [AgentFramework.DUMP_SUPPRESSED_TOOL] : []),
@@ -13449,6 +13489,7 @@ export class AgentFramework {
     // agent's wakes), and neither wake goes to a name that's gone.
     this.eventGate?.agentGone(name);
     this.agents.delete(name);
+    this.forgetSkipReplyHolds(name);
     this.forgetPresentation(agent);
     this.agentConfigs.delete(name);
     this.deadlineCuts.delete(name);
@@ -14406,6 +14447,7 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
+        this.forgetSkipReplyHolds(agent.name);
         this.forgetPresentation(agent);
         this.deadlineCuts.delete(agent.name);
         this.freshCallsCut.delete(agent.name);
@@ -15000,6 +15042,21 @@ export class AgentFramework {
       required: ['path'],
     },
   };
+
+  /** read_image as this host's workspace takes it: where the workspace reads files outside its mounts, the tool says so, in the workspace's words. */
+  private readImageTool(): import('./types/index.js').ToolDefinition {
+    const tool = AgentFramework.READ_IMAGE_TOOL;
+    const outside = this.getWorkspaceModule()?.readsOutside;
+    if (!outside) return tool;
+    return {
+      ...tool,
+      description: `${tool.description} ${outside.description}`,
+      inputSchema: {
+        ...tool.inputSchema,
+        properties: { path: { type: 'string', description: `Mount-prefixed image path, e.g. "project/photos/name.png"${outside.path}.` } },
+      },
+    };
+  }
 
   private static readonly AGENT_SETTINGS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'agent_settings',
@@ -19831,6 +19888,7 @@ export class AgentFramework {
       }
       if (agent && agent.state.status === 'waiting_for_tools') {
         agent.provideToolResult(event.callId, event.result);
+        this.settleStepWait(agent);
 
         // Check if agent is now ready (state may have changed after provideToolResult)
         // Cast to AgentState to bypass TypeScript's control flow narrowing
@@ -24189,6 +24247,18 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: ${destination}, confirmDuplicate: true))`),
     ];
+    // A draft left alone needs no call: a turn's end sets it aside
+    // (setAsideIdleDrafts). One that may already have been posted stays open,
+    // so only it is given its dismissal, and the others are then named.
+    const aside = [
+      ...(free.length > 0
+        ? [`left alone for a whole turn, ${risky.length > 0 ? free.map((d) => d.id).join(', ') : free.length > 1 ? 'they' : 'it'} ` +
+          `${free.length > 1 ? 'are' : 'is'} set aside when that turn ends`]
+        : []),
+      ...(risky.length > 0
+        ? [`drafts(action: "dismiss", draftIds: [${quoted(risky)}]) sets ${risky.length > 1 ? 'them' : 'it'} aside`]
+        : []),
+    ];
     // Named: residents share one message slot (#197), and an agent that
     // observes the writer's slot is shown the notice too.
     // "Not sent" only when no copied words may already have been posted.
@@ -24196,7 +24266,7 @@ export class AgentFramework {
       `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
       `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
       `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${because ? `because ${because}` : AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
-      `${resend.join('; ')}; drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
+      `${[...resend, ...aside].join('; ')}.`
     );
   }
 
@@ -24400,6 +24470,37 @@ export class AgentFramework {
     this.recordDraftNotices(agent, this.draftsNamedInHistory(agent, held.map((d) => d.id)));
   }
 
+  /**
+   * A turn's own end (its last response, or a tool that ends it): set aside,
+   * as the resident's dismissal would, each held draft a notice named before
+   * the turn opened, that nothing has happened to since, and that none of
+   * the turn's `drafts` calls named (TurnRouting.draftsNamed). The resident
+   * had the whole turn to resend it and left it alone, so it asks nothing
+   * more of them: no call to make, and no growing list of open drafts. A turn
+   * that fails, is stopped, is cut off or ends in a refusal sets nothing
+   * aside, since its resident may never have read the notice, or reached what
+   * it meant to do. A bounce stays open: it is a message its resident
+   * addressed and that didn't arrive, which may wait for a destination to
+   * come back, and `{{unsent}}` means it. So do a draft that may already have
+   * been posted (its risk is the resident's to answer) and one queued in a
+   * resend still running.
+   */
+  private setAsideIdleDrafts(agent: Agent, routing: TurnRouting): void {
+    const setAside: string[] = [];
+    try {
+      for (const d of this.proseDrafts.idleSince(agent.name, routing.openedAt)) {
+        if (d.reason === 'bounced' || routing.draftsNamed?.has(d.id) || this.draftsInFlight.has(`${agent.name}\u0000${d.id}`)) continue;
+        this.proseDrafts.dismiss(agent.name, d.id);
+        setAside.push(d.id);
+      }
+    } catch (err) {
+      console.error(`[drafts] ${agent.name}: setting idle drafts aside failed; the next turn's end tries again:`, err);
+    }
+    if (setAside.length === 0) return;
+    console.error(`[drafts] ${agent.name}: set aside ${setAside.join(', ')} (left alone for a turn)`);
+    this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: setAside, auto: true });
+  }
+
   /** Record each named draft as noticed, with the message that names it
    *  (draftsNamedInHistory). */
   private recordDraftNotices(agent: Agent, named: Map<string, string>): void {
@@ -24520,6 +24621,11 @@ export class AgentFramework {
         return refuse('draftIds must be a list of draft ids such as "d-k7x3qm2", or null.');
       }
       ids = (input.draftIds as string[]).map((id) => id.trim());
+      // Naming a draft is something done with it: its turn's end doesn't set
+      // it aside (setAsideIdleDrafts), whatever becomes of the call, a
+      // refusal of the whole call included.
+      const naming = turn ?? this.openLogical.get(agentName);
+      if (naming) for (const id of ids) (naming.draftsNamed ??= new Set()).add(id);
       if (new Set(ids).size !== ids.length) return refuse('draftIds names a draft more than once.');
       if (ids.length > 20) return refuse('draftIds names more than 20 drafts; act on them in smaller groups.');
     }
@@ -24963,12 +25069,17 @@ export class AgentFramework {
     // names one the text left out.
     const idList = (ds: Draft[]): string => ds.map((d) => d.id).join(', ');
     const held = inState('held');
-    if (held.length > 0) {
+    // A bounce stays open until its resident resends or dismisses it; a
+    // later turn's end sets the rest aside (setAsideIdleDrafts).
+    const heldNote = (ds: Draft[], otherwise: string): void => {
+      if (ds.length === 0) return;
       notes.push(
-        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
-        '(not sent — drafts can resend them unchanged, or dismiss them)',
+        `${ds.length} plain-speech segment(s) held as draft${ds.length === 1 ? '' : 's'} ${idList(ds)} ` +
+        `(not sent — drafts can resend them unchanged${otherwise})`,
       );
-    }
+    };
+    heldNote(held.filter((d) => d.reason !== 'bounced'), '; left alone for a whole turn, they are set aside when that turn ends');
+    heldNote(held.filter((d) => d.reason === 'bounced'), ', or dismiss them');
     if (letGo.length > 0) {
       notes.push(
         `draft${letGo.length === 1 ? '' : 's'} ${idList(letGo)} held this turn and since let go by retention ` +
@@ -28693,6 +28804,7 @@ export class AgentFramework {
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
       if (continued?.start) routing.start = continued.start;
       if (continued?.triggerRows !== undefined) routing.triggerRows = continued.triggerRows;
+      if (continued?.skipReplyFailedCall) routing.skipReplyFailedCall = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -29664,6 +29776,7 @@ export class AgentFramework {
     // opposed to a private think: under 'ask' their text is held where
     // nothing routed it live (skipHoldsAtEnd).
     const skipPrivateRounds = new Set<number>();
+    const failedCallRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -29859,6 +29972,7 @@ export class AgentFramework {
         // closed-channel note comes once they've run.
         void turnSpeechChain.then(() => this.appendClosedChannelNoteAlone(agent, streamRouting));
       }
+      if (cancelKind === 'turn_ended' && !trigger?.suppressProse) this.setAsideIdleDrafts(agent, streamRouting);
       // A `!` an earlier round asked for still starts its
       // continuation when a tool ends the turn, once the turn's
       // deliveries have run. Explicit mode doesn't hold the turn
@@ -30134,12 +30248,42 @@ export class AgentFramework {
               : -1;
             const askingCall = askingAt >= 0 ? roundCalls[askingAt] : undefined;
             let answerAsk: ((held: SkipHeld[]) => void) | undefined;
-            if (askingAt >= 0) {
-              this.skipReplyAsks.set(`${agent.name}\u0000${calls[askingAt]!.id}`, new Promise((resolve) => { answerAsk = resolve; }));
-            }
-            let askedSilence: TurnSilence | null = null;
+            const asked = askingAt >= 0 ? new Promise<SkipHeld[]>((resolve) => { answerAsk = resolve; }) : undefined;
             const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
               && agent.state.status === 'waiting_for_tools';
+            const waitingAt = !this.channelRegistry || streamRouting.skipReplyFailedCall || !calls.some(isSendCall)
+              ? []
+              : calls.flatMap((c, i) => (c.name === 'skip_reply' && roundCalls[i]!.permitted && !roundCalls[i]!.refused ? [i] : []));
+            const heldAt = [...new Set([...(askingAt >= 0 ? [askingAt] : []), ...waitingAt])];
+            const waitingCalls = new Set(waitingAt.map((i) => roundCalls[i]!));
+            const heldIds = new Set(heldAt.map((i) => calls[i]!.id));
+            let askedSilence: TurnSilence | null = null;
+            let failedSilence: TurnSilence | null | undefined;
+            let failedCallRefused = false;
+            const failed = waitingAt.length === 0 ? undefined : new Promise<string[]>((settle) => {
+              this.stepWaits.set(agent.name, {
+                agent, streamId: myStreamId, sends: calls.filter(isSendCall).map((c) => c.id), settle,
+              });
+            }).then((names) => {
+              if (names.length > 0 && waits()) {
+                streamRouting.skipReplyFailedCall = true;
+                failedCallRefused = true;
+                if (failedSilence !== undefined) silenceBeforeRefusal = failedSilence;
+                refusedWakeRounds.add(toolRound);
+                skipPrivateRounds.add(toolRound);
+                failedCallRounds.add(toolRound);
+              }
+              return names;
+            });
+            for (const i of heldAt) {
+              this.skipReplyHolds.set(`${agent.name}\u0000${calls[i]!.id}`, {
+                streamId: myStreamId,
+                verdict: Promise.all([
+                  i === askingAt && asked ? asked : Promise.resolve([]),
+                  waitingAt.includes(i) && failed ? failed : Promise.resolve([]),
+                ]).then(([held, failedNames]) => ({ held, failed: failedNames })),
+              });
+            }
             const settleAsk = (held: SkipHeld[]): void => {
               const answer = answerAsk;
               if (!answer) return;
@@ -30147,7 +30291,7 @@ export class AgentFramework {
               if (!waits()) return;
               if (held.some((h) => !h.wouldHold)) {
                 streamRouting.skipReplyAsked = true;
-                silenceBeforeRefusal = askedSilence;
+                silenceBeforeRefusal = failedCallRefused ? failedSilence ?? null : askedSilence;
                 answer(held);
                 return;
               }
@@ -30181,6 +30325,10 @@ export class AgentFramework {
               }
               silence = mergeSilence(silence, roundSilenceOf(calls, toolRound));
               if (askingCall) askedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && c !== askingCall), toolRound));
+              if (waitingCalls.size > 0) {
+                failedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && !waitingCalls.has(c)), toolRound));
+                if (failedCallRefused) silenceBeforeRefusal = failedSilence;
+              }
               turnSends = mergeSends(turnSends, sendsOf(calls, toolRound));
               const roundSilence = silence;
               const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
@@ -30352,13 +30500,14 @@ export class AgentFramework {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
               // `started` goes out once dispatch returns, or for a skip_reply
-              // the guard asks about, once its answer runs it. Refusal sites
+              // that waits for the guard's answer or for the other calls of
+              // its step, once it runs. Refusal sites
               // inside dispatch run synchronously and call refuse() first, as
               // the guard's refusal does, so a call the host refuses produces
               // no events.
               this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call, streamRouting.turnId);
-              if (call !== calls[askingAt]) this.toolLifecycleEmitter?.open(agent.name, call.id);
+              if (!heldIds.has(call.id)) this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             if (scriptCallIds.length === 0 && sendCallIds.length === 0) routeRound(roundCalls);
@@ -30501,6 +30650,7 @@ export class AgentFramework {
               for (const pendingId of stillRunning) {
                 agent.provideToolResult(pendingId, { ...notReceived });
               }
+              this.stepWaits.delete(agent.name);
               // Store the round and its results, with the same bounded spill
               // policy as the ordinary path (issue #89: this guard path must
               // not become the one door a giant blob still walks through).
@@ -31048,6 +31198,7 @@ export class AgentFramework {
               // injected message can reset. The XML tool path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
+              const failedCallBlocks: ReadonlySet<object> = toolUsesOfRounds(response.content, failedCallRounds);
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => b as unknown as { id?: unknown; name?: unknown; input?: unknown; unparseableInput?: string })
@@ -31059,7 +31210,7 @@ export class AgentFramework {
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
                 ? null
-                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c)), agent.getEffectiveSendSilencing());
+                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c) && !(c.name === 'skip_reply' && failedCallBlocks.has(c))), agent.getEffectiveSendSilencing());
               const trailingSilence: TurnSilence | null = liveProseRouting
                 ? silence
                 : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
@@ -31182,6 +31333,10 @@ export class AgentFramework {
             } else if (!trigger?.suppressProse) {
               this.appendClosedChannelNoteAlone(agent, streamRouting);
             }
+            // Only a turn the model ended itself: a refusal read nothing it
+            // could act on, and a turn cut off (the output limit, the stall
+            // guard) may not have reached what it meant to do with a draft.
+            if (!trigger?.suppressProse && AUTO_CONTINUE_STOP_REASONS.has(response.stopReason)) this.setAsideIdleDrafts(agent, streamRouting);
 
             // A `!` continuation this turn asked for. This gives prose the
             // same continuation ability tool rounds have (wanted for
@@ -31916,6 +32071,8 @@ export class AgentFramework {
       // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
       this.decideWaitingRound(agent, myStreamId, 'its stream ended');
+      const stepWait = this.stepWaits.get(agent.name);
+      if (stepWait?.agent === agent && stepWait.streamId === myStreamId) this.stepWaits.delete(agent.name);
 
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to (completeOutgoing). Every exit path does,
@@ -34235,15 +34392,45 @@ export class AgentFramework {
     this.dispatchChannelToolCall(agentName, enrichedCall);
   }
 
-  private refuseSkipReplyOnce(agentName: string, call: ToolCall, held: SkipHeld[]): void {
-    const routing = this.callingTurnOf(agentName, call);
-    const own = routing ? this.ownChannels(routing) : [];
-    const drafts = held.flatMap((h) => h.held);
-    const error = `${held.map((h) => this.draftsHeldNotice(agentName, h.held, 'skip-reply', undefined, h.target, own)).join(' ')} ` +
-      `Where should ${drafts.length > 1 ? 'they' : 'it'} go, if anywhere? This skip_reply didn't run, so your turn goes on: ` +
-      `to end it and keep the draft${drafts.length > 1 ? 's' : ''}, call skip_reply again, with wake_in_seconds again if you set a wake. ` +
-      "A line meant only for yourself fits in skip_reply's reason.";
-    console.error(`[skip-reply] agent=${agentName} skip_reply refused once (sameRoundSkipReplyTextPolicy=ask): its round's text is held as ${drafts.map((d) => d.id).join(', ')}`);
+  private forgetSkipReplyHolds(name: string): void {
+    this.stepWaits.delete(name);
+    for (const key of this.skipReplyHolds.keys()) {
+      if (key.startsWith(`${name}\u0000`)) this.skipReplyHolds.delete(key);
+    }
+  }
+
+  private settleStepWait(agent: Agent): void {
+    const wait = this.stepWaits.get(agent.name);
+    if (!wait) return;
+    const state = agent.state;
+    if (wait.agent !== agent || wait.streamId !== agent.streamId || state.status !== 'waiting_for_tools') {
+      this.stepWaits.delete(agent.name);
+      return;
+    }
+    if (wait.sends.some((id) => state.pending.has(id))) return;
+    this.stepWaits.delete(agent.name);
+    const failed = new Map(state.completed.filter((c) => c.result.isError === true).map((c) => [c.id, c.name]));
+    wait.settle(wait.sends.flatMap((id) => failed.get(id) ?? []));
+  }
+
+  private refuseSkipReplyOnce(agentName: string, call: ToolCall, held: SkipHeld[], failed: string[]): void {
+    const tools = [...new Set(failed)];
+    const named = tools.length <= 1 ? tools.join('') : `${tools.slice(0, -1).join(', ')} and ${tools[tools.length - 1]}`;
+    const why = `${named} ${held.length > 0 ? 'also ' : ''}failed in the same step, and ${failed.length > 1 ? 'their answers say' : 'its answer says'} why.`;
+    let error: string;
+    if (held.length > 0) {
+      const routing = this.callingTurnOf(agentName, call);
+      const own = routing ? this.ownChannels(routing) : [];
+      const drafts = held.flatMap((h) => h.held);
+      error = `${held.map((h) => this.draftsHeldNotice(agentName, h.held, 'skip-reply', undefined, h.target, own)).join(' ')} ` +
+        `Where should ${drafts.length > 1 ? 'they' : 'it'} go, if anywhere? This skip_reply didn't run, so your turn goes on: ` +
+        `to end it and keep the draft${drafts.length > 1 ? 's' : ''}, call skip_reply again, with wake_in_seconds again if you set a wake. ` +
+        "A line meant only for yourself fits in skip_reply's reason." + (failed.length > 0 ? ` ${why}` : '');
+      console.error(`[skip-reply] agent=${agentName} skip_reply refused once (sameRoundSkipReplyTextPolicy=ask): its round's text is held as ${drafts.map((d) => d.id).join(', ')}`);
+    } else {
+      error = `This skip_reply didn't run: ${why} To end your turn, call skip_reply again, with wake_in_seconds again if you set a wake.`;
+    }
+    if (failed.length > 0) console.error(`[skip-reply] agent=${agentName} skip_reply refused once: ${named} failed in the same step`);
     const result = this.refusedResult(agentName, call.id, error);
     this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
     this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels', result });
@@ -34484,6 +34671,9 @@ export class AgentFramework {
         // wake_in_seconds without a gate, and one that isn't a number of
         // seconds with one.
         if (enrichedCall.name === 'skip_reply') {
+          const key = `${agentName}\u0000${enrichedCall.id}`;
+          const hold = this.skipReplyHolds.get(key);
+          this.skipReplyHolds.delete(key);
           const error = this.skipReplyRefusal(enrichedCall);
           if (error !== undefined) {
             const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
@@ -34493,14 +34683,13 @@ export class AgentFramework {
             this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
             return;
           }
-          const key = `${agentName}\u0000${enrichedCall.id}`;
-          const asked = this.skipReplyAsks.get(key);
-          this.skipReplyAsks.delete(key);
-          if (asked) {
-            void asked.then((held) => {
-              if (!this.agents.get(agentName)?.getPendingToolIds().includes(enrichedCall.id)) return;
-              if (held.length > 0) {
-                this.refuseSkipReplyOnce(agentName, enrichedCall, held);
+          const holder = this.agents.get(agentName);
+          if (hold && holder?.streamId === hold.streamId) {
+            void hold.verdict.then(({ held, failed }) => {
+              if (this.agents.get(agentName) !== holder || holder.streamId !== hold.streamId
+                || !holder.getPendingToolIds().includes(enrichedCall.id)) return;
+              if (held.length > 0 || failed.length > 0) {
+                this.refuseSkipReplyOnce(agentName, enrichedCall, held, failed);
                 return;
               }
               this.toolLifecycleEmitter?.open(agentName, enrichedCall.id);
@@ -37846,6 +38035,7 @@ export class AgentFramework {
     try {
       await this.registerMcplServerFeatures(config, connection);
     } catch (error) {
+      if (connection.transportEpoch === epoch && !connection.policyEstablished) connection.noGrantEnd = 'host-error';
       if (opts.closeOnFailure) await this.closeFailedRuntimeConnect(connection, 'policy registration');
       throw error;
     } finally {
@@ -38138,6 +38328,40 @@ export class AgentFramework {
     void controller.connected(connection).catch((error: unknown) => {
       console.error(`[mcpl] ${connection.id}: reading its open toolsets failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+  }
+
+  private tellNoGrant(connection: McplServerConnection, refusal: McplNoGrantRefusal): void {
+    if (connection.noGrantTold || this.agents.size === 0) return;
+    const { cause, tail } = NO_GRANT_WORDS[refusal.end];
+    const firstPolicy = (refusal.end === 'unanswered' || refusal.end === 'errored') && !connection.policyEstablished;
+    const oldServer = firstPolicy ? oldServerWords(connection.capabilities?.version) : null;
+    const text = [
+      `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it.`,
+      `The server holds no grant for such messages, because ${cause}.`,
+      "So for now its pushes and channel messages don't reach you.",
+      ...(oldServer ? [oldServer] : []),
+      ...(tail ? [tail] : []),
+      "If you can't change that yourself, ask whoever runs this host.",
+      'The host says this one time.',
+      'It says it again only after it connects the server anew, or after the server got a grant and lost it.',
+    ].join(' ');
+    try {
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant', serverId: connection.id });
+      connection.noGrantTold = true;
+    } catch (error) {
+      console.error(`[mcpl] ${connection.id}: the notice that it holds no grant could not be written:`, error);
+    }
+  }
+
+  private tellNoGrantEnded(connection: McplServerConnection): void {
+    if (!connection.noGrantTold || connection.grantAdmitsNoGatedMessage()) return;
+    connection.noGrantTold = false;
+    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" now holds a grant. The host accepts the messages that its grant covers.`;
+    try {
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant-ended', serverId: connection.id });
+    } catch (error) {
+      console.error(`[mcpl] ${connection.id}: the notice that it now holds a grant could not be written:`, error);
+    }
   }
 
   /**
@@ -38546,11 +38770,11 @@ export class AgentFramework {
     }
 
     st.inFlight = true;
+    // A manifest, and the policy negotiated for it, belong to the transport
+    // they came on: one that closes meanwhile installs nothing, since the
+    // next transport's initialize and policy exchange start afresh.
+    const epoch = connection.transportEpoch;
     try {
-      // A manifest, and the policy negotiated for it, belong to the transport
-      // they came on: one that closes meanwhile installs nothing, since the
-      // next transport's initialize and policy exchange start afresh.
-      const epoch = connection.transportEpoch;
       // §17.4 fetch. A server that cannot answer keeps its previous
       // manifest in force — an unparseable/failed fetch teaches nothing and
       // narrows nothing (§17.5 step 1).
@@ -38637,7 +38861,7 @@ export class AgentFramework {
         if (receipt && receipt.accepted === false) {
           const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
           const fallback = refusal.fallback;
-          console.error(`[mcpl] ${connection.id} refused post-manifest policy — fallback: ${fallback}`);
+          console.error(`[mcpl] ${connection.id} refused post-manifest policy (${typeof receipt.reason === 'string' ? logValueRedacted(receipt.reason, recorded) : 'no reason'}) — fallback: ${fallback}`);
           this.emitTrace({
             type: 'mcpl:policy-refused',
             serverId: connection.id,
@@ -38648,20 +38872,24 @@ export class AgentFramework {
             closeForGood = true;
           } else {
             connection.establishGrant(CapabilityGrant.empty());
+            connection.noGrantEnd = 'refused';
             this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, CapabilityGrant.empty());
           }
         } else {
           connection.establishGrant(newGrant);
+          this.tellNoGrantEnded(connection);
           this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
           connection.manifestState.lastNegotiatedAt = Date.now();
           negotiated = true;
         }
-      } catch {
+      } catch (err) {
         if (connection.transportEpoch !== epoch) {
           console.error(`[mcpl] ${connection.id}: post-manifest policy Request ended by its transport's close; not applied`);
           return;
         }
         console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7); interim state stands`);
+        const end = noGrantEndOf(err);
+        if (end && (connection.noGrantEnd !== null || connection.grantAdmitsNoGatedMessage())) connection.noGrantEnd = end;
       }
       if (closeForGood) {
         await this.closeMcplServerForGood(connection);
@@ -38709,6 +38937,9 @@ export class AgentFramework {
         impacts,
       });
       this.handleToolsListChanged(connection.id);
+    } catch (err) {
+      if (connection.transportEpoch === epoch && connection.noGrantEnd === null && connection.grantAdmitsNoGatedMessage()) connection.noGrantEnd = 'host-error';
+      throw err;
     } finally {
       st.inFlight = false;
       st.lastCompletedAt = Date.now();
@@ -38758,7 +38989,10 @@ export class AgentFramework {
     config: import('./mcpl/types.js').McplServerConfig,
     connection: McplServerConnection,
   ): Promise<void> {
-    if (!connection.capabilities) return;
+    if (!connection.capabilities) {
+      connection.noGrantEnd = 'no-mcpl';
+      return;
+    }
     // Taken before any await, so every record of what the server says below
     // uses one derivation, whatever becomes of the server meanwhile (removed,
     // or replaced by a restart).
@@ -38809,7 +39043,7 @@ export class AgentFramework {
         const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
         const fallback = refusal.fallback;
         console.error(
-          `[mcpl] ${config.id} refused initial policy (${refusal.reason ?? 'no reason'}) — fallback: ${fallback}`,
+          `[mcpl] ${config.id} refused initial policy (${typeof receipt.reason === 'string' ? logValueRedacted(receipt.reason, recorded) : 'no reason'}) — fallback: ${fallback}`,
         );
         this.emitTrace({
           type: 'mcpl:policy-refused',
@@ -38820,11 +39054,15 @@ export class AgentFramework {
         // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
         // dark, plain MCP tools keep working. MUST NOT widen in response to
         // the refusal — a human can change config; the policy engine cannot.
-        if (fallback !== 'close') return;
+        if (fallback !== 'close') {
+          connection.noGrantEnd = 'refused';
+          return;
+        }
         closeForGood = true;
       } else {
         // Expansion activates on receipt (§6.7).
         connection.establishGrant(grant);
+        this.tellNoGrantEnded(connection);
         if (receipt?.accepted === true && receipt.mode === 'degraded') {
           for (const uf of receipt.unavailableFeatures ?? []) {
             console.error(recorded(
@@ -38838,6 +39076,7 @@ export class AgentFramework {
         console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one, if one comes, negotiates its own`);
         return;
       }
+      connection.noGrantEnd = noGrantEndOf(err);
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
@@ -39454,6 +39693,12 @@ export class AgentFramework {
     family: 'legacy' | 'modern' | null;
     /** The MCP revision its last handshake established; null until one has. */
     protocolVersion: string | null;
+    /** The server's own name and version, as the last handshake of its
+     *  connection gave them in MCP's `serverInfo` ({@link McpServerInfo}).
+     *  Null when that handshake gave neither, and while the server has no
+     *  connection that has made a handshake: before its first one, and once
+     *  its connection is gone, as for a closed tab. */
+    serverInfo: McpServerInfo | null;
     /** How it is reached; null when the configuration names no usable transport. */
     transport: 'stdio' | 'websocket' | 'http' | null;
     /** Why connecting refuses this configuration, before anything is spawned
@@ -39505,7 +39750,7 @@ export class AgentFramework {
   }> {
     const result: Array<{
       id: string; connected: boolean; closedTab: boolean; retrying: boolean;
-      family: 'legacy' | 'modern' | null; protocolVersion: string | null;
+      family: 'legacy' | 'modern' | null; protocolVersion: string | null; serverInfo: McpServerInfo | null;
       transport: 'stdio' | 'websocket' | 'http' | null; refused: string | null;
       toolPrefix: string; toolCount: number; policyEstablished: boolean | null;
       effectiveGrant: string[]; maskedCapabilities: string[];
@@ -39536,6 +39781,7 @@ export class AgentFramework {
         binding = null;
       }
       const problems = serverConfigProblems(config);
+      const serverInfo = modern?.serverInfo ?? connection?.serverInfo ?? null;
       // Attribute through the dispatch resolver, the one rule that picks a
       // tool's server.
       const ownTools = (this.mcplTools ?? []).flatMap((t) => {
@@ -39549,6 +39795,7 @@ export class AgentFramework {
         retrying: !connected && (modern?.willReconnect ?? connection?.willReconnect ?? false),
         family: binding?.family ?? null,
         protocolVersion: modern?.protocolVersion ?? connection?.protocolVersion ?? null,
+        serverInfo: serverInfo && { ...serverInfo },
         transport: binding?.transport ?? null,
         refused: problems.length > 0 ? problems.join('; ') : null,
         toolPrefix: prefix,
@@ -39768,6 +40015,8 @@ export class AgentFramework {
     connection.on('stderr', (params: { line: string }) => {
       this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
     });
+
+    connection.on('no-grant-refusal', (refusal: McplNoGrantRefusal) => this.tellNoGrant(connection, refusal));
 
     // featureSets/changed is REMOVED in 0.5.0 — the connection answers it
     // -32601 (superseded by SPEC §17's host-diffed manifest fetch); no
