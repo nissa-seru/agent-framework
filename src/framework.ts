@@ -18398,10 +18398,14 @@ export class AgentFramework {
       const unreadable = report.unreadable.items.length + report.unreadable.takes.length > 0
         ? [`${report.unreadable.items.length} applied-list item(s) and ${report.unreadable.takes.length} take(s) unreadable`]
         : [];
+      const floor = report.dropped?.floorChange;
       const dropped = report.dropped && report.dropped.summaries.length > 0
         ? [`dropped ${report.dropped.summaries.map((each) => `${each.count} L${each.level}`).join(', ')} summary(ies) over joined notes, ${report.dropped.records} chunk record(s) to fold again, ~${report.dropped.rawTokens} token(s) raw until then`]
         : [];
-      console.error(`[sweep] ${point}: ${agent.name} on ${report.branch}: ${[...sweeps, ...dropped, ...unreadable, ...(report.stopped ? [`stopped: ${report.stopped}`] : [])].join('; ')}`);
+      const room = floor && !(floor.known && floor.tokens === 0)
+        ? [floor.known ? `the smallest compile ${floor.tokens > 0 ? 'grew' : 'shrank'} by ~${Math.abs(floor.tokens)} token(s)` : `the smallest compile's change is not known: ${floor.reason}`]
+        : [];
+      console.error(`[sweep] ${point}: ${agent.name} on ${report.branch}: ${[...sweeps, ...dropped, ...room, ...unreadable, ...(report.stopped ? [`stopped: ${report.stopped}`] : [])].join('; ')}`);
       this.emitTrace({ type: 'sweep:pass', point, agentName: agent.name, report });
     }
     return { passes, threw };
