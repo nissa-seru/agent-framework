@@ -19,8 +19,10 @@
   leave every window (`presentation:retracted`, reason `sweep`). The history
   module's semantic index sends a rewritten body again, and deletes a
   removed shard where the service deletes, also for a pass made while it was
-  not attached. A pass with something to report is traced (`sweep:pass`),
-  with what it dropped where it joined a long note, which its log line names
-  too, and a pass that throws is traced too (`sweep:pass-failed`). The
-  operator log records a take as `sweep` and the second act as
-  `sweep-summaries`.
+  not attached. An index restored from a copy made before a pass, where the
+  copy holds the newest message that the module sent, keeps that pass's old
+  text: rebuild the index then. A pass with something to report is traced
+  (`sweep:pass`), with what it dropped where it joined a long note, which
+  its log line names too, and a pass that throws is traced too
+  (`sweep:pass-failed`). The operator log records a take as `sweep` and
+  the second act as `sweep-summaries`.

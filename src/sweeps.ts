@@ -74,8 +74,12 @@ export interface SweepPassThrew {
 /**
  * How a sweep's write ended (AgentFramework.takeSweep). `finished`: every
  * live agent's slot on the open branch finished the newest take. `failed`:
- * a slot did not: `failed` names each body that a pass reported not
- * rewritten, and `threw` each context whose pass threw before it reported.
+ * a slot did not: `failed` names each body that a pass reported a problem
+ * with, and why (one it did not rewrite, or one that changed during the
+ * pass after its rewrite), and `threw` each context whose pass threw before
+ * it reported. Each pass applies every sweep that its slot owes, so
+ * `passes` can hold another sweep's rewrites: the counts in the operator
+ * log are this sweep's alone.
  * `held`: where there was a take to apply, an agent's turn was alive, or
  * another operator's act held the store, so nothing was applied: the store
  * took the sweep (or had taken it), and the next start or branch move

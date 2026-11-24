@@ -18219,10 +18219,12 @@ export class AgentFramework {
    * is a take to apply and an agent's turn is alive, or another operator's
    * act holds the store, it applies nothing and ends `held`, with the
    * refusal: the next start or branch move applies it, as does the same
-   * call between turns. A context whose pass throws is named in `threw`. Written to the
-   * operator log as a `sweep`. Refused (OperatorActionError 'invalid') for
-   * a sweep the framework has no entry of, and where no live agent's
-   * context is open on the store's branch.
+   * call between turns. Each pass applies every sweep that its slot owes,
+   * not `name` alone, as a pass at any point does. A context whose pass
+   * throws is named in `threw`. Written to the operator log as a `sweep`.
+   * Refused (OperatorActionError 'invalid') for a sweep the framework has no
+   * entry of, and where no live agent's context is open on the store's
+   * branch.
    */
   async takeSweep(name: string, opts?: { requester?: OperatorRequester; note?: string }): Promise<FrameworkSweepWrite> {
     this.refuseOperatorAfterStop('sweep');
