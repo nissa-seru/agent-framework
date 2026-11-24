@@ -12,6 +12,53 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.35.3 — 2026-11-24
+
+### Added
+
+- The workspace's `read`, `read_image` and `write` can take a file outside
+  every mount. `WorkspaceConfig.outsideMounts: 'read-only'` lets `read` and
+  `read_image` take an absolute path, or one that starts with `~/`, and
+  `'read-write'` lets `write` take one too. Left out, every path is a
+  mount's, and nothing changes. Such a file is read and written as the
+  host's own user, through no mount's boundary, include or symlink rule, up
+  to 5 MB, and only where it's a regular file. Nothing of it is stored or
+  watched, and an undo leaves a write to it on disk. An absolute path that
+  lies in a mount's directory, links followed, is that mount's file, by that
+  mount's rules, so a read-only mount stays read-only.
+  Where the setting is on, the descriptions of those tools say what they
+  take, and so does the framework's own `read_image`, so setting it changes
+  what the agent's tool list says.
+
+### Fixed
+
+- An emoji no longer makes the reply judge fail. The judge shortens a long
+  text to its head and its tail. Its cut kept a fixed number of UTF-16 units
+  at each end, so it could keep half of an emoji's surrogate pair. The
+  provider refused such a request with HTTP 400 ("lone leading surrogate in
+  hex escape"). Under the default `onError: "wake"`, each refused batch then
+  woke the agent. The cut now keeps each pair whole. The judge also replaces
+  each lone surrogate in its request with U+FFFD before it sends the
+  request. A rule's `instructions` can hold one, for example.
+
+## 0.35.2 — 2026-11-22
+
+### Added
+
+- **`listMcplServers()` gives each server's own name and version** as
+  `serverInfo`: the `name` and the `version` that the last handshake of the
+  server's connection gave in MCP's `serverInfo`, each null where it gave
+  none. Each is the server's text: redacted as the server's other text is,
+  kept to one line, and with each opening of a framework notice tag marked.
+  `serverInfo` is null when that handshake gave neither, and while the
+  server has no connection that has made a handshake: before its first one,
+  and once its connection is gone, as for a closed tab. A later handshake,
+  such as a reconnect's, replaces it. `McplServerConnection` and
+  `ModernMcpConnection` have it as `serverInfo` too, and the package exports
+  its type, `McpServerInfo`. The legacy engine reads it from the
+  `initialize` answer, and the modern engine from its client's handshake,
+  where a server on MCP 2026-07-28 may give none.
+
 ## 0.35.1 — 2026-11-20
 
 ### Added
