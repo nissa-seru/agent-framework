@@ -50,7 +50,16 @@ export interface FrameworkSweepReceipt {
   oldSummaries: AgentOldSummaries[];
 }
 
-/** One live agent's pass, as its context manager reported it. */
+/**
+ * One live agent's pass, as its context manager reported it. Its report's
+ * `dropped` counts the summaries that agent's strategy held as its own pass
+ * began and no longer holds as it ends. Where agents hold one note, an
+ * earlier agent's pass in the same take can remove the note's later shards
+ * first, and the later agent's strategy then lets go of the summaries over
+ * them before its own pass begins. Those are gone, and no report counts
+ * them, so such a report can count less than the agent's `writeDrops` in
+ * the show.
+ */
 export interface AgentSweepPass {
   agent: string;
   report: SweepPassReport;
